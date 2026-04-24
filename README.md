@@ -220,6 +220,7 @@ shasum -a 256 dist/BridgeDeck.dmg
 
 ```bash
 python3 -m py_compile bridgedeck.py
+python3 -m unittest discover -s tests
 python3 bridgedeck.py --host 127.0.0.1 --port 8899
 zsh -n run-bridgedeck.command
 zsh -n package-bridgedeck-dmg.command
@@ -266,6 +267,7 @@ LICENSE                        MIT license / MIT 许可证
 
 ```bash
 python3 -m py_compile bridgedeck.py
+python3 -m unittest discover -s tests
 zsh -n run-bridgedeck.command
 zsh -n package-bridgedeck-dmg.command
 ./package-bridgedeck-dmg.command

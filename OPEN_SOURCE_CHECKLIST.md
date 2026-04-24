@@ -39,8 +39,6 @@
 - 如果面向普通 macOS 用户分发，建议做代码签名和 notarization。
 - Publish SHA-256 checksums for DMG releases.
 - 发布 DMG 时提供 SHA-256 校验值。
-- Add automated tests for API security behavior.
-- 为 API 安全行为补自动化测试。
 - Split the embedded HTML into a template/static asset if the UI grows further.
 - 如果 UI 继续变复杂，拆出 HTML 模板或静态资源。
 - Add a compatibility matrix for specific CC Switch versions after more testing.
@@ -52,6 +50,7 @@
 
 ```bash
 python3 -m py_compile bridgedeck.py
+python3 -m unittest discover -s tests
 zsh -n run-bridgedeck.command
 zsh -n package-bridgedeck-dmg.command
 ./package-bridgedeck-dmg.command
