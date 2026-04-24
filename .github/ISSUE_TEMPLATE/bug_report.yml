@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible problem
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove tokens, account IDs, emails, and local absolute paths before posting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: List the exact steps to reproduce.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs or screenshots
+      description: Do not paste OAuth tokens, account IDs, emails, or private paths.
+  - type: input
+    id: version
+    attributes:
+      label: Tool version
+      placeholder: "0.2.0"
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "macOS version, Python version, CC Switch version"
