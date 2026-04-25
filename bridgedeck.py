@@ -32,7 +32,7 @@ DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 MAX_REQUEST_BYTES = 1024 * 1024
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -976,10 +976,28 @@ INDEX_HTML = """<!doctype html>
     .stepNote { display:block; color:var(--muted); font-size:12px; margin-top:2px; }
     .guideTarget { color:var(--muted); font-size:12px; margin-bottom:10px; }
     .miniBtn { padding:5px 8px; font-size:12px; }
+    .topGrid { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:10px; margin-top:12px; }
+    .tile { border:1px solid var(--line); border-radius:8px; padding:10px; background:#101520; min-height:66px; }
+    .tileLabel { color:var(--muted); font-size:11px; margin-bottom:6px; }
+    .tileValue { font-size:18px; font-weight:700; }
+    .recommend { margin-top:10px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#111827; }
+    .recommend.okState { border-color:#265f43; background:#102018; }
+    .recommend.warnState { border-color:#7a5a1c; background:#211a0e; }
+    .recommend.badState { border-color:#7a3232; background:#251414; }
+    .quickbar { display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }
+    summary { cursor:pointer; font-weight:700; }
+    details.card { padding:0; }
+    details.card > summary { padding:14px; list-style:none; }
+    details.card > summary::-webkit-details-marker { display:none; }
+    details.card > .detailsBody { padding:0 14px 14px; }
     textarea { width:100%; min-height:120px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
     @media (max-width: 900px) {
       .layout { grid-template-columns: 1fr; }
       .sidebar { position: static; }
+      .topGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 560px) {
+      .topGrid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -988,6 +1006,19 @@ INDEX_HTML = """<!doctype html>
     <div class="card">
       <h1>BridgeDeck</h1>
       <div id="status" class="muted">加载中...</div>
+      <div class="topGrid">
+        <div class="tile"><div class="tileLabel">账号</div><div id="tileAccounts" class="tileValue">-</div></div>
+        <div class="tile"><div class="tileLabel">Claude Provider</div><div id="tileProviders" class="tileValue">-</div></div>
+        <div class="tile"><div class="tileLabel">Codex Mismatch</div><div id="tileMismatches" class="tileValue">-</div></div>
+        <div class="tile"><div class="tileLabel">CLI Home</div><div id="tileCliHomes" class="tileValue">-</div></div>
+      </div>
+      <div id="recommendation" class="recommend">加载中...</div>
+      <div class="quickbar">
+        <button class="primary" onclick="scrollToSection('providerCreateCard')">创建 Claude 桥接</button>
+        <button onclick="scrollToSection('cliHomeCard')">创建 CLI 独立账号</button>
+        <button onclick="scrollToSection('statusCard')">检查状态</button>
+        <button onclick="refreshData()">刷新</button>
+      </div>
       <div class="paths" id="paths"></div>
     </div>
 
@@ -1001,7 +1032,7 @@ INDEX_HTML = """<!doctype html>
       </aside>
 
       <main class="main">
-        <div class="card guideSection" data-guide="providerCreate">
+        <div class="card guideSection" id="providerCreateCard" data-guide="providerCreate">
           <h2>Claude 桥接账号</h2>
           <div class="sectionHint">把某个 ChatGPT 账号接到 Claude Code。通常只需要选账号，然后创建并设为当前。</div>
           <div class="row">
@@ -1015,7 +1046,7 @@ INDEX_HTML = """<!doctype html>
           <div class="muted">工具会自动写入本地 bridge 配置，不需要手动编辑 URL/token。</div>
         </div>
 
-        <div class="card guideSection" data-guide="cliHome">
+        <div class="card guideSection" id="cliHomeCard" data-guide="cliHome">
           <h2>Codex CLI 独立账号</h2>
           <div class="sectionHint">给 Codex CLI 单独指定账号，不影响 Codex 桌面端默认 <code>~/.codex</code>。</div>
           <div class="row">
@@ -1046,8 +1077,9 @@ INDEX_HTML = """<!doctype html>
           </div>
         </div>
 
-        <div class="card guideSection" data-guide="providerManage">
-          <h2>Claude Provider 管理</h2>
+        <details class="card guideSection" id="providerManageCard" data-guide="providerManage">
+          <summary>高级：Claude Provider 管理</summary>
+          <div class="detailsBody">
           <div class="sectionHint">只在需要切换、修复、排查 token 时使用。日常只看“当前”和“账号”。</div>
           <div class="row">
             <button onclick="refreshData()">刷新</button>
@@ -1070,10 +1102,12 @@ INDEX_HTML = """<!doctype html>
               <tbody></tbody>
             </table>
           </div>
-        </div>
+          </div>
+        </details>
 
-        <div class="card guideSection" data-guide="status">
-          <h2>账号状态检查</h2>
+        <details class="card guideSection" id="statusCard" data-guide="status" open>
+          <summary>账号状态检查</summary>
+          <div class="detailsBody">
           <div class="sectionHint">用于确认 Codex Provider、CLI Home 是否绑定到正确账号。红色 mismatch 表示可能串号。</div>
           <div class="tableWrap">
             <table id="codexProvidersTable">
@@ -1097,12 +1131,15 @@ INDEX_HTML = """<!doctype html>
               <tbody></tbody>
             </table>
           </div>
-        </div>
+          </div>
+        </details>
 
-        <div class="card guideSection" data-guide="log">
-          <h2>执行日志</h2>
+        <details class="card guideSection" data-guide="log">
+          <summary>执行日志</summary>
+          <div class="detailsBody">
           <textarea id="log" readonly></textarea>
-        </div>
+          </div>
+        </details>
       </main>
     </div>
   </div>
@@ -1179,6 +1216,13 @@ INDEX_HTML = """<!doctype html>
     function selectedProviderId() {
       const chosen = document.querySelector('input[name="providerPick"]:checked');
       return chosen ? chosen.value : '';
+    }
+    function scrollToSection(id) {
+      const section = document.getElementById(id);
+      if (!section) return;
+      if (section.tagName === 'DETAILS') section.open = true;
+      section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      setGuide(section.dataset.guide || 'providerCreate');
     }
     function setGuide(key) {
       const guide = GUIDES[key] || GUIDES.providerCreate;
@@ -1340,12 +1384,39 @@ INDEX_HTML = """<!doctype html>
         body.appendChild(tr);
       });
     }
+    function renderHealth(data) {
+      const accountCount = data.accounts.length;
+      const providerCount = data.providers.length;
+      const mismatchCount = data.codex_providers.filter((p) => p.token_mismatch).length;
+      const cliHomeCount = data.cli_homes.length;
+      document.getElementById('tileAccounts').textContent = accountCount;
+      document.getElementById('tileProviders').textContent = providerCount;
+      document.getElementById('tileMismatches').textContent = mismatchCount;
+      document.getElementById('tileMismatches').className = `tileValue ${mismatchCount ? 'bad' : 'ok'}`;
+      document.getElementById('tileCliHomes').textContent = cliHomeCount;
+      const box = document.getElementById('recommendation');
+      let state = 'okState';
+      let text = '状态正常。需要切账号时，直接使用上方两个创建入口。';
+      if (accountCount === 0) {
+        state = 'warnState';
+        text = '未发现 CC Switch Codex OAuth 账号。先在 CC Switch 登录目标 ChatGPT 账号，再回这里刷新。';
+      } else if (mismatchCount > 0) {
+        state = 'badState';
+        text = `发现 ${mismatchCount} 个 Codex Provider 账号不匹配。打开“账号状态检查”，重新同步对应 CLI 账号。`;
+      } else if (providerCount === 0) {
+        state = 'warnState';
+        text = '还没有 Claude Provider。点击“创建 Claude 桥接”，选择账号后创建。';
+      }
+      box.className = `recommend ${state}`;
+      box.textContent = text;
+    }
     async function refreshData() {
       const data = await api(tokenVisible ? '/api/data?include_secrets=1' : '/api/data');
       lastData = data;
       const mismatches = data.codex_providers.filter((p) => p.token_mismatch).length;
       document.getElementById('status').innerHTML = `版本: <b>${esc(data.version || '')}</b> | 账号: <b>${data.accounts.length}</b> | Claude providers: <b>${data.providers.length}</b> | Codex mismatches: <b class="${mismatches ? 'bad' : 'ok'}">${mismatches}</b>`;
       document.getElementById('paths').textContent = `db: ${data.paths.db}\\nsettings: ${data.paths.settings}\\nauth_store: ${data.paths.auth_store}`;
+      renderHealth(data);
       renderAccounts(data.accounts);
       renderProviders(data);
       renderCodexProviders(data);
