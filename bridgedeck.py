@@ -32,7 +32,7 @@ DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 MAX_REQUEST_BYTES = 1024 * 1024
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -1093,7 +1093,7 @@ INDEX_HTML = """<!doctype html>
               <thead>
                 <tr>
                   <th class="nameCol">name</th>
-                  <th class="smallCol">current</th>
+                  <th class="smallCol">当前</th>
                   <th class="accountCol">account</th>
                   <th class="urlCol">base_url</th>
                   <th class="tokenCol">token</th>
@@ -1113,12 +1113,13 @@ INDEX_HTML = """<!doctype html>
             <table id="codexProvidersTable">
               <thead>
                 <tr>
-                  <th class="nameCol">name</th><th class="smallCol">current</th><th class="accountCol">绑定账号</th><th class="accountCol">实际账号</th><th class="smallCol">状态</th>
+                  <th class="nameCol">名称</th><th class="smallCol">当前</th><th class="accountCol">绑定账号</th><th class="accountCol">实际账号</th><th class="smallCol">状态</th>
                 </tr>
               </thead>
               <tbody></tbody>
             </table>
           </div>
+          <div id="diagnosis" class="recommend"></div>
           <br />
           <div class="muted">已配置 CLI 目录：这里只显示已经存在的 CODEX_HOME。</div>
           <div class="tableWrap">
@@ -1158,7 +1159,7 @@ INDEX_HTML = """<!doctype html>
           '显示名称不用改，除非你想重命名。',
           '保持“设为当前”勾选。',
           '点击“创建/更新 Claude 桥接”。',
-          '下方 Provider 管理里看到 settings=true 就生效。'
+          '下方 Provider 管理里看到“设置同步”就生效。'
         ]
       },
       cliHome: {
@@ -1207,6 +1208,22 @@ INDEX_HTML = """<!doctype html>
     };
     function esc(value) {
       return String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    function maskEmail(value) {
+      const text = String(value || '');
+      if (!text.includes('@')) return text;
+      const [left, domain] = text.split('@');
+      if (!left || !domain) return text;
+      const visible = left.length <= 2 ? left[0] : `${left.slice(0, 2)}***${left.slice(-1)}`;
+      return `${visible}@${domain}`;
+    }
+    function maskId(value) {
+      const text = String(value || '');
+      if (text.length <= 12) return text;
+      return `${text.slice(0, 8)}...${text.slice(-4)}`;
+    }
+    function humanPath(value) {
+      return String(value || '').replace(/^\\/Users\\/[^/]+/, '~');
     }
     function log(msg) {
       const box = document.getElementById('log');
@@ -1259,7 +1276,7 @@ INDEX_HTML = """<!doctype html>
       if (!item) return;
       const shortId = item.account_id.slice(0, 8);
       const label = item.email && item.email.includes('@') ? item.email.split('@')[0] : shortId;
-      document.getElementById('cliHome').value = item.default_cli_home || `~/.codex-cli-${label}`;
+      document.getElementById('cliHome').value = humanPath(item.default_cli_home || `~/.codex-cli-${label}`);
       document.getElementById('cliProfileName').value = label;
     }
     function selectCliAccount(accountId) {
@@ -1268,7 +1285,7 @@ INDEX_HTML = """<!doctype html>
       if (idx < 0) return;
       cliSel.selectedIndex = idx;
       applyCliAccountDefaults(lastAccounts[idx]);
-      log(`CLI 账号已选中: ${accountId}`);
+      log(`CLI 账号已选中: ${maskId(accountId)}`);
     }
     async function api(path, method='GET', payload=null) {
       const init = { method, headers: { 'X-CCSBT-Token': CSRF_TOKEN } };
@@ -1292,8 +1309,8 @@ INDEX_HTML = """<!doctype html>
       accounts.forEach((a) => {
         const opt = document.createElement('option');
         opt.value = a.account_id;
-        const mail = a.email ? ` (${a.email})` : '';
-        opt.textContent = `${a.account_id}${mail}`;
+        const mail = a.email ? ` (${maskEmail(a.email)})` : '';
+        opt.textContent = `${maskId(a.account_id)}${mail}`;
         sel.appendChild(opt);
         cliSel.appendChild(opt.cloneNode(true));
       });
@@ -1328,10 +1345,10 @@ INDEX_HTML = """<!doctype html>
       accounts.forEach((a) => {
         const tr = document.createElement('tr');
         tr.innerHTML = `
-          <td>${esc(a.label || '')}</td>
-          <td>${esc(a.email || '')}</td>
-          <td class="mono">${esc(a.account_id || '')}</td>
-          <td class="mono">${esc(a.default_cli_home || '')}</td>
+          <td>${esc(maskEmail(a.email || a.label || ''))}</td>
+          <td>${esc(maskEmail(a.email || ''))}</td>
+          <td class="mono">${esc(maskId(a.account_id || ''))}</td>
+          <td class="mono">${esc(humanPath(a.default_cli_home || ''))}</td>
           <td><button class="miniBtn" onclick="selectCliAccount('${esc(a.account_id)}')">选用</button></td>
         `;
         body.appendChild(tr);
@@ -1345,8 +1362,8 @@ INDEX_HTML = """<!doctype html>
         const currentBySettings = data.current_provider_from_settings === p.id;
         tr.innerHTML = `
           <td><label class="providerNameCell"><input type="radio" name="providerPick" value="${esc(p.id)}"><span class="providerNameText">${esc(p.name)}</span></label></td>
-          <td>${p.is_current ? '<span class="ok">db=true</span>' : 'db=false'} ${currentBySettings ? '<span class="ok">settings=true</span>' : ''}</td>
-          <td class="mono">${esc(p.account_id || '')}</td>
+          <td>${p.is_current ? '<span class="ok">当前</span>' : '<span class="muted">未选</span>'} ${currentBySettings ? '<span class="ok">设置同步</span>' : ''}</td>
+          <td class="mono">${esc(maskId(p.account_id || ''))}</td>
           <td class="mono">${esc(p.base_url || '')}</td>
           <td class="mono">${esc(tokenText(p))}</td>
         `;
@@ -1358,12 +1375,12 @@ INDEX_HTML = """<!doctype html>
       body.innerHTML = '';
       data.codex_providers.forEach((p) => {
         const tr = document.createElement('tr');
-        const status = p.token_mismatch ? '<span class="bad">mismatch</span>' : '<span class="ok">ok</span>';
+        const status = p.token_mismatch ? '<span class="bad">账号不一致</span>' : '<span class="ok">正常</span>';
         tr.innerHTML = `
           <td>${esc(p.name)}</td>
-          <td>${p.is_current ? '<span class="ok">true</span>' : 'false'}</td>
-          <td>${esc(p.meta_account_id || '')}</td>
-          <td>${esc(p.token_account_id || '')}</td>
+          <td>${p.is_current ? '<span class="ok">当前使用</span>' : '<span class="muted">备用</span>'}</td>
+          <td>${esc(maskId(p.meta_account_id || ''))}</td>
+          <td>${esc(maskId(p.token_account_id || ''))}</td>
           <td>${status}</td>
         `;
         body.appendChild(tr);
@@ -1375,9 +1392,9 @@ INDEX_HTML = """<!doctype html>
       data.cli_homes.forEach((h) => {
         const tr = document.createElement('tr');
         tr.innerHTML = `
-          <td class="cmd">${esc(h.path)}</td>
-          <td>${esc(h.token_account_id || h.access_account_id || '')}</td>
-          <td>${esc(h.email || '')}</td>
+          <td class="cmd">${esc(humanPath(h.path))}</td>
+          <td>${esc(maskId(h.token_account_id || h.access_account_id || ''))}</td>
+          <td>${esc(maskEmail(h.email || ''))}</td>
           <td>${esc(h.plan || '')}</td>
           <td>${esc(h.last_refresh || '')}</td>
         `;
@@ -1410,17 +1427,50 @@ INDEX_HTML = """<!doctype html>
       box.className = `recommend ${state}`;
       box.textContent = text;
     }
+    function renderDiagnosis(data) {
+      const currentCodex = data.codex_providers.filter((p) => p.is_current);
+      const mismatches = data.codex_providers.filter((p) => p.token_mismatch);
+      const defaultCli = data.cli_homes.find((h) => humanPath(h.path) === '~/.codex');
+      const advice = [];
+      let state = 'okState';
+      if (data.accounts.length === 0) {
+        state = 'warnState';
+        advice.push('未检测到 CC Switch 中的 Codex OAuth 账号：先去 CC Switch 登录账号。');
+      }
+      if (currentCodex.length === 0) {
+        state = 'warnState';
+        advice.push('没有检测到当前 Codex Provider：在 CC Switch 里选一个 Codex Provider。');
+      } else {
+        advice.push(`当前 Codex Provider：${currentCodex.map((p) => p.name).join(', ')}。`);
+      }
+      if (mismatches.length > 0) {
+        state = 'badState';
+        advice.push(`发现 ${mismatches.length} 个账号不一致：重新同步对应 CLI 账号，或回 CC Switch 重新登录。`);
+      } else {
+        advice.push('绑定账号与实际 token 账号一致。');
+      }
+      if (defaultCli) {
+        advice.push(`默认 Codex CLI 账号：${defaultCli.plan || '未知套餐'}，${maskEmail(defaultCli.email || '') || '无邮箱信息'}。`);
+      } else {
+        state = state === 'badState' ? state : 'warnState';
+        advice.push('未检测到默认 ~/.codex/auth.json：Codex CLI 可能还没登录。');
+      }
+      const box = document.getElementById('diagnosis');
+      box.className = `recommend ${state}`;
+      box.innerHTML = `<b>自动检测意见</b><br>${advice.map((item) => `- ${esc(item)}`).join('<br>')}`;
+    }
     async function refreshData() {
       const data = await api(tokenVisible ? '/api/data?include_secrets=1' : '/api/data');
       lastData = data;
       const mismatches = data.codex_providers.filter((p) => p.token_mismatch).length;
       document.getElementById('status').innerHTML = `版本: <b>${esc(data.version || '')}</b> | 账号: <b>${data.accounts.length}</b> | Claude providers: <b>${data.providers.length}</b> | Codex mismatches: <b class="${mismatches ? 'bad' : 'ok'}">${mismatches}</b>`;
-      document.getElementById('paths').textContent = `db: ${data.paths.db}\\nsettings: ${data.paths.settings}\\nauth_store: ${data.paths.auth_store}`;
+      document.getElementById('paths').textContent = `db: ${humanPath(data.paths.db)}\\nsettings: ${humanPath(data.paths.settings)}\\nauth_store: ${humanPath(data.paths.auth_store)}`;
       renderHealth(data);
       renderAccounts(data.accounts);
       renderProviders(data);
       renderCodexProviders(data);
       renderCliHomes(data);
+      renderDiagnosis(data);
       log('数据已刷新');
     }
     async function createProvider() {

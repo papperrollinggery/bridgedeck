@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+- Replaced boolean provider states with Chinese labels.
+- Added automatic diagnosis advice for account/provider/CLI status.
+- Masked email addresses, account IDs, and home paths in the UI to make screenshots safer.
+
 ## 0.2.1
 
 - Simplified the first screen with status tiles, recommended next action, and direct workflow buttons.
