@@ -32,7 +32,7 @@ DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.3"
+APP_VERSION = "0.2.4"
 MAX_REQUEST_BYTES = 1024 * 1024
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -213,9 +213,12 @@ class BridgeManager:
         access_token = token_obj.get("access_token") if isinstance(token_obj.get("access_token"), str) else ""
         refresh_token = token_obj.get("refresh_token") if isinstance(token_obj.get("refresh_token"), str) else ""
         identity = jwt_identity(access_token)
+        is_default = codex_home == DEFAULT_CODEX_HOME
         return {
             "path": str(codex_home),
             "exists": auth_path.exists(),
+            "is_default": is_default,
+            "run_command": "codex" if is_default else f"CODEX_HOME={codex_home} codex",
             "auth_mode": payload.get("auth_mode") if isinstance(payload.get("auth_mode"), str) else "",
             "last_refresh": payload.get("last_refresh") if isinstance(payload.get("last_refresh"), str) else "",
             "token_account_id": token_obj.get("account_id") if isinstance(token_obj.get("account_id"), str) else "",
@@ -970,6 +973,7 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     for home in redacted.get("cli_homes", []):
         if isinstance(home, dict):
             home["path"] = redact_path_value(home.get("path"))
+            home["run_command"] = redact_path_value(home.get("run_command"))
             home["token_account_id"] = mask_id_value(home.get("token_account_id"))
             home["access_account_id"] = mask_id_value(home.get("access_account_id"))
             home["email"] = mask_email_value(home.get("email"))
@@ -1091,7 +1095,7 @@ INDEX_HTML = """<!doctype html>
       <div id="recommendation" class="recommend">加载中...</div>
       <div class="quickbar">
         <button class="primary" onclick="scrollToSection('providerCreateCard')">创建 Claude 桥接</button>
-        <button onclick="scrollToSection('cliHomeCard')">创建 CLI 独立账号</button>
+        <button onclick="scrollToSection('cliHomeCard')">切换 Codex CLI</button>
         <button onclick="scrollToSection('statusCard')">检查状态</button>
         <button onclick="refreshData()">刷新</button>
       </div>
@@ -1123,8 +1127,8 @@ INDEX_HTML = """<!doctype html>
         </div>
 
         <div class="card guideSection" id="cliHomeCard" data-guide="cliHome">
-          <h2>Codex CLI 独立账号</h2>
-          <div class="sectionHint">给 Codex CLI 单独指定账号，不影响 Codex 桌面端默认 <code>~/.codex</code>。</div>
+          <h2>Codex CLI 切换</h2>
+          <div class="sectionHint">Codex CLI 通过不同 <code>CODEX_HOME</code> 启动不同账号；这里生成独立账号目录和启动命令，不改默认 <code>~/.codex</code>。</div>
           <div class="row">
             <label>账号</label>
             <select id="cliAccount"></select>
@@ -1132,9 +1136,9 @@ INDEX_HTML = """<!doctype html>
             <input id="cliHome" placeholder="~/.codex-cli-pro20x" />
             <label>启动器名称</label>
             <input id="cliProfileName" placeholder="pro20x" />
-            <button class="primary" onclick="createCliHome()">创建/同步 CLI 账号</button>
+            <button class="primary" onclick="createCliHome()">创建/同步并生成启动命令</button>
           </div>
-          <div class="muted">完成后用输出的启动命令打开 CLI。</div>
+          <div class="muted">切换 CLI 账号 = 使用对应启动命令打开新的 Codex CLI。</div>
           <div class="paths" id="cliCommand"></div>
           <div class="muted" style="margin-top:10px;">可用账号：点“选用”自动填入推荐目录。</div>
           <div class="tableWrap">
@@ -1202,7 +1206,7 @@ INDEX_HTML = """<!doctype html>
             <table id="cliHomesTable">
               <thead>
                 <tr>
-                  <th class="urlCol">CLI 目录</th><th class="accountCol">账号</th><th class="urlCol">email</th><th class="smallCol">套餐</th><th class="urlCol">更新时间</th>
+                  <th class="urlCol">CLI 目录</th><th class="urlCol">切换命令</th><th class="accountCol">账号</th><th class="urlCol">email</th><th class="smallCol">套餐</th><th class="urlCol">更新时间</th>
                 </tr>
               </thead>
               <tbody></tbody>
@@ -1239,13 +1243,13 @@ INDEX_HTML = """<!doctype html>
         ]
       },
       cliHome: {
-        title: 'Codex CLI 独立账号',
-        target: '右侧板块：Codex CLI 独立账号',
+        title: 'Codex CLI 切换',
+        target: '右侧板块：Codex CLI 切换',
         steps: [
           '在可用账号表点“选用”。',
           '保存目录保持 ~/.codex-cli-xxx。',
-          '点击“创建/同步 CLI 账号”。',
-          '复制页面输出的 CODEX_HOME=... codex 启动。',
+          '点击“创建/同步并生成启动命令”。',
+          '用页面输出的 CODEX_HOME=... codex 启动该账号。',
           '以后也可双击生成的 .command 启动器。'
         ]
       },
@@ -1462,6 +1466,11 @@ INDEX_HTML = """<!doctype html>
         body.appendChild(tr);
       });
     }
+    function cliRunCommand(home) {
+      if (home.run_command) return humanPath(home.run_command);
+      const path = humanPath(home.path || '');
+      return path === '~/.codex' ? 'codex' : `CODEX_HOME=${path} codex`;
+    }
     function renderCliHomes(data) {
       const body = document.querySelector('#cliHomesTable tbody');
       body.innerHTML = '';
@@ -1469,6 +1478,7 @@ INDEX_HTML = """<!doctype html>
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td class="cmd">${esc(humanPath(h.path))}</td>
+          <td class="cmd">${esc(cliRunCommand(h))}</td>
           <td>${esc(maskId(h.token_account_id || h.access_account_id || ''))}</td>
           <td>${esc(maskEmail(h.email || ''))}</td>
           <td>${esc(h.plan || '')}</td>
@@ -1567,7 +1577,7 @@ INDEX_HTML = """<!doctype html>
       const profileName = document.getElementById('cliProfileName').value.trim();
       if (!accountId || !targetDir) return log('请选择账号并填写 CLI Home');
       const res = await api('/api/create-cli-home', 'POST', { account_id: accountId, target_dir: targetDir, profile_name: profileName });
-      document.getElementById('cliCommand').textContent = `启动命令: ${res.run_command}\\n启动脚本: ${res.launcher}`;
+      document.getElementById('cliCommand').textContent = `启动命令: ${humanPath(res.run_command)}\\n启动脚本: ${humanPath(res.launcher)}`;
       log(`${res.message}: ${res.target_dir}`);
       await refreshData();
     }

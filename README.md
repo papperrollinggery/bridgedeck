@@ -10,8 +10,8 @@ Local web helper for managing CC Switch Codex OAuth bridge providers and isolate
 - 创建或修复走本地 Codex bridge 的 Claude Provider。
 - Keep Claude provider account binding and quota identity intact.
 - 保留 Claude Provider 的账号绑定和额度身份。
-- Create isolated Codex CLI profiles under `~/.codex-cli-*`.
-- 在 `~/.codex-cli-*` 下创建独立 Codex CLI 配置。
+- Create isolated Codex CLI profiles under `~/.codex-cli-*` and show the exact `CODEX_HOME=... codex` switch command.
+- 在 `~/.codex-cli-*` 下创建独立 Codex CLI 配置，并显示精确的 `CODEX_HOME=... codex` 切换命令。
 - Generate `.command` launchers for isolated CLI profiles.
 - 为独立 CLI 账号生成 `.command` 启动器。
 - Detect Codex provider account/token mismatch.
@@ -93,16 +93,16 @@ python3 bridgedeck.py --host 127.0.0.1 --port 8899
 5. 点击 `创建/更新 Claude 桥接`。
 6. 在 `Claude Provider 管理` 中确认目标 Provider 显示 `settings=true`。
 
-### Isolated Codex CLI Account / Codex CLI 独立账号
+### Switch Codex CLI Account / Codex CLI 账号切换
 
-1. In `Codex CLI 独立账号`, click `选用` for the account.
+1. In `Codex CLI 切换`, click `选用` for the account.
 2. Keep the generated directory such as `~/.codex-cli-pro`.
-3. Click `创建/同步 CLI 账号`.
+3. Click `创建/同步并生成启动命令`.
 4. Start CLI using the displayed command:
 
-1. 在 `Codex CLI 独立账号` 中，对目标账号点击 `选用`。
+1. 在 `Codex CLI 切换` 中，对目标账号点击 `选用`。
 2. 保持生成的目录，例如 `~/.codex-cli-pro`。
-3. 点击 `创建/同步 CLI 账号`。
+3. 点击 `创建/同步并生成启动命令`。
 4. 使用页面输出命令启动 CLI：
 
 ```bash

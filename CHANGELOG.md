@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4
+
+- Made Codex CLI switching explicit by showing CODEX_HOME startup commands for each detected CLI profile.
+- Renamed the CLI workflow from isolated account creation to CLI switching.
+
 ## 0.2.3
 
 - Added CSP nonce, frame blocking, and additional browser security headers.

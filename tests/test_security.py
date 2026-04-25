@@ -63,6 +63,8 @@ class FakeManager:
             "cli_homes": [
                 {
                     "path": f"{home}/.codex",
+                    "is_default": True,
+                    "run_command": "codex",
                     "token_account_id": "01234567-89ab-cdef-0123-456789abcdef",
                     "access_account_id": "01234567-89ab-cdef-0123-456789abcdef",
                     "email": "person@example.com",
