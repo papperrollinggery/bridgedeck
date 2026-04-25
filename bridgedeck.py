@@ -32,7 +32,7 @@ DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.2.3"
 MAX_REQUEST_BYTES = 1024 * 1024
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -918,14 +918,90 @@ def origin_host(value: str | None) -> str:
     return urllib.parse.urlsplit(value).hostname or ""
 
 
+def mask_email_value(value: Any) -> Any:
+    if not isinstance(value, str) or "@" not in value:
+        return value
+    left, domain = value.split("@", 1)
+    if not left or not domain:
+        return value
+    visible = left[0] if len(left) <= 2 else f"{left[:2]}***{left[-1]}"
+    return f"{visible}@{domain}"
+
+
+def mask_id_value(value: Any) -> Any:
+    if not isinstance(value, str) or len(value) <= 12:
+        return value
+    return f"{value[:8]}...{value[-4:]}"
+
+
+def redact_path_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    home = str(Path.home())
+    if value == home:
+        return "~"
+    if value.startswith(f"{home}/"):
+        return f"~/{value[len(home) + 1:]}"
+    return value
+
+
+def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    redacted = copy.deepcopy(payload)
+    paths = redacted.get("paths")
+    if isinstance(paths, dict):
+        for key, value in list(paths.items()):
+            paths[key] = redact_path_value(value)
+    for account in redacted.get("accounts", []):
+        if isinstance(account, dict):
+            account["account_id"] = mask_id_value(account.get("account_id"))
+            account["email"] = mask_email_value(account.get("email"))
+            account["label"] = mask_email_value(account.get("label"))
+            account["default_cli_home"] = redact_path_value(account.get("default_cli_home"))
+    for provider in redacted.get("providers", []):
+        if isinstance(provider, dict):
+            provider["account_id"] = mask_id_value(provider.get("account_id"))
+            provider["base_url"] = re.sub(r"/accounts/[^/?#]+", "/accounts/<redacted>", str(provider.get("base_url") or ""))
+            provider["auth_token"] = ""
+            provider["auth_token_masked"] = mask_token(provider.get("auth_token_masked"))
+    for provider in redacted.get("codex_providers", []):
+        if isinstance(provider, dict):
+            provider["meta_account_id"] = mask_id_value(provider.get("meta_account_id"))
+            provider["token_account_id"] = mask_id_value(provider.get("token_account_id"))
+    for home in redacted.get("cli_homes", []):
+        if isinstance(home, dict):
+            home["path"] = redact_path_value(home.get("path"))
+            home["token_account_id"] = mask_id_value(home.get("token_account_id"))
+            home["access_account_id"] = mask_id_value(home.get("access_account_id"))
+            home["email"] = mask_email_value(home.get("email"))
+    return redacted
+
+
+def send_security_headers(handler: BaseHTTPRequestHandler, *, csp_nonce: str | None = None) -> None:
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.send_header("Referrer-Policy", "no-referrer")
+    handler.send_header("X-Frame-Options", "DENY")
+    handler.send_header("Cross-Origin-Resource-Policy", "same-origin")
+    handler.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
+    if csp_nonce:
+        handler.send_header(
+            "Content-Security-Policy",
+            (
+                "default-src 'none'; "
+                f"script-src 'nonce-{csp_nonce}'; "
+                f"style-src 'nonce-{csp_nonce}'; "
+                "connect-src 'self'; img-src 'self' data:; "
+                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            ),
+        )
+
+
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
-    handler.send_header("Cache-Control", "no-store")
-    handler.send_header("X-Content-Type-Options", "nosniff")
-    handler.send_header("Referrer-Policy", "no-referrer")
+    send_security_headers(handler)
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -936,7 +1012,7 @@ INDEX_HTML = """<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>BridgeDeck</title>
-  <style>
+  <style nonce="__CSP_NONCE__">
     :root { --bg:#0f1115; --panel:#171a21; --line:#2a3040; --text:#e8ecf5; --muted:#9aa4b5; --ok:#39c980; --warn:#f0b429; --bad:#ff6b6b; --brand:#56a8ff; }
     * { box-sizing: border-box; }
     body { margin:0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
@@ -1145,7 +1221,7 @@ INDEX_HTML = """<!doctype html>
     </div>
   </div>
 
-  <script>
+  <script nonce="__CSP_NONCE__">
     const CSRF_TOKEN = "__CSRF_TOKEN__";
     let lastData = null;
     let tokenVisible = false;
@@ -1522,7 +1598,13 @@ INDEX_HTML = """<!doctype html>
 """
 
 
-def build_handler(manager: BridgeManager, csrf_token: str, allow_sensitive: bool, allow_remote_access: bool):
+def build_handler(
+    manager: BridgeManager,
+    csrf_token: str,
+    csp_nonce: str,
+    allow_sensitive: bool,
+    allow_remote_access: bool,
+):
     class Handler(BaseHTTPRequestHandler):
         def _valid_host(self) -> bool:
             host = host_from_header(self.headers.get("Host"))
@@ -1539,24 +1621,35 @@ def build_handler(manager: BridgeManager, csrf_token: str, allow_sensitive: bool
         def _valid_csrf(self) -> bool:
             return secrets.compare_digest(self.headers.get("X-CCSBT-Token", ""), csrf_token)
 
+        def _valid_fetch_metadata(self) -> bool:
+            site = self.headers.get("Sec-Fetch-Site")
+            if not site:
+                return True
+            return site in {"same-origin", "same-site", "none"}
+
         def do_GET(self) -> None:
             if not self._valid_host():
                 json_response(self, 403, {"ok": False, "error": "Invalid Host header"})
                 return
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/":
-                body = INDEX_HTML.replace("__CSRF_TOKEN__", csrf_token).encode("utf-8")
+                body = (
+                    INDEX_HTML.replace("__CSRF_TOKEN__", csrf_token)
+                    .replace("__CSP_NONCE__", csp_nonce)
+                    .encode("utf-8")
+                )
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Referrer-Policy", "no-referrer")
+                send_security_headers(self, csp_nonce=csp_nonce)
                 self.end_headers()
                 self.wfile.write(body)
                 return
             if parsed.path == "/api/data":
                 try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
                     if not self._valid_csrf():
                         json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
                         return
@@ -1565,7 +1658,10 @@ def build_handler(manager: BridgeManager, csrf_token: str, allow_sensitive: bool
                     if include_secrets and not allow_sensitive:
                         json_response(self, 403, {"ok": False, "error": "Secret display is disabled for remote mode"})
                         return
-                    payload = {"ok": True, **manager.snapshot(include_secrets=include_secrets)}
+                    snapshot = manager.snapshot(include_secrets=include_secrets)
+                    if not allow_sensitive:
+                        snapshot = redact_snapshot(snapshot)
+                    payload = {"ok": True, **snapshot}
                     json_response(self, 200, payload)
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
@@ -1578,6 +1674,9 @@ def build_handler(manager: BridgeManager, csrf_token: str, allow_sensitive: bool
                 return
             if not self._valid_origin():
                 json_response(self, 403, {"ok": False, "error": "Invalid Origin header"})
+                return
+            if not self._valid_fetch_metadata():
+                json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
                 return
             if not allow_sensitive:
                 json_response(self, 403, {"ok": False, "error": "Write APIs are disabled for remote mode"})
@@ -1677,6 +1776,7 @@ def main() -> int:
     allow_sensitive = host_is_loopback or bool(args.allow_remote_write)
     handler = build_handler(
         manager,
+        secrets.token_urlsafe(32),
         secrets.token_urlsafe(32),
         allow_sensitive=allow_sensitive,
         allow_remote_access=bool(args.allow_remote),

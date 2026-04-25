@@ -24,21 +24,50 @@ class FakeManager:
         self.set_current_called = False
 
     def snapshot(self, include_secrets: bool = False) -> dict[str, Any]:
+        home = str(Path.home())
         return {
             "version": bridgedeck.APP_VERSION,
-            "paths": {"db": "", "settings": "", "auth_store": ""},
+            "paths": {
+                "db": f"{home}/.cc-switch/cc-switch.db",
+                "settings": f"{home}/.cc-switch/settings.json",
+                "auth_store": f"{home}/.cc-switch/codex_oauth_auth.json",
+            },
             "exists": {"db": False, "settings": False, "auth_store": False},
-            "accounts": [],
+            "accounts": [
+                {
+                    "account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "email": "person@example.com",
+                    "label": "person@example.com",
+                    "default_cli_home": f"{home}/.codex-cli-person",
+                }
+            ],
             "providers": [
                 {
                     "id": "provider-1",
                     "name": "Provider",
+                    "account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "base_url": "http://127.0.0.1:8876/accounts/01234567-89ab-cdef-0123-456789abcdef",
                     "auth_token": "full-token" if include_secrets else "",
                     "auth_token_masked": "full...oken",
                 }
             ],
-            "codex_providers": [],
-            "cli_homes": [],
+            "codex_providers": [
+                {
+                    "id": "codex-1",
+                    "name": "Codex",
+                    "meta_account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "token_account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "token_mismatch": False,
+                }
+            ],
+            "cli_homes": [
+                {
+                    "path": f"{home}/.codex",
+                    "token_account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "access_account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "email": "person@example.com",
+                }
+            ],
             "current_provider_from_settings": "",
         }
 
@@ -65,6 +94,7 @@ class ServerCase(unittest.TestCase):
         handler = bridgedeck.build_handler(
             manager,
             "test-token",
+            "test-nonce",
             allow_sensitive=allow_sensitive,
             allow_remote_access=allow_remote_access,
         )
@@ -123,6 +153,20 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["providers"][0]["auth_token"], "full-token")
 
+    def test_html_uses_csp_and_no_frame_headers(self) -> None:
+        server, _ = self.start_server()
+        request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/")
+        request.add_header("Host", "127.0.0.1")
+
+        with urllib.request.urlopen(request, timeout=5) as response:
+            html = response.read().decode("utf-8")
+            csp = response.headers["Content-Security-Policy"]
+
+        self.assertIn('nonce="test-nonce"', html)
+        self.assertIn("script-src 'nonce-test-nonce'", csp)
+        self.assertIn("frame-ancestors 'none'", csp)
+        self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+
     def test_remote_mode_blocks_secret_reveal(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
 
@@ -148,6 +192,38 @@ class ServerCase(unittest.TestCase):
 
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "Write APIs are disabled for remote mode")
+        self.assertFalse(manager.set_current_called)
+
+    def test_remote_mode_redacts_snapshot_fields(self) -> None:
+        server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
+
+        status, payload = self.request(
+            server,
+            "/api/data",
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["accounts"][0]["account_id"], "01234567...cdef")
+        self.assertEqual(payload["accounts"][0]["email"], "pe***n@example.com")
+        self.assertEqual(payload["accounts"][0]["default_cli_home"], "~/.codex-cli-person")
+        self.assertEqual(payload["providers"][0]["account_id"], "01234567...cdef")
+        self.assertIn("/accounts/<redacted>", payload["providers"][0]["base_url"])
+        self.assertEqual(payload["cli_homes"][0]["path"], "~/.codex")
+
+    def test_cross_site_fetch_metadata_is_rejected(self) -> None:
+        server, manager = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/set-current",
+            method="POST",
+            body={"provider_id": "provider-1"},
+            headers={"Sec-Fetch-Site": "cross-site", "X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "Invalid fetch metadata")
         self.assertFalse(manager.set_current_called)
 
     def test_post_rejects_non_loopback_origin(self) -> None:

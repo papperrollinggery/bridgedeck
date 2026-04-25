@@ -43,6 +43,12 @@ Do not publish these files.
 - `include_secrets=1` 必须携带浏览器令牌。
 - Host/Origin checks reject unexpected browser contexts.
 - Host/Origin 校验会拒绝异常浏览器上下文。
+- Cross-site Fetch Metadata is rejected where browsers provide it.
+- 浏览器提供 Fetch Metadata 时会拒绝跨站请求。
+- Remote read-only mode redacts account identifiers, emails, local paths, and bridge account URLs in API responses.
+- 远程只读模式会在 API 响应中脱敏账号标识、邮箱、本地路径和 bridge 账号 URL。
+- HTML responses use a nonce-based CSP and frame blocking headers.
+- HTML 响应使用 nonce CSP 和防嵌入响应头。
 - Request bodies are size-limited.
 - 请求体有大小限制。
 

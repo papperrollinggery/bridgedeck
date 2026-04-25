@@ -152,12 +152,18 @@ Backups are written to:
 - 非本机监听必须显式传入 `--allow-remote`。
 - Remote mode is read-only by default and cannot reveal full tokens.
 - 远程模式默认只读，不能显示完整 token。
+- Remote read-only mode redacts account IDs, email addresses, local paths, and bridge account URLs in API responses.
+- 远程只读模式会在 API 响应中脱敏 account id、邮箱、本地路径和 bridge 账号 URL。
 - Write APIs and token reveal in remote mode require `--allow-remote-write`.
 - 远程模式下写入和显示 token 必须额外传入 `--allow-remote-write`。
 - All API requests require a per-run browser token.
 - 所有 API 请求都需要本次启动生成的浏览器令牌。
+- API requests reject cross-site Fetch Metadata where supported by the browser.
+- 浏览器支持 Fetch Metadata 时，API 会拒绝跨站请求。
 - Full tokens are not returned by `/api/data` unless the UI explicitly requests `include_secrets=1`.
 - `/api/data` 默认不返回完整 token，只有 UI 明确请求 `include_secrets=1` 才返回。
+- The page sends CSP, frame blocking, no-store, nosniff, and referrer policy headers.
+- 页面会发送 CSP、防嵌入、no-store、nosniff 和 referrer policy 安全响应头。
 - Do not expose this app to a public network.
 - 不要把本工具暴露到公网。
 

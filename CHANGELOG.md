@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3
+
+- Added CSP nonce, frame blocking, and additional browser security headers.
+- Added Fetch Metadata rejection for cross-site API requests.
+- Redacted account identifiers, emails, local paths, and bridge URLs server-side in remote read-only mode.
+
 ## 0.2.2
 
 - Replaced boolean provider states with Chinese labels.
