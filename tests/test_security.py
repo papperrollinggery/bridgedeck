@@ -257,6 +257,8 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(result["quota_status"], "near_limit")
         self.assertEqual(result["windows"][0]["name"], "5小时")
         self.assertEqual(result["windows"][1]["name"], "7天")
+        self.assertEqual(result["capacity_factor"], 1)
+        self.assertEqual(result["effective_remaining_units"], 16.0)
 
     def test_quota_summary_extracts_spark_additional_limit(self) -> None:
         payload = {
@@ -542,17 +544,78 @@ class LauncherCase(unittest.TestCase):
             self.assertEqual(create_provider.call_args.args[0], "acct-new-plus")
             set_current.assert_called_once_with("created-plus")
 
+    def test_auto_switch_keeps_current_bridge_account_until_limit_reached(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+            snapshot = {
+                "providers": [
+                    {
+                        "id": "current-plus",
+                        "name": "Local Codex Bridge - Plus",
+                        "is_current": True,
+                        "account_id": "acct-plus",
+                        "base_url": "http://127.0.0.1:8876/accounts/acct-plus",
+                    },
+                    {
+                        "id": "pro-max",
+                        "name": "Local Codex Bridge - Pro Max 20x",
+                        "is_current": False,
+                        "account_id": "acct-pro-max",
+                        "base_url": "http://127.0.0.1:8876/accounts/acct-pro-max",
+                    },
+                ],
+                "current_provider_from_settings": "current-plus",
+                "codex_desktop": {"managed_by": "bridgedeck_or_local_bridge", "account_id": "acct-plus"},
+            }
+            quotas = {
+                "ok": True,
+                "quotas": [
+                    {"account_id": "acct-plus", "quota_status": "near_limit", "limit_reached": False, "plan_type": "plus", "windows": [{"used_percent": 99}]},
+                    {"account_id": "acct-pro-max", "quota_status": "ok", "limit_reached": False, "plan_type": "pro", "windows": [{"used_percent": 0}]},
+                ],
+            }
+            with mock.patch.object(manager, "_load_auto_switch_config", return_value={"enabled": True, "claude": True, "default_codex": True, "priority": [], "last_result": {}}), \
+                mock.patch.object(manager, "snapshot", return_value=snapshot), \
+                mock.patch.object(manager, "quotas", return_value=quotas), \
+                mock.patch.object(manager, "set_current_provider") as set_current, \
+                mock.patch.object(manager, "set_default_codex_account") as set_codex, \
+                mock.patch.object(manager, "_save_auto_switch_config"):
+                result = manager.run_auto_switch()
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(set_current.called)
+            self.assertFalse(set_codex.called)
+            self.assertEqual(result["actions"][0]["reason"], "current_account_still_usable")
+            self.assertEqual(result["actions"][1]["reason"], "current_account_still_usable")
+
     def test_auto_switch_priority_uses_quota_plan_before_provider_name(self) -> None:
         manager = self.make_manager(Path(tempfile.mkdtemp()))
         snapshot = {"providers": [{"name": "Local Codex Bridge - Old Pro", "account_id": "acct-pro"}]}
         quotas = [
-            {"account_id": "acct-pro", "quota_status": "ok", "limit_reached": False, "plan_type": "pro"},
-            {"account_id": "acct-plus-new", "quota_status": "ok", "limit_reached": False, "plan_type": "plus"},
+            {"account_id": "acct-pro", "quota_status": "ok", "limit_reached": False, "plan_type": "pro", "windows": [{"used_percent": 99}]},
+            {"account_id": "acct-plus-new", "quota_status": "ok", "limit_reached": False, "plan_type": "plus", "windows": [{"used_percent": 50}]},
         ]
 
         best = manager._best_quota_account(snapshot, quotas)
 
         self.assertEqual(best["account_id"], "acct-plus-new")
+
+    def test_auto_switch_prefers_larger_effective_remaining_capacity(self) -> None:
+        manager = self.make_manager(Path(tempfile.mkdtemp()))
+        snapshot = {
+            "providers": [
+                {"name": "Local Codex Bridge - Plus", "account_id": "acct-plus"},
+                {"name": "Local Codex Bridge - Pro Max 20x", "account_id": "acct-pro-max"},
+            ]
+        }
+        quotas = [
+            {"account_id": "acct-plus", "quota_status": "ok", "limit_reached": False, "plan_type": "plus", "windows": [{"used_percent": 95}]},
+            {"account_id": "acct-pro-max", "quota_status": "near_limit", "limit_reached": False, "plan_type": "pro", "windows": [{"used_percent": 99}]},
+        ]
+
+        best = manager._best_quota_account(snapshot, quotas)
+
+        self.assertEqual(best["account_id"], "acct-pro-max")
 
     def test_create_missing_bridge_providers_creates_without_switching_current(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

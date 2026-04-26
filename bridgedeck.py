@@ -625,13 +625,24 @@ class BridgeManager:
         names = " ".join(str(p.get("name") or "").lower() for p in providers if p.get("account_id") == account_id)
         plan_type = str((quota or {}).get("plan_type") or "").lower()
         haystack = f"{plan_type} {names}"
+        if "20x" in haystack or "pro max" in haystack or "promax" in haystack:
+            return (2, haystack)
         if "plus" in haystack:
             return (0, haystack)
-        if "20x" in haystack:
-            return (2, haystack)
         if "pro" in haystack:
             return (1, haystack)
         return (9, account_id)
+
+    def _quota_capacity_factor(self, account_id: str, providers: list[dict[str, Any]], quota: dict[str, Any] | None = None) -> int:
+        names = " ".join(str(p.get("name") or "").lower() for p in providers if p.get("account_id") == account_id)
+        plan_type = str((quota or {}).get("plan_type") or "").lower()
+        return quota_capacity_factor_from_text(plan_type, names)
+
+    def _quota_effective_remaining(self, account_id: str, providers: list[dict[str, Any]], quota: dict[str, Any]) -> float:
+        return effective_remaining_units(
+            quota.get("windows", []) if isinstance(quota.get("windows"), list) else [],
+            self._quota_capacity_factor(account_id, providers, quota),
+        )
 
     def _is_bridge_provider(self, provider: dict[str, Any] | None) -> bool:
         if not provider:
@@ -658,8 +669,18 @@ class BridgeManager:
         ]
         if not usable:
             return None
-        usable.sort(key=lambda q: self._priority_rank(str(q.get("account_id") or ""), providers, q))
+        usable.sort(
+            key=lambda q: (
+                -self._quota_effective_remaining(str(q.get("account_id") or ""), providers, q),
+                self._priority_rank(str(q.get("account_id") or ""), providers, q),
+            )
+        )
         return usable[0]
+
+    def _quota_is_still_usable(self, quota: dict[str, Any] | None) -> bool:
+        if not quota:
+            return False
+        return quota.get("quota_status") in {"ok", "near_limit"} and not quota.get("limit_reached")
 
     def _account_for_id(self, account_id: str) -> dict[str, Any] | None:
         for account in self._load_accounts():
@@ -690,7 +711,13 @@ class BridgeManager:
 
         snapshot = self.snapshot(include_secrets=False)
         quotas = self.quotas().get("quotas", [])
-        best = self._best_quota_account(snapshot, quotas if isinstance(quotas, list) else [])
+        quota_rows = quotas if isinstance(quotas, list) else []
+        quota_by_account = {
+            str(quota.get("account_id") or ""): quota
+            for quota in quota_rows
+            if isinstance(quota, dict) and quota.get("account_id")
+        }
+        best = self._best_quota_account(snapshot, quota_rows)
         actions: list[dict[str, Any]] = []
         if not best:
             result = {"ok": False, "enabled": config["enabled"], "message": "没有可用 OpenAI 账号", "actions": []}
@@ -703,7 +730,10 @@ class BridgeManager:
         current_provider = self._current_claude_provider(snapshot)
         if config["claude"]:
             if self._is_bridge_provider(current_provider):
-                if not target_provider:
+                current_account_id = str((current_provider or {}).get("account_id") or "")
+                if current_account_id and self._quota_is_still_usable(quota_by_account.get(current_account_id)):
+                    actions.append({"target": "claude", "changed": False, "reason": "current_account_still_usable"})
+                elif not target_provider:
                     existing_names = {str(p.get("name") or "") for p in providers}
                     provider_name = self._provider_name_for_quota(best_account_id, best, existing_names)
                     created = self.create_or_update_provider(best_account_id, provider_name, False)
@@ -711,7 +741,12 @@ class BridgeManager:
                     snapshot = self.snapshot(include_secrets=False)
                     providers = [p for p in snapshot.get("providers", []) if isinstance(p, dict)]
                     target_provider = next((p for p in providers if p.get("account_id") == best_account_id and self._is_bridge_provider(p)), None)
-                if target_provider and current_provider and target_provider.get("id") != current_provider.get("id"):
+                    if target_provider and current_provider and target_provider.get("id") != current_provider.get("id"):
+                        changed = self.set_current_provider(str(target_provider["id"]))
+                        actions.append({"target": "claude", "changed": True, "provider_id": target_provider["id"], "result": changed})
+                    else:
+                        actions.append({"target": "claude", "changed": False, "reason": "missing_provider_after_create"})
+                elif target_provider and current_provider and target_provider.get("id") != current_provider.get("id"):
                     changed = self.set_current_provider(str(target_provider["id"]))
                     actions.append({"target": "claude", "changed": True, "provider_id": target_provider["id"], "result": changed})
                 else:
@@ -722,7 +757,10 @@ class BridgeManager:
         desktop = snapshot.get("codex_desktop") if isinstance(snapshot.get("codex_desktop"), dict) else {}
         if config["default_codex"]:
             if desktop.get("managed_by") == "bridgedeck_or_local_bridge":
-                if desktop.get("account_id") != best_account_id:
+                current_codex_account_id = str(desktop.get("account_id") or "")
+                if current_codex_account_id and self._quota_is_still_usable(quota_by_account.get(current_codex_account_id)):
+                    actions.append({"target": "default_codex", "changed": False, "reason": "current_account_still_usable"})
+                elif desktop.get("account_id") != best_account_id:
                     changed = self.set_default_codex_account(best_account_id)
                     actions.append({"target": "default_codex", "changed": True, "result": changed})
                 else:
@@ -1382,9 +1420,36 @@ def summarize_rate_limit_windows(rate_limit: dict[str, Any]) -> tuple[list[dict[
     return windows, max_used, bool(rate_limit.get("limit_reached"))
 
 
+def quota_capacity_factor_from_text(*values: Any) -> int:
+    haystack = " ".join(str(value or "").lower() for value in values)
+    if "20x" in haystack or "pro max" in haystack or "promax" in haystack:
+        return 20
+    if "pro" in haystack:
+        return 5
+    if "plus" in haystack:
+        return 1
+    return 1
+
+
+def effective_remaining_units(windows: list[dict[str, Any]], capacity_factor: int) -> float:
+    remaining_values: list[float] = []
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        try:
+            used = float(window.get("used_percent"))
+        except (TypeError, ValueError):
+            continue
+        remaining_values.append(max(0.0, 100.0 - used))
+    remaining_percent = min(remaining_values) if remaining_values else 0.0
+    return round(remaining_percent * max(1, capacity_factor), 1)
+
+
 def summarize_quota_payload(payload: dict[str, Any]) -> dict[str, Any]:
     rate_limit = payload.get("rate_limit") if isinstance(payload.get("rate_limit"), dict) else {}
     windows, max_used, rate_limit_reached = summarize_rate_limit_windows(rate_limit)
+    plan_type = payload.get("plan_type") if isinstance(payload.get("plan_type"), str) else ""
+    capacity_factor = quota_capacity_factor_from_text(plan_type)
     limit_reached = bool(rate_limit_reached or payload.get("rate_limit_reached_type"))
     if limit_reached or max_used >= 100:
         status = "limit_reached"
@@ -1414,11 +1479,13 @@ def summarize_quota_payload(payload: dict[str, Any]) -> dict[str, Any]:
             )
 
     return {
-        "plan_type": payload.get("plan_type") if isinstance(payload.get("plan_type"), str) else "",
+        "plan_type": plan_type,
         "allowed": bool(rate_limit.get("allowed", True)),
         "limit_reached": limit_reached,
         "quota_status": status,
         "windows": windows,
+        "capacity_factor": capacity_factor,
+        "effective_remaining_units": effective_remaining_units(windows, capacity_factor),
         "additional_limits": additional_limits,
         "queried_at": int(time.time()),
     }
@@ -2052,9 +2119,13 @@ INDEX_HTML = """<!doctype html>
         const sparkWindows = spark
           ? (spark.windows || []).map((w) => `${esc(w.name)}: <span class="${Number(w.used_percent) >= 100 ? 'bad' : Number(w.used_percent) >= 80 ? 'warnText' : 'ok'}">${esc(w.used_percent)}%</span>`).join('  ')
           : '';
+        const remaining = Number(q.effective_remaining_units);
+        const remainingText = Number.isFinite(remaining)
+          ? `<br><span class="muted">估算剩余：${esc(remaining)} 单位，容量系数 x${esc(q.capacity_factor || 1)}</span>`
+          : '';
         return `<div class="quotaPill${currentCls}">
           <div class="quotaTitle">${esc(maskEmail(q.email || q.label || maskId(q.account_id || '')))} ${q.plan_type ? `<span class="muted">(${esc(q.plan_type)})</span>` : ''}</div>
-          <div class="quotaWindows">主额度：<span class="${cls}">${esc(quotaStatusText(status))}</span>${windows ? '<br>' + windows : ''}</div>
+          <div class="quotaWindows">主额度：<span class="${cls}">${esc(quotaStatusText(status))}</span>${windows ? '<br>' + windows : ''}${remainingText}</div>
           <div class="quotaWindows">Spark：${spark ? `<span class="${spark.quota_status === 'ok' ? 'ok' : (spark.quota_status === 'near_limit' ? 'warnText' : 'bad')}">${esc(quotaStatusText(spark.quota_status))}</span>${sparkWindows ? '<br>' + sparkWindows : ''}` : '<span class="muted">未返回</span>'}</div>
         </div>`;
       }).join('');
