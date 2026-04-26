@@ -1168,6 +1168,7 @@ INDEX_HTML = """<!doctype html>
     .stepNote { display:block; color:var(--muted); font-size:12px; margin-top:2px; }
     .guideTarget { color:var(--muted); font-size:12px; margin-bottom:10px; }
     .miniBtn { padding:5px 8px; font-size:12px; }
+    .mt10 { margin-top:10px; }
     .topGrid { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:10px; margin-top:12px; }
     .tile { border:1px solid var(--line); border-radius:8px; padding:10px; background:#101520; min-height:66px; }
     .tileLabel { color:var(--muted); font-size:11px; margin-bottom:6px; }
@@ -1206,10 +1207,10 @@ INDEX_HTML = """<!doctype html>
       </div>
       <div id="recommendation" class="recommend">加载中...</div>
       <div class="quickbar">
-        <button class="primary" onclick="scrollToSection('providerCreateCard')">创建 Claude 桥接</button>
-        <button onclick="scrollToSection('cliHomeCard')">切换 Codex CLI</button>
-        <button onclick="scrollToSection('statusCard')">检查状态</button>
-        <button onclick="refreshData()">刷新</button>
+        <button class="primary" data-action="scroll" data-target="providerCreateCard">创建 Claude 桥接</button>
+        <button data-action="scroll" data-target="cliHomeCard">切换 Codex CLI</button>
+        <button data-action="scroll" data-target="statusCard">检查状态</button>
+        <button data-action="refresh">刷新</button>
       </div>
       <div class="paths" id="paths"></div>
     </div>
@@ -1233,7 +1234,7 @@ INDEX_HTML = """<!doctype html>
             <label>显示名称</label>
             <input id="providerName" placeholder="Local Codex Bridge - xxx" />
             <label><input type="checkbox" id="setCurrent" checked /> 设为当前</label>
-            <button class="primary" onclick="createProvider()">创建/更新 Claude 桥接</button>
+            <button class="primary" data-action="create-provider">创建/更新 Claude 桥接</button>
           </div>
           <div class="muted">工具会自动写入本地 bridge 配置，不需要手动编辑 URL/token。</div>
         </div>
@@ -1248,12 +1249,12 @@ INDEX_HTML = """<!doctype html>
             <input id="cliHome" placeholder="~/.codex-cli-pro20x" />
             <label>启动器名称</label>
             <input id="cliProfileName" placeholder="pro20x" />
-            <button class="primary" onclick="createCliHome()">生成启动器</button>
-            <button onclick="migrateCliHome()">迁移旧 CLI 目录</button>
+            <button class="primary" data-action="create-cli-home">生成启动器</button>
+            <button data-action="migrate-cli-home">迁移旧 CLI 目录</button>
           </div>
           <div class="muted">切换 CLI 账号 = 使用对应启动脚本打开新的 Codex CLI，可多个账号同时运行。</div>
           <div class="paths" id="cliCommand"></div>
-          <div class="muted" style="margin-top:10px;">可用账号：点“选用”自动填入推荐目录。</div>
+          <div class="muted mt10">可用账号：点“选用”自动填入推荐目录。</div>
           <div class="tableWrap">
             <table id="cliAccountsTable">
               <thead>
@@ -1275,11 +1276,11 @@ INDEX_HTML = """<!doctype html>
           <div class="detailsBody">
           <div class="sectionHint">只在需要切换、修复、排查 token 时使用。日常只看“当前”和“账号”。</div>
           <div class="row">
-            <button onclick="refreshData()">刷新</button>
-            <button class="miniBtn" id="tokenToggle" onclick="toggleTokens()">显示 token</button>
-            <button onclick="setCurrentFromSelected()">设选中为当前</button>
-            <button onclick="patchSelected()">修复选中桥接</button>
-            <button class="warn" onclick="repairPlusPro()">修复 Plus/Pro</button>
+            <button data-action="refresh">刷新</button>
+            <button class="miniBtn" id="tokenToggle" data-action="toggle-tokens">显示 token</button>
+            <button data-action="set-current-selected">设选中为当前</button>
+            <button data-action="patch-selected">修复选中桥接</button>
+            <button class="warn" data-action="repair-plus-pro">修复 Plus/Pro</button>
           </div>
           <div class="tableWrap">
             <table id="providersTable">
@@ -1553,7 +1554,7 @@ INDEX_HTML = """<!doctype html>
           <td>${esc(maskEmail(a.email || ''))}</td>
           <td class="mono">${esc(maskId(a.account_id || ''))}</td>
           <td class="mono">${esc(humanPath(a.default_cli_home || ''))}</td>
-          <td><button class="miniBtn" onclick="selectCliAccount('${esc(a.account_id)}')">选用</button></td>
+          <td><button class="miniBtn" data-action="select-cli-account" data-account-id="${esc(a.account_id)}">选用</button></td>
         `;
         body.appendChild(tr);
       });
@@ -1776,6 +1777,27 @@ INDEX_HTML = """<!doctype html>
       log(`${res.message}: ${JSON.stringify(res.patched)}`);
       await refreshData();
     }
+    function bindActions() {
+      document.addEventListener('click', (event) => {
+        const button = event.target.closest('button[data-action]');
+        if (!button) return;
+        const action = button.dataset.action;
+        const run = async () => {
+          if (action === 'scroll') return scrollToSection(button.dataset.target || '');
+          if (action === 'refresh') return refreshData();
+          if (action === 'create-provider') return createProvider();
+          if (action === 'create-cli-home') return createCliHome();
+          if (action === 'migrate-cli-home') return migrateCliHome();
+          if (action === 'toggle-tokens') return toggleTokens();
+          if (action === 'set-current-selected') return setCurrentFromSelected();
+          if (action === 'patch-selected') return patchSelected();
+          if (action === 'repair-plus-pro') return repairPlusPro();
+          if (action === 'select-cli-account') return selectCliAccount(button.dataset.accountId || '');
+        };
+        Promise.resolve(run()).catch((e) => log(`操作失败: ${e.message}`));
+      });
+    }
+    bindActions();
     initGuideObserver();
     refreshData().catch((e) => log(`初始化失败: ${e.message}`));
   </script>
