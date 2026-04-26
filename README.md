@@ -95,14 +95,18 @@ python3 bridgedeck.py --host 127.0.0.1 --port 8899
 5. 点击 `创建/更新 Claude 桥接`。
 6. 在 `Claude Provider 管理` 中确认目标 Provider 显示 `settings=true`。
 
-### Switch Codex CLI Account / Codex CLI 账号切换
+### Standalone Codex CLI / 单独 Codex CLI
 
-1. In `Codex CLI 切换`, click `选用` for the account.
+This creates a per-account launcher and does not change the global default Codex account.
+
+单独 Codex CLI 只生成某个账号的独立启动器，不改变全局默认 Codex 账号。
+
+1. In `单独 Codex CLI`, click `选用` for the account.
 2. Keep the generated directory such as `~/.codex-cli-pro`.
 3. Click `生成启动器`.
 4. Start CLI using the displayed command:
 
-1. 在 `Codex CLI 切换` 中，对目标账号点击 `选用`。
+1. 在 `单独 Codex CLI` 中，对目标账号点击 `选用`。
 2. 保持生成的目录，例如 `~/.codex-cli-pro`。
 3. 点击 `生成启动器`。
 4. 使用页面输出命令启动 CLI：
@@ -119,11 +123,11 @@ or use the generated launcher:
 ~/.cc-switch/codex-cli-launchers/codex-<name>.command
 ```
 
-### Set Default Codex Account / 设置默认 Codex 账号
+### Global Codex CLI / 全局 Codex CLI
 
-For tools such as Paperclip that call the default `codex` command and do not let you enter a launch command, use `默认都用这个账号`.
+For tools such as Paperclip that call the default `codex` command and do not let you enter a launch command, use `设为全局 Codex CLI`.
 
-对于 Paperclip 这类直接调用默认 `codex`、不提供命令输入位置的工具，使用 `默认都用这个账号`。
+对于 Paperclip 这类直接调用默认 `codex`、不提供命令输入位置的工具，使用 `设为全局 Codex CLI`。
 
 This writes only `base_url` in `~/.codex/config.toml` after making a backup. It does not copy `access_token`, `refresh_token`, or `id_token`.
 

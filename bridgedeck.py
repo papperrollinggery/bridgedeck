@@ -31,7 +31,7 @@ DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.4"
+APP_VERSION = "0.2.5"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -1232,10 +1232,13 @@ INDEX_HTML = """<!doctype html>
     .bigSelectRow { display:grid; grid-template-columns: 140px minmax(260px, 520px); gap:12px; align-items:center; margin:12px 0 14px; }
     .bigSelectRow label { font-weight:700; }
     .bigSelectRow select { width:100%; min-height:42px; font-size:15px; }
-    .toolGrid { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:12px; }
+    .toolGrid { display:grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap:12px; }
     .toolCard { border:1px solid var(--line); border-radius:10px; padding:14px; background:#101827; min-height:150px; display:flex; flex-direction:column; justify-content:space-between; gap:12px; }
     .toolName { font-size:16px; font-weight:800; margin-bottom:6px; }
     .toolText { color:var(--muted); font-size:13px; line-height:1.5; }
+    .toolSelect { margin-top:10px; display:grid; gap:6px; }
+    .toolSelect label { color:var(--muted); font-size:12px; }
+    .toolSelect select { width:100%; min-width:0; }
     .toolCard button { min-height:42px; font-weight:700; }
     .simpleResult { margin-top:12px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#0f1320; min-height:42px; color:var(--muted); font-size:13px; line-height:1.5; }
     .simpleResult strong { color:var(--text); }
@@ -1279,29 +1282,33 @@ INDEX_HTML = """<!doctype html>
     <div class="card simpleFlow guideSection" id="simpleFlowCard" data-guide="simpleFlow">
       <div class="simpleHeader">
         <div>
-          <div class="simpleTitle">先选账号，再选要用的工具</div>
-          <div class="simpleSubtitle">日常只用这里。Claude Code 是“当前账号”，Codex CLI 是“开一个新窗口”。Codex Desktop 这里只看状态。</div>
+          <div class="simpleTitle">Claude Code、单独 Codex CLI、全局 Codex CLI 分开选</div>
+          <div class="simpleSubtitle">Claude Code 是当前 Claude 账号；单独 Codex CLI 是独立窗口；全局 Codex CLI 给 Paperclip、桌面版、直接运行 codex 用。</div>
         </div>
         <button data-action="refresh">刷新状态</button>
-      </div>
-      <div class="bigSelectRow">
-        <label for="simpleAccount">今天用哪个账号</label>
-        <select id="simpleAccount"></select>
       </div>
       <div class="toolGrid">
         <div class="toolCard">
           <div>
             <div class="toolName">Claude Code</div>
-            <div class="toolText">让 Claude Code 立刻使用上面选中的账号。</div>
+            <div class="toolText">切换 Claude Code 当前使用的账号。</div>
+            <div class="toolSelect">
+              <label for="simpleClaudeAccount">Claude Code 用哪个账号</label>
+              <select id="simpleClaudeAccount"></select>
+            </div>
           </div>
-          <button class="primary" data-action="simple-claude">Claude Code 用这个账号</button>
+          <button class="primary" data-action="simple-claude">应用到 Claude Code</button>
         </div>
         <div class="toolCard">
           <div>
-            <div class="toolName">Codex CLI</div>
-            <div class="toolText">为上面选中的账号准备一个独立 CLI 启动器，可和其它账号同时开。</div>
+            <div class="toolName">单独 Codex CLI</div>
+            <div class="toolText">只为这个账号准备独立启动器，可和其它账号同时开，不改变全局默认。</div>
+            <div class="toolSelect">
+              <label for="simpleCliAccount">单独 Codex CLI 用哪个账号</label>
+              <select id="simpleCliAccount"></select>
+            </div>
           </div>
-          <button class="primary" data-action="simple-cli">准备 Codex CLI 窗口</button>
+          <button class="primary" data-action="simple-cli">准备单独 Codex CLI</button>
         </div>
         <div class="toolCard">
           <div>
@@ -1312,13 +1319,17 @@ INDEX_HTML = """<!doctype html>
         </div>
         <div class="toolCard">
           <div>
-            <div class="toolName">Paperclip / 默认 Codex</div>
-            <div class="toolText">给没地方输命令的工具用。会把默认 Codex 账号改成上面选中的账号。</div>
+            <div class="toolName">全局 Codex CLI</div>
+            <div class="toolText">给 Paperclip、Codex Desktop、直接运行 codex 用。会把全局默认账号改成这里选的账号。</div>
+            <div class="toolSelect">
+              <label for="simpleDefaultAccount">全局 Codex CLI 用哪个账号</label>
+              <select id="simpleDefaultAccount"></select>
+            </div>
           </div>
-          <button class="warn" data-action="simple-default-codex">默认都用这个账号</button>
+          <button class="warn" data-action="simple-default-codex">设为全局 Codex CLI</button>
         </div>
       </div>
-      <div class="simpleResult" id="simpleResult">选择账号后，点一个按钮即可。</div>
+      <div class="simpleResult" id="simpleResult">三种入口可以选择不同账号。</div>
     </div>
 
     <div class="layout">
@@ -1351,7 +1362,7 @@ INDEX_HTML = """<!doctype html>
         <details class="card guideSection" id="cliHomeCard" data-guide="cliHome">
           <summary>高级：Codex CLI 启动器</summary>
           <div class="detailsBody">
-          <h2>Codex CLI 切换</h2>
+          <h2>单独 Codex CLI</h2>
           <div class="sectionHint">生成 launcher-only 启动器：只设置 <code>CODEX_HOME</code>、<code>OPENAI_API_KEY</code> 和账号路由，不复制 OpenAI token，不改默认 <code>~/.codex</code>。</div>
           <div class="row">
             <label>账号</label>
@@ -1363,7 +1374,7 @@ INDEX_HTML = """<!doctype html>
             <button class="primary" data-action="create-cli-home">生成启动器</button>
             <button data-action="migrate-cli-home">迁移旧 CLI 目录</button>
           </div>
-          <div class="muted">切换 CLI 账号 = 使用对应启动脚本打开新的 Codex CLI，可多个账号同时运行。</div>
+          <div class="muted">单独 Codex CLI = 使用对应启动脚本打开新的 Codex CLI，可多个账号同时运行，不改变全局默认。</div>
           <div class="paths" id="cliCommand"></div>
           <div class="muted mt10">可用账号：点“选用”自动填入推荐目录。</div>
           <div class="tableWrap">
@@ -1414,7 +1425,7 @@ INDEX_HTML = """<!doctype html>
         <details class="card guideSection" id="statusCard" data-guide="status" open>
           <summary>账号状态检查</summary>
           <div class="detailsBody">
-          <div class="sectionHint">自动检测 Claude Code、Codex CLI、Codex Desktop 当前状态。BridgeDeck 只检测 Desktop，不接管默认配置。</div>
+          <div class="sectionHint">自动检测 Claude Code、单独 Codex CLI、全局 Codex CLI 当前状态。Desktop 跟随全局 Codex CLI。</div>
           <div class="tableWrap">
             <table id="accountMatrixTable">
               <thead>
@@ -1470,13 +1481,13 @@ INDEX_HTML = """<!doctype html>
     const GUIDES = {
       simpleFlow: {
         title: '日常模式',
-        target: '上方板块：先选账号，再选工具',
+        target: '上方板块：每个入口单独选账号',
         steps: [
-          '先选“今天用哪个账号”。',
-          'Claude Code 要切账号，就点“Claude Code 用这个账号”。',
-          'Codex CLI 要开新窗口，就点“准备 Codex CLI 窗口”。',
-          'Paperclip 这类没地方输命令的工具，点“默认都用这个账号”。',
-          'Codex Desktop 会跟随默认 Codex 设置。',
+          'Claude Code、单独 Codex CLI、全局 Codex CLI 各自选账号。',
+          'Claude Code 卡片只影响 Claude Code 当前账号。',
+          '单独 Codex CLI 只生成独立启动器，不改变全局默认。',
+          '全局 Codex CLI 给 Paperclip、Codex Desktop、直接运行 codex 用。',
+          '三个入口可以同号，也可以不同号。',
           '下方高级区只在排查时使用。'
         ]
       },
@@ -1492,14 +1503,14 @@ INDEX_HTML = """<!doctype html>
         ]
       },
       cliHome: {
-        title: 'Codex CLI 切换',
-        target: '右侧板块：Codex CLI 切换',
+        title: '单独 Codex CLI',
+        target: '右侧板块：单独 Codex CLI',
         steps: [
           '在可用账号表点“选用”。',
           '保存目录保持 ~/.codex-cli-xxx。',
           '点击“生成启动器”。',
           '用页面输出的 launcher 启动该账号。',
-          '以后也可双击生成的 .command 启动器。'
+          '这不会改变全局 Codex CLI 默认账号。'
         ]
       },
       providerManage: {
@@ -1625,24 +1636,38 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('cliHome').value = humanPath(item.default_cli_home || `~/.codex-cli-${label}`);
       document.getElementById('cliProfileName').value = label;
     }
-    function syncSelectedAccount(accountId) {
-      const idx = lastAccounts.findIndex((a) => a.account_id === accountId);
-      if (idx < 0) return null;
-      const item = lastAccounts[idx];
-      const simpleSel = document.getElementById('simpleAccount');
-      const accountSel = document.getElementById('account');
-      const cliSel = document.getElementById('cliAccount');
-      simpleSel.selectedIndex = idx;
-      accountSel.selectedIndex = idx;
-      cliSel.selectedIndex = idx;
+    function setSelectValue(id, accountId) {
+      const sel = document.getElementById(id);
+      if (!sel) return;
+      const idx = Array.from(sel.options).findIndex((opt) => opt.value === accountId);
+      if (idx >= 0) sel.selectedIndex = idx;
+    }
+    function selectedAccount(selectId) {
+      const sel = document.getElementById(selectId);
+      return sel ? findAccount(sel.value) : null;
+    }
+    function applyClaudeAccount(item) {
+      if (!item) return;
+      setSelectValue('account', item.account_id);
+      setSelectValue('simpleClaudeAccount', item.account_id);
       document.getElementById('providerName').value = `Local Codex Bridge - ${accountSlug(item)}`;
+    }
+    function applyCliAccount(item) {
+      if (!item) return;
+      setSelectValue('cliAccount', item.account_id);
+      setSelectValue('simpleCliAccount', item.account_id);
       applyCliAccountDefaults(item);
-      return item;
+    }
+    function applyGlobalCodexAccount(item) {
+      if (!item) return;
+      setSelectValue('simpleDefaultAccount', item.account_id);
     }
     function selectCliAccount(accountId) {
-      const item = syncSelectedAccount(accountId);
+      const item = findAccount(accountId);
       if (!item) return;
-      log(`CLI 账号已选中: ${maskId(accountId)}`);
+      applyCliAccount(item);
+      setSimpleResult(`单独 Codex CLI 已选择 ${accountLabel(item)}。`);
+      log(`单独 Codex CLI 账号已选中: ${maskId(accountId)}`);
     }
     async function api(path, method='GET', payload=null) {
       const init = { method, headers: { 'X-CCSBT-Token': CSRF_TOKEN } };
@@ -1661,10 +1686,19 @@ INDEX_HTML = """<!doctype html>
       lastAccounts = accounts;
       const sel = document.getElementById('account');
       const cliSel = document.getElementById('cliAccount');
-      const simpleSel = document.getElementById('simpleAccount');
+      const simpleClaudeSel = document.getElementById('simpleClaudeAccount');
+      const simpleCliSel = document.getElementById('simpleCliAccount');
+      const simpleDefaultSel = document.getElementById('simpleDefaultAccount');
+      const previous = {
+        claude: simpleClaudeSel.value || sel.value,
+        cli: simpleCliSel.value || cliSel.value,
+        global: simpleDefaultSel.value
+      };
       sel.innerHTML = '';
       cliSel.innerHTML = '';
-      simpleSel.innerHTML = '';
+      simpleClaudeSel.innerHTML = '';
+      simpleCliSel.innerHTML = '';
+      simpleDefaultSel.innerHTML = '';
       accounts.forEach((a) => {
         const opt = document.createElement('option');
         opt.value = a.account_id;
@@ -1672,34 +1706,57 @@ INDEX_HTML = """<!doctype html>
         opt.textContent = `${maskId(a.account_id)}${mail}`;
         sel.appendChild(opt);
         cliSel.appendChild(opt.cloneNode(true));
-        simpleSel.appendChild(opt.cloneNode(true));
+        simpleClaudeSel.appendChild(opt.cloneNode(true));
+        simpleCliSel.appendChild(opt.cloneNode(true));
+        simpleDefaultSel.appendChild(opt.cloneNode(true));
       });
-      function applyAccountDefaults(item) {
-        if (!item) return;
-        const label = accountSlug(item);
-        if (!document.getElementById('providerName').value.trim()) {
-          document.getElementById('providerName').value = `Local Codex Bridge - ${label}`;
-        }
-        applyCliAccountDefaults(item);
-      }
-      if (accounts.length > 0 && !document.getElementById('providerName').value.trim()) {
+      if (accounts.length > 0) {
         const a = accounts[0];
-        applyAccountDefaults(a);
+        if (previous.claude) {
+          setSelectValue('account', previous.claude);
+          setSelectValue('simpleClaudeAccount', previous.claude);
+        } else if (!document.getElementById('providerName').value.trim()) {
+          applyClaudeAccount(a);
+        }
+        if (previous.cli) {
+          setSelectValue('cliAccount', previous.cli);
+          setSelectValue('simpleCliAccount', previous.cli);
+        } else if (!document.getElementById('cliHome').value.trim()) {
+          applyCliAccount(a);
+        }
+        applyGlobalCodexAccount(findAccount(previous.global) || a);
       }
       sel.onchange = () => {
-        const idx = sel.selectedIndex;
-        const item = accounts[idx];
-        if (item) syncSelectedAccount(item.account_id);
+        const item = accounts[sel.selectedIndex];
+        if (item) {
+          applyClaudeAccount(item);
+          setSimpleResult(`Claude Code 已选择 ${accountLabel(item)}。`);
+        }
       };
       cliSel.onchange = () => {
         const item = accounts[cliSel.selectedIndex];
-        if (item) syncSelectedAccount(item.account_id);
+        if (item) {
+          applyCliAccount(item);
+          setSimpleResult(`单独 Codex CLI 已选择 ${accountLabel(item)}。`);
+        }
       };
-      simpleSel.onchange = () => {
-        const item = accounts[simpleSel.selectedIndex];
+      simpleClaudeSel.onchange = () => {
+        const item = accounts[simpleClaudeSel.selectedIndex];
         if (!item) return;
-        syncSelectedAccount(item.account_id);
-        setSimpleResult(`已选择 ${accountLabel(item)}。现在点下面的工具按钮。`);
+        applyClaudeAccount(item);
+        setSimpleResult(`Claude Code 已选择 ${accountLabel(item)}。`);
+      };
+      simpleCliSel.onchange = () => {
+        const item = accounts[simpleCliSel.selectedIndex];
+        if (!item) return;
+        applyCliAccount(item);
+        setSimpleResult(`单独 Codex CLI 已选择 ${accountLabel(item)}。`);
+      };
+      simpleDefaultSel.onchange = () => {
+        const item = accounts[simpleDefaultSel.selectedIndex];
+        if (!item) return;
+        applyGlobalCodexAccount(item);
+        setSimpleResult(`全局 Codex CLI 已选择 ${accountLabel(item)}。点击按钮后才会写入默认配置。`);
       };
       renderCliAccounts(accounts);
     }
@@ -1886,8 +1943,7 @@ INDEX_HTML = """<!doctype html>
       renderCliHomes(data);
       renderDiagnosis(data);
       if (data.accounts.length > 0 && !document.getElementById('simpleResult').dataset.touched) {
-        const selected = data.accounts[document.getElementById('simpleAccount').selectedIndex] || data.accounts[0];
-        setSimpleResult(`已准备好。当前选择：${accountLabel(selected)}。`);
+        setSimpleResult('已准备好。Claude Code、单独 Codex CLI、全局 Codex CLI 可以分别选不同账号。');
       }
       log('数据已刷新');
     }
@@ -1916,9 +1972,9 @@ INDEX_HTML = """<!doctype html>
       return res;
     }
     async function simpleClaude() {
-      const accountId = document.getElementById('simpleAccount').value;
-      const item = syncSelectedAccount(accountId);
+      const item = selectedAccount('simpleClaudeAccount');
       if (!item) return setSimpleResult('先选择一个账号。', 'warn');
+      applyClaudeAccount(item);
       document.getElementById('setCurrent').checked = true;
       document.getElementById('simpleResult').dataset.touched = '1';
       setSimpleResult(`正在让 Claude Code 使用 ${accountLabel(item)}...`);
@@ -1926,21 +1982,21 @@ INDEX_HTML = """<!doctype html>
       setSimpleResult(`完成：Claude Code 现在使用 ${accountLabel(item)}。`, 'ok');
     }
     async function simpleCli() {
-      const accountId = document.getElementById('simpleAccount').value;
-      const item = syncSelectedAccount(accountId);
+      const item = selectedAccount('simpleCliAccount');
       if (!item) return setSimpleResult('先选择一个账号。', 'warn');
+      applyCliAccount(item);
       document.getElementById('simpleResult').dataset.touched = '1';
-      setSimpleResult(`正在准备 ${accountLabel(item)} 的 Codex CLI 窗口...`);
+      setSimpleResult(`正在准备 ${accountLabel(item)} 的单独 Codex CLI...`);
       const res = await createCliHome();
-      setSimpleResult(`完成：Codex CLI 窗口已准备好。启动器：${humanPath(res.launcher)}。`, 'ok');
+      setSimpleResult(`完成：单独 Codex CLI 已准备好。启动器：${humanPath(res.launcher)}。`, 'ok');
     }
     async function simpleDefaultCodex() {
-      const accountId = document.getElementById('simpleAccount').value;
-      const item = syncSelectedAccount(accountId);
+      const item = selectedAccount('simpleDefaultAccount');
       if (!item) return setSimpleResult('先选择一个账号。', 'warn');
+      applyGlobalCodexAccount(item);
       document.getElementById('simpleResult').dataset.touched = '1';
-      setSimpleResult(`正在把默认 Codex 账号设为 ${accountLabel(item)}...`);
-      const res = await api('/api/set-default-codex', 'POST', { account_id: accountId });
+      setSimpleResult(`正在把全局 Codex CLI 设为 ${accountLabel(item)}...`);
+      const res = await api('/api/set-default-codex', 'POST', { account_id: item.account_id });
       await refreshData();
       setSimpleResult(`完成：Paperclip、Codex Desktop、直接运行 codex 默认都会用 ${accountLabel(item)}。`, 'ok');
       log(`${res.message}: ${humanPath(res.config_path)}`);

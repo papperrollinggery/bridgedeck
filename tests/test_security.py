@@ -193,6 +193,22 @@ class ServerCase(unittest.TestCase):
         self.assertIn("frame-ancestors 'none'", csp)
         self.assertEqual(response.headers["X-Frame-Options"], "DENY")
 
+    def test_daily_ui_has_separate_account_selectors(self) -> None:
+        server, _ = self.start_server()
+        request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/")
+        request.add_header("Host", "127.0.0.1")
+
+        with urllib.request.urlopen(request, timeout=5) as response:
+            html = response.read().decode("utf-8")
+
+        self.assertIn('id="simpleClaudeAccount"', html)
+        self.assertIn('id="simpleCliAccount"', html)
+        self.assertIn('id="simpleDefaultAccount"', html)
+        self.assertIn("单独 Codex CLI", html)
+        self.assertIn("全局 Codex CLI", html)
+        self.assertNotIn('id="simpleAccount"', html)
+        self.assertNotIn("今天用哪个账号", html)
+
     def test_remote_mode_blocks_secret_reveal(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
 

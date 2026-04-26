@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.5
+
+- Split the daily UI into Claude Code, standalone Codex CLI, and global Codex CLI account selectors.
+- Renamed the default Codex workflow to global Codex CLI to clarify when `~/.codex/config.toml` is changed.
+
 ## 0.2.4
 
 - Made Codex CLI switching explicit by showing CODEX_HOME startup commands for each detected CLI profile.
