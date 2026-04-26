@@ -107,6 +107,9 @@ class FakeManager:
     def migrate_cli_launcher(self, account_id: str, target_dir: str, profile_name: str) -> dict[str, Any]:
         return {"ok": True}
 
+    def set_default_codex_account(self, account_id: str) -> dict[str, Any]:
+        return {"ok": True}
+
     def health(self) -> dict[str, Any]:
         return {"ok": True, "status": "ok", "risk_flags": []}
 
@@ -421,6 +424,29 @@ class LauncherCase(unittest.TestCase):
 
             self.assertEqual(status["managed_by"], "cc_switch")
             self.assertEqual(config.read_text(encoding="utf-8"), original)
+
+    def test_set_default_codex_account_writes_only_base_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text(
+                'model = "gpt-5.5"\nbase_url = "http://127.0.0.1:15721/v1"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home):
+                result = manager.set_default_codex_account("acct-1")
+
+            body = config.read_text(encoding="utf-8")
+            self.assertTrue(result["ok"])
+            self.assertIn('base_url = "http://127.0.0.1:8876/accounts/acct-1/v1"', body)
+            self.assertIn('model = "gpt-5.5"', body)
+            self.assertNotIn("secret-refresh-token", body)
+            self.assertNotIn("access_token", body)
+            self.assertTrue(result["backups"])
 
     def test_error_classifier(self) -> None:
         self.assertEqual(

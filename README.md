@@ -14,8 +14,8 @@ Local web helper for managing CC Switch Codex OAuth bridge providers and launche
 - 在 `~/.cc-switch/codex-cli-launchers/` 下生成 launcher-only Codex CLI 账号路由。
 - Detect stale tokenful `~/.codex-cli-*` profiles without copying or refreshing OpenAI tokens.
 - 检测旧的 tokenful `~/.codex-cli-*` 配置，不复制、不刷新 OpenAI token。
-- Detect Codex Desktop config state without taking over `~/.codex/config.toml`.
-- 只检测 Codex Desktop 配置状态，不接管 `~/.codex/config.toml`。
+- Detect Codex Desktop config state, and optionally set a default Codex account for tools that cannot pass CLI flags.
+- 检测 Codex Desktop 配置状态，并可选设置默认 Codex 账号，供无法输入 CLI 参数的工具使用。
 - Detect Codex provider account/token mismatch.
 - 检查 Codex Provider 的显示账号和实际 token 账号是否不一致。
 - Hide tokens by default; reveal only on explicit user action.
@@ -119,6 +119,16 @@ or use the generated launcher:
 ~/.cc-switch/codex-cli-launchers/codex-<name>.command
 ```
 
+### Set Default Codex Account / 设置默认 Codex 账号
+
+For tools such as Paperclip that call the default `codex` command and do not let you enter a launch command, use `默认都用这个账号`.
+
+对于 Paperclip 这类直接调用默认 `codex`、不提供命令输入位置的工具，使用 `默认都用这个账号`。
+
+This writes only `base_url` in `~/.codex/config.toml` after making a backup. It does not copy `access_token`, `refresh_token`, or `id_token`.
+
+该操作会先备份，再只写入 `~/.codex/config.toml` 里的 `base_url`。不会复制 `access_token`、`refresh_token` 或 `id_token`。
+
 ## Files Read or Written / 读写文件
 
 The tool reads/writes these local files:
@@ -130,14 +140,16 @@ The tool reads/writes these local files:
 - `~/.cc-switch/codex_oauth_auth.json`
 - `~/.codex-cli-*`
 - `~/.cc-switch/codex-cli-launchers/*`
+- `~/.codex/config.toml` only when `默认都用这个账号` is clicked
+- 只有点击 `默认都用这个账号` 时才会写入 `~/.codex/config.toml`
 
 Codex CLI launchers no longer write `auth.json` or copy OAuth tokens. Migration may disable an old `~/.codex-cli-*/auth.json` after backing it up.
 
 Codex CLI 启动器不再写 `auth.json`，也不复制 OAuth token。迁移旧配置时会先备份，再禁用旧的 `~/.codex-cli-*/auth.json`。
 
-It reads but does not overwrite the default Codex config:
+By default, it reads but does not overwrite the default Codex config:
 
-只读取、不覆盖默认 Codex 配置：
+默认只读取、不覆盖默认 Codex 配置：
 
 - `~/.codex/config.toml`
 - `~/.codex/.env`

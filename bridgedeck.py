@@ -298,6 +298,7 @@ class BridgeManager:
             "detected": config_path.exists(),
             "config_path": str(config_path),
             "base_url": "",
+            "account_id": "",
             "managed_by": "unknown",
             "risk_flags": [],
         }
@@ -311,6 +312,9 @@ class BridgeManager:
         match = re.search(r'^\s*base_url\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
         if match:
             data["base_url"] = match.group(1)
+        account_match = re.search(r"/accounts/([^/?#]+)/v1", data["base_url"])
+        if account_match:
+            data["account_id"] = account_match.group(1)
         if CC_SWITCH_BASE_URL in data["base_url"]:
             data["managed_by"] = "cc_switch"
         elif LOCAL_BRIDGE_BASE_URL in data["base_url"]:
@@ -977,6 +981,49 @@ class BridgeManager:
                 "backups": [],
             }
 
+    def set_default_codex_account(self, account_id: str) -> dict[str, Any]:
+        account_id = account_id.strip()
+        if not account_id:
+            raise ValueError("account_id 不能为空")
+        with self._lock:
+            store = self._load_auth_store_raw()
+            accounts = store.get("accounts")
+            if not isinstance(accounts, dict):
+                raise ValueError("auth store 缺少 accounts")
+            account_payload = accounts.get(account_id)
+            if not isinstance(account_payload, dict):
+                raise ValueError(f"未找到账号: {account_id}")
+
+            config_path = DEFAULT_CODEX_HOME / "config.toml"
+            if config_path.is_symlink():
+                raise ValueError("~/.codex/config.toml 不能是符号链接")
+            DEFAULT_CODEX_HOME.mkdir(parents=True, exist_ok=True)
+            os.chmod(DEFAULT_CODEX_HOME, 0o700)
+            backup = self._backup_file(config_path, "set-default-codex") if config_path.exists() else None
+            original = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+            base_url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1"
+            line = f'base_url = "{base_url}"'
+            pattern = re.compile(r'(?m)^\s*base_url\s*=\s*["\'][^"\']*["\']\s*$')
+            if pattern.search(original):
+                updated = pattern.sub(line, original, count=1)
+            else:
+                updated = f"{line}\n{original}" if original else f"{line}\n"
+            config_path.write_text(updated, encoding="utf-8")
+            try:
+                os.chmod(config_path, 0o600)
+            except OSError:
+                pass
+            return {
+                "ok": True,
+                "message": "默认 Codex 账号已设置",
+                "account_id": account_id,
+                "email": account_payload.get("email", ""),
+                "config_path": str(config_path),
+                "base_url": base_url,
+                "affected": ["Paperclip", "Codex Desktop", "default codex"],
+                "backups": [backup] if backup else [],
+            }
+
     def migrate_cli_launcher(self, account_id: str, target_dir: str, profile_name: str) -> dict[str, Any]:
         target = self._validate_cli_home(target_dir)
         auth_path = target / "auth.json"
@@ -1263,6 +1310,13 @@ INDEX_HTML = """<!doctype html>
           </div>
           <button data-action="scroll" data-target="statusCard">查看桌面版状态</button>
         </div>
+        <div class="toolCard">
+          <div>
+            <div class="toolName">Paperclip / 默认 Codex</div>
+            <div class="toolText">给没地方输命令的工具用。会把默认 Codex 账号改成上面选中的账号。</div>
+          </div>
+          <button class="warn" data-action="simple-default-codex">默认都用这个账号</button>
+        </div>
       </div>
       <div class="simpleResult" id="simpleResult">选择账号后，点一个按钮即可。</div>
     </div>
@@ -1421,7 +1475,8 @@ INDEX_HTML = """<!doctype html>
           '先选“今天用哪个账号”。',
           'Claude Code 要切账号，就点“Claude Code 用这个账号”。',
           'Codex CLI 要开新窗口，就点“准备 Codex CLI 窗口”。',
-          'Codex Desktop 只看状态，不在这里切换。',
+          'Paperclip 这类没地方输命令的工具，点“默认都用这个账号”。',
+          'Codex Desktop 会跟随默认 Codex 设置。',
           '下方高级区只在排查时使用。'
         ]
       },
@@ -1711,15 +1766,17 @@ INDEX_HTML = """<!doctype html>
     function renderAccountMatrix(data) {
       const body = document.querySelector('#accountMatrixTable tbody');
       body.innerHTML = '';
+      const desktopAccount = data.codex_desktop ? data.codex_desktop.account_id : '';
       (data.account_matrix || []).forEach((row) => {
         const status = row.account_status || 'ok';
         const cls = status === 'ok' ? 'ok' : (status === 'stale_launcher' ? 'warnText' : 'bad');
         const tr = document.createElement('tr');
+        const desktopLabel = row.account_id && desktopAccount && row.account_id === desktopAccount ? '默认' : statusText(row.codex_desktop || '');
         tr.innerHTML = `
           <td>${esc(maskEmail(row.email || row.label || maskId(row.account_id || '')))}</td>
           <td>${row.claude_current ? '<span class="ok">当前</span>' : '<span class="muted">备用</span>'}</td>
           <td>${(row.cli_launchers || []).length ? '<span class="ok">launcher</span>' : '<span class="warnText">未生成</span>'}</td>
-          <td>${esc(statusText(row.codex_desktop || ''))}</td>
+          <td>${esc(desktopLabel)}</td>
           <td><span class="${cls}">${esc(statusText(status))}</span></td>
           <td>${esc(row.advice || '')}</td>
         `;
@@ -1877,6 +1934,17 @@ INDEX_HTML = """<!doctype html>
       const res = await createCliHome();
       setSimpleResult(`完成：Codex CLI 窗口已准备好。启动器：${humanPath(res.launcher)}。`, 'ok');
     }
+    async function simpleDefaultCodex() {
+      const accountId = document.getElementById('simpleAccount').value;
+      const item = syncSelectedAccount(accountId);
+      if (!item) return setSimpleResult('先选择一个账号。', 'warn');
+      document.getElementById('simpleResult').dataset.touched = '1';
+      setSimpleResult(`正在把默认 Codex 账号设为 ${accountLabel(item)}...`);
+      const res = await api('/api/set-default-codex', 'POST', { account_id: accountId });
+      await refreshData();
+      setSimpleResult(`完成：Paperclip、Codex Desktop、直接运行 codex 默认都会用 ${accountLabel(item)}。`, 'ok');
+      log(`${res.message}: ${humanPath(res.config_path)}`);
+    }
     async function migrateCliHome() {
       const accountId = document.getElementById('cliAccount').value;
       const targetDir = document.getElementById('cliHome').value.trim();
@@ -1919,6 +1987,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'create-cli-home') return createCliHome();
           if (action === 'simple-claude') return simpleClaude();
           if (action === 'simple-cli') return simpleCli();
+          if (action === 'simple-default-codex') return simpleDefaultCodex();
           if (action === 'migrate-cli-home') return migrateCliHome();
           if (action === 'toggle-tokens') return toggleTokens();
           if (action === 'set-current-selected') return setCurrentFromSelected();
@@ -2085,6 +2154,11 @@ def build_handler(
                         result = manager.create_or_sync_cli_home(account_id, target_dir, profile_name)
                     else:
                         result = manager.create_cli_launcher(account_id, target_dir, profile_name)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/set-default-codex":
+                    account_id = str(payload.get("account_id") or "")
+                    result = manager.set_default_codex_account(account_id)
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/migrate-cli-launcher":
