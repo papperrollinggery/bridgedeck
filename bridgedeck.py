@@ -1359,8 +1359,7 @@ def quota_window_name(seconds: Any) -> str:
     return f"{value}s"
 
 
-def summarize_quota_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    rate_limit = payload.get("rate_limit") if isinstance(payload.get("rate_limit"), dict) else {}
+def summarize_rate_limit_windows(rate_limit: dict[str, Any]) -> tuple[list[dict[str, Any]], float, bool]:
     windows: list[dict[str, Any]] = []
     max_used = 0.0
     for key in ("primary_window", "secondary_window"):
@@ -1380,8 +1379,13 @@ def summarize_quota_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "reset_at": window.get("reset_at"),
             }
         )
+    return windows, max_used, bool(rate_limit.get("limit_reached"))
 
-    limit_reached = bool(rate_limit.get("limit_reached") or payload.get("rate_limit_reached_type"))
+
+def summarize_quota_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    rate_limit = payload.get("rate_limit") if isinstance(payload.get("rate_limit"), dict) else {}
+    windows, max_used, rate_limit_reached = summarize_rate_limit_windows(rate_limit)
+    limit_reached = bool(rate_limit_reached or payload.get("rate_limit_reached_type"))
     if limit_reached or max_used >= 100:
         status = "limit_reached"
     elif max_used >= 80:
@@ -1389,12 +1393,33 @@ def summarize_quota_payload(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         status = "ok"
 
+    additional_limits: list[dict[str, Any]] = []
+    raw_additional = payload.get("additional_rate_limits")
+    if isinstance(raw_additional, list):
+        for item in raw_additional:
+            if not isinstance(item, dict):
+                continue
+            item_rate_limit = item.get("rate_limit") if isinstance(item.get("rate_limit"), dict) else {}
+            item_windows, item_max_used, item_limit_reached = summarize_rate_limit_windows(item_rate_limit)
+            item_status = "limit_reached" if item_limit_reached or item_max_used >= 100 else ("near_limit" if item_max_used >= 80 else "ok")
+            additional_limits.append(
+                {
+                    "limit_name": item.get("limit_name") if isinstance(item.get("limit_name"), str) else "",
+                    "metered_feature": item.get("metered_feature") if isinstance(item.get("metered_feature"), str) else "",
+                    "quota_status": item_status,
+                    "allowed": bool(item_rate_limit.get("allowed", True)),
+                    "limit_reached": item_limit_reached,
+                    "windows": item_windows,
+                }
+            )
+
     return {
         "plan_type": payload.get("plan_type") if isinstance(payload.get("plan_type"), str) else "",
         "allowed": bool(rate_limit.get("allowed", True)),
         "limit_reached": limit_reached,
         "quota_status": status,
         "windows": windows,
+        "additional_limits": additional_limits,
         "queried_at": int(time.time()),
     }
 
@@ -1617,6 +1642,7 @@ INDEX_HTML = """<!doctype html>
       <div class="recommend">
         <b>OpenAI 额度与自动切换</b>
         <div class="sectionHint">只接管 Local Codex Bridge。你切到 MiniMax、Nvidia、SSSAiCode 等第三方供应商时不会自动改回 OpenAI。</div>
+        <div id="actualCurrentAccounts" class="actualLine">实际当前使用：检测中...</div>
         <div id="quotaBoard" class="quotaBar">额度加载中...</div>
         <div class="toggleLine">
           <label><input type="checkbox" id="autoSwitchEnabled"> OpenAI 自动切换</label>
@@ -1961,6 +1987,15 @@ INDEX_HTML = """<!doctype html>
       if (account) return accountLabel(account);
       return maskId(accountId || '');
     }
+    function renderActualCurrentAccounts(data) {
+      const box = document.getElementById('actualCurrentAccounts');
+      if (!box) return;
+      const provider = currentClaudeProvider(data);
+      const claudeAccount = provider && provider.account_id ? accountDisplay(provider.account_id) : '外部供应商/未检测到';
+      const desktop = data.codex_desktop || {};
+      const codexAccount = desktop.account_id ? accountDisplay(desktop.account_id) : statusText(desktop.managed_by || 'unknown');
+      box.innerHTML = `实际当前使用：Claude Code <strong>${esc(claudeAccount)}</strong>；全局 Codex CLI <strong>${esc(codexAccount)}</strong>`;
+    }
     function renderActualClaude(data) {
       const box = document.getElementById('simpleClaudeActual');
       if (!box) return;
@@ -2010,9 +2045,17 @@ INDEX_HTML = """<!doctype html>
         const cls = status === 'ok' ? 'ok' : (status === 'near_limit' ? 'warnText' : 'bad');
         const currentCls = current && current.account_id === q.account_id ? ' current' : '';
         const windows = (q.windows || []).map((w) => `${esc(w.name)}: <span class="${Number(w.used_percent) >= 100 ? 'bad' : Number(w.used_percent) >= 80 ? 'warnText' : 'ok'}">${esc(w.used_percent)}%</span>`).join('  ');
+        const spark = (q.additional_limits || []).find((item) => {
+          const label = `${item.limit_name || ''} ${item.metered_feature || ''}`.toLowerCase();
+          return label.includes('spark') || label.includes('bengalfox') || label.includes('gpt-5.3-codex');
+        });
+        const sparkWindows = spark
+          ? (spark.windows || []).map((w) => `${esc(w.name)}: <span class="${Number(w.used_percent) >= 100 ? 'bad' : Number(w.used_percent) >= 80 ? 'warnText' : 'ok'}">${esc(w.used_percent)}%</span>`).join('  ')
+          : '';
         return `<div class="quotaPill${currentCls}">
           <div class="quotaTitle">${esc(maskEmail(q.email || q.label || maskId(q.account_id || '')))} ${q.plan_type ? `<span class="muted">(${esc(q.plan_type)})</span>` : ''}</div>
-          <div class="quotaWindows"><span class="${cls}">${esc(quotaStatusText(status))}</span>${windows ? '<br>' + windows : ''}</div>
+          <div class="quotaWindows">主额度：<span class="${cls}">${esc(quotaStatusText(status))}</span>${windows ? '<br>' + windows : ''}</div>
+          <div class="quotaWindows">Spark：${spark ? `<span class="${spark.quota_status === 'ok' ? 'ok' : (spark.quota_status === 'near_limit' ? 'warnText' : 'bad')}">${esc(quotaStatusText(spark.quota_status))}</span>${sparkWindows ? '<br>' + sparkWindows : ''}` : '<span class="muted">未返回</span>'}</div>
         </div>`;
       }).join('');
     }
@@ -2434,6 +2477,7 @@ INDEX_HTML = """<!doctype html>
       renderCliHomes(data);
       renderDiagnosis(data);
       renderActualClaude(data);
+      renderActualCurrentAccounts(data);
       renderAutoSwitchConfig(data);
       refreshQuotas();
       if (data.auto_switch && data.auto_switch.enabled) {

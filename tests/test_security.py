@@ -237,6 +237,8 @@ class ServerCase(unittest.TestCase):
         self.assertIn('id="autoSwitchEnabled"', html)
         self.assertIn("OpenAI 自动切换", html)
         self.assertIn("为新账号创建 Local Codex Bridge", html)
+        self.assertIn('id="actualCurrentAccounts"', html)
+        self.assertIn("Spark", html)
         self.assertNotIn('id="simpleAccount"', html)
         self.assertNotIn("今天用哪个账号", html)
 
@@ -255,6 +257,33 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(result["quota_status"], "near_limit")
         self.assertEqual(result["windows"][0]["name"], "5小时")
         self.assertEqual(result["windows"][1]["name"], "7天")
+
+    def test_quota_summary_extracts_spark_additional_limit(self) -> None:
+        payload = {
+            "plan_type": "pro",
+            "rate_limit": {
+                "limit_reached": False,
+                "primary_window": {"used_percent": 10, "limit_window_seconds": 18000},
+            },
+            "additional_rate_limits": [
+                {
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                    "metered_feature": "codex_bengalfox",
+                    "rate_limit": {
+                        "allowed": True,
+                        "limit_reached": False,
+                        "primary_window": {"used_percent": 2, "limit_window_seconds": 18000},
+                        "secondary_window": {"used_percent": 28, "limit_window_seconds": 604800},
+                    },
+                }
+            ],
+        }
+
+        result = bridgedeck.summarize_quota_payload(payload)
+
+        self.assertEqual(result["additional_limits"][0]["limit_name"], "GPT-5.3-Codex-Spark")
+        self.assertEqual(result["additional_limits"][0]["quota_status"], "ok")
+        self.assertEqual(result["additional_limits"][0]["windows"][1]["used_percent"], 28)
 
     def test_remote_mode_blocks_secret_reveal(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
