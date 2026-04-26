@@ -1956,6 +1956,11 @@ INDEX_HTML = """<!doctype html>
       if (account) return `${provider.name} / ${accountLabel(account)}`;
       return provider.name || maskId(provider.id || '');
     }
+    function accountDisplay(accountId) {
+      const account = findAccount(accountId);
+      if (account) return accountLabel(account);
+      return maskId(accountId || '');
+    }
     function renderActualClaude(data) {
       const box = document.getElementById('simpleClaudeActual');
       if (!box) return;
@@ -1976,7 +1981,7 @@ INDEX_HTML = """<!doctype html>
       const last = config.last_result || {};
       if (last.message || last.selected_account_id) {
         document.getElementById('autoSwitchStatus').textContent = last.selected_account_id
-          ? `上次选择：${maskId(last.selected_account_id)}，${last.selected_quota_status || ''}`
+          ? `上次选择：${accountDisplay(last.selected_account_id)}，${quotaStatusText(last.selected_quota_status)}`
           : `上次结果：${last.message || '无'}`;
       }
     }
@@ -2049,7 +2054,7 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/auto-switch-run', 'POST', { force });
       const actions = (res.actions || []).map((a) => `${a.target}:${a.changed ? '已切换' : (a.reason || '未变')}`).join('，');
       document.getElementById('autoSwitchStatus').textContent = res.selected_account_id
-        ? `当前优先账号：${maskId(res.selected_account_id)}，${quotaStatusText(res.selected_quota_status)}。${actions}`
+        ? `当前优先账号：${accountDisplay(res.selected_account_id)}，${quotaStatusText(res.selected_quota_status)}。${actions}`
         : (res.message || '未切换');
       log(`自动切换检查: ${document.getElementById('autoSwitchStatus').textContent}`);
       if (refresh) await refreshData();
