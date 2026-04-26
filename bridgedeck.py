@@ -563,14 +563,16 @@ class BridgeManager:
         self._save_auto_switch_config(payload)
         return {"ok": True, "auto_switch": self._load_auto_switch_config()}
 
-    def _priority_rank(self, account_id: str, providers: list[dict[str, Any]]) -> tuple[int, str]:
+    def _priority_rank(self, account_id: str, providers: list[dict[str, Any]], quota: dict[str, Any] | None = None) -> tuple[int, str]:
         names = " ".join(str(p.get("name") or "").lower() for p in providers if p.get("account_id") == account_id)
-        if "plus" in names:
-            return (0, names)
-        if "20x" in names:
-            return (2, names)
-        if "pro" in names:
-            return (1, names)
+        plan_type = str((quota or {}).get("plan_type") or "").lower()
+        haystack = f"{plan_type} {names}"
+        if "plus" in haystack:
+            return (0, haystack)
+        if "20x" in haystack:
+            return (2, haystack)
+        if "pro" in haystack:
+            return (1, haystack)
         return (9, account_id)
 
     def _is_bridge_provider(self, provider: dict[str, Any] | None) -> bool:
@@ -598,8 +600,30 @@ class BridgeManager:
         ]
         if not usable:
             return None
-        usable.sort(key=lambda q: self._priority_rank(str(q.get("account_id") or ""), providers))
+        usable.sort(key=lambda q: self._priority_rank(str(q.get("account_id") or ""), providers, q))
         return usable[0]
+
+    def _account_for_id(self, account_id: str) -> dict[str, Any] | None:
+        for account in self._load_accounts():
+            if account.get("account_id") == account_id:
+                return account
+        return None
+
+    def _provider_name_for_quota(self, account_id: str, quota: dict[str, Any], existing_names: set[str]) -> str:
+        account = self._account_for_id(account_id) or {"account_id": account_id, "email": quota.get("email") or ""}
+        plan = str(quota.get("plan_type") or "").strip().lower()
+        suffix = ""
+        if "plus" in plan:
+            suffix = "Plus"
+        elif "20x" in plan:
+            suffix = "Pro 20x"
+        elif "pro" in plan:
+            suffix = "Pro"
+        if suffix:
+            candidate = f"Local Codex Bridge - {suffix}"
+            if candidate not in existing_names:
+                return candidate
+        return self._default_provider_name(account, existing_names)
 
     def run_auto_switch(self, *, force: bool = False) -> dict[str, Any]:
         config = self._load_auto_switch_config()
@@ -621,6 +645,14 @@ class BridgeManager:
         current_provider = self._current_claude_provider(snapshot)
         if config["claude"]:
             if self._is_bridge_provider(current_provider):
+                if not target_provider:
+                    existing_names = {str(p.get("name") or "") for p in providers}
+                    provider_name = self._provider_name_for_quota(best_account_id, best, existing_names)
+                    created = self.create_or_update_provider(best_account_id, provider_name, False)
+                    actions.append({"target": "claude_provider", "changed": True, "reason": "created_missing_provider", "result": created})
+                    snapshot = self.snapshot(include_secrets=False)
+                    providers = [p for p in snapshot.get("providers", []) if isinstance(p, dict)]
+                    target_provider = next((p for p in providers if p.get("account_id") == best_account_id and self._is_bridge_provider(p)), None)
                 if target_provider and current_provider and target_provider.get("id") != current_provider.get("id"):
                     changed = self.set_current_provider(str(target_provider["id"]))
                     actions.append({"target": "claude", "changed": True, "provider_id": target_provider["id"], "result": changed})

@@ -463,6 +463,61 @@ class LauncherCase(unittest.TestCase):
             self.assertFalse(set_codex.called)
             self.assertEqual(result["actions"][0]["reason"], "current_provider_is_not_local_bridge")
 
+    def test_auto_switch_creates_missing_bridge_provider_only_in_bridge_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+            snapshot = {
+                "providers": [
+                    {
+                        "id": "current-plus",
+                        "name": "Local Codex Bridge - Plus",
+                        "is_current": True,
+                        "account_id": "acct-plus",
+                        "base_url": "http://127.0.0.1:8876/accounts/acct-plus",
+                    }
+                ],
+                "current_provider_from_settings": "current-plus",
+                "codex_desktop": {"managed_by": "custom"},
+            }
+            quotas = {
+                "ok": True,
+                "quotas": [
+                    {"account_id": "acct-new-plus", "quota_status": "ok", "limit_reached": False, "plan_type": "plus"},
+                    {"account_id": "acct-plus", "quota_status": "limit_reached", "limit_reached": True, "plan_type": "plus"},
+                ],
+            }
+            snapshots = [snapshot, {**snapshot, "providers": [*snapshot["providers"], {
+                "id": "created-plus",
+                "name": "Local Codex Bridge - person",
+                "is_current": False,
+                "account_id": "acct-new-plus",
+                "base_url": "http://127.0.0.1:8876/accounts/acct-new-plus",
+            }]}]
+            with mock.patch.object(manager, "_load_auto_switch_config", return_value={"enabled": True, "claude": True, "default_codex": False, "priority": [], "last_result": {}}), \
+                mock.patch.object(manager, "snapshot", side_effect=snapshots), \
+                mock.patch.object(manager, "quotas", return_value=quotas), \
+                mock.patch.object(manager, "create_or_update_provider", return_value={"ok": True, "provider_id": "created-plus"}) as create_provider, \
+                mock.patch.object(manager, "set_current_provider", return_value={"ok": True}) as set_current, \
+                mock.patch.object(manager, "_save_auto_switch_config"):
+                result = manager.run_auto_switch()
+
+            self.assertTrue(result["ok"])
+            create_provider.assert_called_once()
+            self.assertEqual(create_provider.call_args.args[0], "acct-new-plus")
+            set_current.assert_called_once_with("created-plus")
+
+    def test_auto_switch_priority_uses_quota_plan_before_provider_name(self) -> None:
+        manager = self.make_manager(Path(tempfile.mkdtemp()))
+        snapshot = {"providers": [{"name": "Local Codex Bridge - Old Pro", "account_id": "acct-pro"}]}
+        quotas = [
+            {"account_id": "acct-pro", "quota_status": "ok", "limit_reached": False, "plan_type": "pro"},
+            {"account_id": "acct-plus-new", "quota_status": "ok", "limit_reached": False, "plan_type": "plus"},
+        ]
+
+        best = manager._best_quota_account(snapshot, quotas)
+
+        self.assertEqual(best["account_id"], "acct-plus-new")
+
     def test_create_cli_home_compatibility_wrapper_is_launcher_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
