@@ -559,6 +559,64 @@ class BridgeManager:
         accounts = self._load_accounts()
         return {"ok": True, "quotas": [self._fetch_quota(account) for account in accounts]}
 
+    def missing_bridge_accounts(self, quotas: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        snapshot = self.snapshot(include_secrets=False)
+        providers = [p for p in snapshot.get("providers", []) if isinstance(p, dict)]
+        bridge_account_ids = {
+            str(provider.get("account_id") or "")
+            for provider in providers
+            if self._is_bridge_provider(provider) and provider.get("account_id")
+        }
+        quota_rows = quotas if isinstance(quotas, list) else self.quotas().get("quotas", [])
+        quota_by_account = {
+            str(quota.get("account_id") or ""): quota
+            for quota in quota_rows
+            if isinstance(quota, dict) and quota.get("account_id")
+        }
+        missing: list[dict[str, Any]] = []
+        for account in self._load_accounts():
+            account_id = str(account.get("account_id") or "")
+            if not account_id or account_id in bridge_account_ids:
+                continue
+            quota = quota_by_account.get(account_id, {})
+            row = {
+                "account_id": account_id,
+                "email": quota.get("email") or account.get("email") or "",
+                "label": account.get("label") or "",
+                "plan_type": quota.get("plan_type") or "",
+                "quota_status": quota.get("quota_status") or "unknown",
+            }
+            missing.append(row)
+        missing.sort(key=lambda item: self._priority_rank(str(item.get("account_id") or ""), providers, item))
+        return missing
+
+    def create_missing_bridge_providers(self) -> dict[str, Any]:
+        quotas_payload = self.quotas()
+        quota_rows = quotas_payload.get("quotas", [])
+        missing = self.missing_bridge_accounts(quota_rows if isinstance(quota_rows, list) else [])
+        snapshot = self.snapshot(include_secrets=False)
+        providers = [p for p in snapshot.get("providers", []) if isinstance(p, dict)]
+        existing_names = {str(provider.get("name") or "") for provider in providers}
+        created: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        quota_by_account = {
+            str(quota.get("account_id") or ""): quota
+            for quota in (quota_rows if isinstance(quota_rows, list) else [])
+            if isinstance(quota, dict) and quota.get("account_id")
+        }
+        for account in missing:
+            account_id = str(account.get("account_id") or "")
+            quota = quota_by_account.get(account_id, account)
+            status = str(quota.get("quota_status") or "unknown")
+            if status in {"refresh_token_reused", "unsupported_region", "bridge_down", "network_error"}:
+                skipped.append({**account, "reason": status})
+                continue
+            provider_name = self._provider_name_for_quota(account_id, quota, existing_names)
+            result = self.create_or_update_provider(account_id, provider_name, False)
+            existing_names.add(provider_name)
+            created.append({"account_id": account_id, "provider_name": provider_name, "result": result})
+        return {"ok": True, "created": created, "skipped": skipped, "missing": missing}
+
     def update_auto_switch_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._save_auto_switch_config(payload)
         return {"ok": True, "auto_switch": self._load_auto_switch_config()}
@@ -1404,6 +1462,11 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(quota, dict):
             quota["account_id"] = mask_id_value(quota.get("account_id"))
             quota["email"] = mask_email_value(quota.get("email"))
+    for key in ("missing", "created", "skipped"):
+        for item in redacted.get(key, []):
+            if isinstance(item, dict):
+                item["account_id"] = mask_id_value(item.get("account_id"))
+                item["email"] = mask_email_value(item.get("email"))
     return redacted
 
 
@@ -1561,7 +1624,9 @@ INDEX_HTML = """<!doctype html>
           <label><input type="checkbox" id="autoSwitchDefaultCodex"> 自动切全局 Codex CLI</label>
           <button class="miniBtn" data-action="save-auto-switch">保存</button>
           <button class="miniBtn" data-action="run-auto-switch">立即检查并切换</button>
+          <button class="miniBtn" data-action="create-missing-bridges">为新账号创建 Local Codex Bridge</button>
         </div>
+        <div id="missingBridgeStatus" class="muted mt10">新账号检测中...</div>
         <div id="autoSwitchStatus" class="muted mt10">未运行</div>
       </div>
       <details>
@@ -1946,10 +2011,21 @@ INDEX_HTML = """<!doctype html>
         </div>`;
       }).join('');
     }
+    function renderMissingBridgeStatus(payload) {
+      const box = document.getElementById('missingBridgeStatus');
+      if (!box) return;
+      const missing = payload.missing || [];
+      if (!missing.length) {
+        box.innerHTML = '<span class="ok">所有已授权 OpenAI 账号都已经有 Local Codex Bridge。</span>';
+        return;
+      }
+      box.innerHTML = `<span class="warnText">发现 ${missing.length} 个已授权但未桥接的新账号：</span> ${missing.map((item) => esc(maskEmail(item.email || item.label || maskId(item.account_id || '')))).join('，')}`;
+    }
     async function refreshQuotas() {
       try {
         const payload = await api('/api/quotas');
         renderQuotaBoard(payload);
+        renderMissingBridgeStatus(payload);
         return payload;
       } catch (e) {
         document.getElementById('quotaBoard').textContent = `额度查询失败: ${e.message}`;
@@ -1977,6 +2053,20 @@ INDEX_HTML = """<!doctype html>
         : (res.message || '未切换');
       log(`自动切换检查: ${document.getElementById('autoSwitchStatus').textContent}`);
       if (refresh) await refreshData();
+      return res;
+    }
+    async function createMissingBridges() {
+      const res = await api('/api/create-missing-bridges', 'POST', {});
+      const created = res.created || [];
+      const skipped = res.skipped || [];
+      document.getElementById('missingBridgeStatus').innerHTML = created.length
+        ? `<span class="ok">已创建 ${created.length} 个 Local Codex Bridge。</span>`
+        : '<span class="muted">没有需要创建的 Local Codex Bridge。</span>';
+      if (skipped.length) {
+        document.getElementById('missingBridgeStatus').innerHTML += ` <span class="warnText">跳过 ${skipped.length} 个异常账号。</span>`;
+      }
+      log(`新账号桥接创建: created=${created.length}, skipped=${skipped.length}`);
+      await refreshData();
       return res;
     }
     function setSimpleResult(message, level='') {
@@ -2453,6 +2543,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'repair-plus-pro') return repairPlusPro();
           if (action === 'save-auto-switch') return saveAutoSwitch();
           if (action === 'run-auto-switch') return runAutoSwitch(true, true);
+          if (action === 'create-missing-bridges') return createMissingBridges();
           if (action === 'select-cli-account') return selectCliAccount(button.dataset.accountId || '');
         };
         Promise.resolve(run()).catch((e) => log(`操作失败: ${e.message}`));
@@ -2565,6 +2656,7 @@ def build_handler(
                         json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
                         return
                     payload = manager.quotas()
+                    payload["missing"] = manager.missing_bridge_accounts(payload.get("quotas"))
                     if not allow_sensitive:
                         payload = redact_snapshot(payload)
                     json_response(self, 200, payload)
@@ -2655,6 +2747,10 @@ def build_handler(
                     return
                 if self.path == "/api/auto-switch-run":
                     result = manager.run_auto_switch(force=bool(payload.get("force", False)))
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/create-missing-bridges":
+                    result = manager.create_missing_bridge_providers()
                     json_response(self, 200, result)
                     return
                 json_response(self, 404, {"ok": False, "error": "Not Found"})

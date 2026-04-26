@@ -133,6 +133,12 @@ class FakeManager:
     def run_auto_switch(self, *, force: bool = False) -> dict[str, Any]:
         return {"ok": True, "enabled": True, "actions": [], "force": force}
 
+    def missing_bridge_accounts(self, quotas: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        return []
+
+    def create_missing_bridge_providers(self) -> dict[str, Any]:
+        return {"ok": True, "created": [], "skipped": [], "missing": []}
+
 
 class ServerCase(unittest.TestCase):
     def start_server(self, *, allow_sensitive: bool = True, allow_remote_access: bool = False):
@@ -230,6 +236,7 @@ class ServerCase(unittest.TestCase):
         self.assertIn("当前实际", html)
         self.assertIn('id="autoSwitchEnabled"', html)
         self.assertIn("OpenAI 自动切换", html)
+        self.assertIn("为新账号创建 Local Codex Bridge", html)
         self.assertNotIn('id="simpleAccount"', html)
         self.assertNotIn("今天用哪个账号", html)
 
@@ -517,6 +524,20 @@ class LauncherCase(unittest.TestCase):
         best = manager._best_quota_account(snapshot, quotas)
 
         self.assertEqual(best["account_id"], "acct-plus-new")
+
+    def test_create_missing_bridge_providers_creates_without_switching_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+            with mock.patch.object(manager, "quotas", return_value={"ok": True, "quotas": [{"account_id": "acct-1", "quota_status": "ok", "plan_type": "plus"}]}), \
+                mock.patch.object(manager, "snapshot", return_value={"providers": [], "codex_desktop": {}}), \
+                mock.patch.object(manager, "create_or_update_provider", return_value={"ok": True, "provider_id": "new"}) as create_provider:
+                result = manager.create_missing_bridge_providers()
+
+            self.assertTrue(result["ok"])
+            create_provider.assert_called_once()
+            self.assertEqual(create_provider.call_args.args[0], "acct-1")
+            self.assertFalse(create_provider.call_args.args[2])
+            self.assertEqual(len(result["created"]), 1)
 
     def test_create_cli_home_compatibility_wrapper_is_launcher_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
