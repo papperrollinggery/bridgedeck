@@ -4,6 +4,7 @@
 
 - Split the daily UI into Claude Code, standalone Codex CLI, and global Codex CLI account selectors.
 - Renamed the default Codex workflow to global Codex CLI to clarify when `~/.codex/config.toml` is changed.
+- Added an actual Claude Code provider status line so CC Switch changes are visible without changing the selected account dropdown.
 
 ## 0.2.4
 

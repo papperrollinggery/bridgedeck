@@ -1239,6 +1239,8 @@ INDEX_HTML = """<!doctype html>
     .toolSelect { margin-top:10px; display:grid; gap:6px; }
     .toolSelect label { color:var(--muted); font-size:12px; }
     .toolSelect select { width:100%; min-width:0; }
+    .actualLine { margin-top:8px; color:var(--muted); font-size:12px; line-height:1.45; }
+    .actualLine strong { color:var(--text); }
     .toolCard button { min-height:42px; font-weight:700; }
     .simpleResult { margin-top:12px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#0f1320; min-height:42px; color:var(--muted); font-size:13px; line-height:1.5; }
     .simpleResult strong { color:var(--text); }
@@ -1296,6 +1298,7 @@ INDEX_HTML = """<!doctype html>
               <label for="simpleClaudeAccount">Claude Code 用哪个账号</label>
               <select id="simpleClaudeAccount"></select>
             </div>
+            <div class="actualLine" id="simpleClaudeActual">当前实际：检测中...</div>
           </div>
           <button class="primary" data-action="simple-claude">应用到 Claude Code</button>
         </div>
@@ -1485,6 +1488,7 @@ INDEX_HTML = """<!doctype html>
         steps: [
           'Claude Code、单独 Codex CLI、全局 Codex CLI 各自选账号。',
           'Claude Code 卡片只影响 Claude Code 当前账号。',
+          '“当前实际”显示 CC Switch 当前 Claude Provider。',
           '单独 Codex CLI 只生成独立启动器，不改变全局默认。',
           '全局 Codex CLI 给 Paperclip、Codex Desktop、直接运行 codex 用。',
           '三个入口可以同号，也可以不同号。',
@@ -1582,6 +1586,33 @@ INDEX_HTML = """<!doctype html>
     }
     function findAccount(accountId) {
       return lastAccounts.find((a) => a.account_id === accountId);
+    }
+    function currentClaudeProvider(data) {
+      if (!data) return null;
+      const fromSettings = data.providers.find((p) => p.id === data.current_provider_from_settings);
+      if (fromSettings) return fromSettings;
+      return data.providers.find((p) => p.is_current) || null;
+    }
+    function isBridgeClaudeProvider(provider) {
+      return Boolean(provider && provider.base_url && provider.base_url.includes('/accounts/'));
+    }
+    function providerDisplayName(provider) {
+      if (!provider) return '未检测到';
+      const account = provider.account_id ? findAccount(provider.account_id) : null;
+      if (account) return `${provider.name} / ${accountLabel(account)}`;
+      return provider.name || maskId(provider.id || '');
+    }
+    function renderActualClaude(data) {
+      const box = document.getElementById('simpleClaudeActual');
+      if (!box) return;
+      const provider = currentClaudeProvider(data);
+      if (!provider) {
+        box.innerHTML = '当前实际：<strong class="warnText">未检测到</strong>';
+        return;
+      }
+      const mode = isBridgeClaudeProvider(provider) ? 'BridgeDeck 同步' : '外部供应商';
+      const cls = isBridgeClaudeProvider(provider) ? 'ok' : 'warnText';
+      box.innerHTML = `当前实际：<strong>${esc(providerDisplayName(provider))}</strong><br><span class="${cls}">${esc(mode)}</span>`;
     }
     function setSimpleResult(message, level='') {
       const box = document.getElementById('simpleResult');
@@ -1942,6 +1973,7 @@ INDEX_HTML = """<!doctype html>
       renderCodexProviders(data);
       renderCliHomes(data);
       renderDiagnosis(data);
+      renderActualClaude(data);
       if (data.accounts.length > 0 && !document.getElementById('simpleResult').dataset.touched) {
         setSimpleResult('已准备好。Claude Code、单独 Codex CLI、全局 Codex CLI 可以分别选不同账号。');
       }
@@ -1979,7 +2011,7 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('simpleResult').dataset.touched = '1';
       setSimpleResult(`正在让 Claude Code 使用 ${accountLabel(item)}...`);
       await createProvider();
-      setSimpleResult(`完成：Claude Code 现在使用 ${accountLabel(item)}。`, 'ok');
+      setSimpleResult(`完成：Claude Code 现在使用 ${accountLabel(item)}，CC Switch 当前 Claude Provider 已同步。`, 'ok');
     }
     async function simpleCli() {
       const item = selectedAccount('simpleCliAccount');

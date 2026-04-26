@@ -204,8 +204,10 @@ class ServerCase(unittest.TestCase):
         self.assertIn('id="simpleClaudeAccount"', html)
         self.assertIn('id="simpleCliAccount"', html)
         self.assertIn('id="simpleDefaultAccount"', html)
+        self.assertIn('id="simpleClaudeActual"', html)
         self.assertIn("单独 Codex CLI", html)
         self.assertIn("全局 Codex CLI", html)
+        self.assertIn("当前实际", html)
         self.assertNotIn('id="simpleAccount"', html)
         self.assertNotIn("今天用哪个账号", html)
 
