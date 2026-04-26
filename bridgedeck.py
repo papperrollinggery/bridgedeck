@@ -1178,6 +1178,21 @@ INDEX_HTML = """<!doctype html>
     .recommend.warnState { border-color:#7a5a1c; background:#211a0e; }
     .recommend.badState { border-color:#7a3232; background:#251414; }
     .quickbar { display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }
+    .simpleFlow { border-color:#35527d; background:#121a29; }
+    .simpleHeader { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; flex-wrap:wrap; margin-bottom:12px; }
+    .simpleTitle { font-size:22px; font-weight:800; margin-bottom:4px; }
+    .simpleSubtitle { color:var(--muted); font-size:13px; line-height:1.5; }
+    .bigSelectRow { display:grid; grid-template-columns: 140px minmax(260px, 520px); gap:12px; align-items:center; margin:12px 0 14px; }
+    .bigSelectRow label { font-weight:700; }
+    .bigSelectRow select { width:100%; min-height:42px; font-size:15px; }
+    .toolGrid { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:12px; }
+    .toolCard { border:1px solid var(--line); border-radius:10px; padding:14px; background:#101827; min-height:150px; display:flex; flex-direction:column; justify-content:space-between; gap:12px; }
+    .toolName { font-size:16px; font-weight:800; margin-bottom:6px; }
+    .toolText { color:var(--muted); font-size:13px; line-height:1.5; }
+    .toolCard button { min-height:42px; font-weight:700; }
+    .simpleResult { margin-top:12px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#0f1320; min-height:42px; color:var(--muted); font-size:13px; line-height:1.5; }
+    .simpleResult strong { color:var(--text); }
+    .advancedIntro { color:var(--muted); font-size:12px; margin-bottom:10px; }
     summary { cursor:pointer; font-weight:700; }
     details.card { padding:0; }
     details.card > summary { padding:14px; list-style:none; }
@@ -1188,6 +1203,8 @@ INDEX_HTML = """<!doctype html>
       .layout { grid-template-columns: 1fr; }
       .sidebar { position: static; }
       .topGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .toolGrid { grid-template-columns: 1fr; }
+      .bigSelectRow { grid-template-columns: 1fr; }
     }
     @media (max-width: 560px) {
       .topGrid { grid-template-columns: 1fr; }
@@ -1201,18 +1218,53 @@ INDEX_HTML = """<!doctype html>
       <div id="status" class="muted">加载中...</div>
       <div class="topGrid">
         <div class="tile"><div class="tileLabel">账号</div><div id="tileAccounts" class="tileValue">-</div></div>
-        <div class="tile"><div class="tileLabel">Claude Provider</div><div id="tileProviders" class="tileValue">-</div></div>
-        <div class="tile"><div class="tileLabel">Codex Mismatch</div><div id="tileMismatches" class="tileValue">-</div></div>
-        <div class="tile"><div class="tileLabel">CLI Home</div><div id="tileCliHomes" class="tileValue">-</div></div>
+        <div class="tile"><div class="tileLabel">Claude 配置</div><div id="tileProviders" class="tileValue">-</div></div>
+        <div class="tile"><div class="tileLabel">账号不一致</div><div id="tileMismatches" class="tileValue">-</div></div>
+        <div class="tile"><div class="tileLabel">CLI 配置</div><div id="tileCliHomes" class="tileValue">-</div></div>
       </div>
       <div id="recommendation" class="recommend">加载中...</div>
-      <div class="quickbar">
-        <button class="primary" data-action="scroll" data-target="providerCreateCard">创建 Claude 桥接</button>
-        <button data-action="scroll" data-target="cliHomeCard">切换 Codex CLI</button>
-        <button data-action="scroll" data-target="statusCard">检查状态</button>
-        <button data-action="refresh">刷新</button>
+      <details>
+        <summary>技术信息</summary>
+        <div class="paths" id="paths"></div>
+      </details>
+    </div>
+
+    <div class="card simpleFlow guideSection" id="simpleFlowCard" data-guide="simpleFlow">
+      <div class="simpleHeader">
+        <div>
+          <div class="simpleTitle">先选账号，再选要用的工具</div>
+          <div class="simpleSubtitle">日常只用这里。Claude Code 是“当前账号”，Codex CLI 是“开一个新窗口”。Codex Desktop 这里只看状态。</div>
+        </div>
+        <button data-action="refresh">刷新状态</button>
       </div>
-      <div class="paths" id="paths"></div>
+      <div class="bigSelectRow">
+        <label for="simpleAccount">今天用哪个账号</label>
+        <select id="simpleAccount"></select>
+      </div>
+      <div class="toolGrid">
+        <div class="toolCard">
+          <div>
+            <div class="toolName">Claude Code</div>
+            <div class="toolText">让 Claude Code 立刻使用上面选中的账号。</div>
+          </div>
+          <button class="primary" data-action="simple-claude">Claude Code 用这个账号</button>
+        </div>
+        <div class="toolCard">
+          <div>
+            <div class="toolName">Codex CLI</div>
+            <div class="toolText">为上面选中的账号准备一个独立 CLI 启动器，可和其它账号同时开。</div>
+          </div>
+          <button class="primary" data-action="simple-cli">准备 Codex CLI 窗口</button>
+        </div>
+        <div class="toolCard">
+          <div>
+            <div class="toolName">Codex Desktop</div>
+            <div class="toolText">桌面版不由 BridgeDeck 接管。这里帮你看它当前是否正常。</div>
+          </div>
+          <button data-action="scroll" data-target="statusCard">查看桌面版状态</button>
+        </div>
+      </div>
+      <div class="simpleResult" id="simpleResult">选择账号后，点一个按钮即可。</div>
     </div>
 
     <div class="layout">
@@ -1225,7 +1277,9 @@ INDEX_HTML = """<!doctype html>
       </aside>
 
       <main class="main">
-        <div class="card guideSection" id="providerCreateCard" data-guide="providerCreate">
+        <details class="card guideSection" id="providerCreateCard" data-guide="providerCreate">
+          <summary>高级：Claude 桥接账号</summary>
+          <div class="detailsBody">
           <h2>Claude 桥接账号</h2>
           <div class="sectionHint">把某个 ChatGPT 账号接到 Claude Code。通常只需要选账号，然后创建并设为当前。</div>
           <div class="row">
@@ -1237,9 +1291,12 @@ INDEX_HTML = """<!doctype html>
             <button class="primary" data-action="create-provider">创建/更新 Claude 桥接</button>
           </div>
           <div class="muted">工具会自动写入本地 bridge 配置，不需要手动编辑 URL/token。</div>
-        </div>
+          </div>
+        </details>
 
-        <div class="card guideSection" id="cliHomeCard" data-guide="cliHome">
+        <details class="card guideSection" id="cliHomeCard" data-guide="cliHome">
+          <summary>高级：Codex CLI 启动器</summary>
+          <div class="detailsBody">
           <h2>Codex CLI 切换</h2>
           <div class="sectionHint">生成 launcher-only 启动器：只设置 <code>CODEX_HOME</code>、<code>OPENAI_API_KEY</code> 和账号路由，不复制 OpenAI token，不改默认 <code>~/.codex</code>。</div>
           <div class="row">
@@ -1269,7 +1326,8 @@ INDEX_HTML = """<!doctype html>
               <tbody></tbody>
             </table>
           </div>
-        </div>
+          </div>
+        </details>
 
         <details class="card guideSection" id="providerManageCard" data-guide="providerManage">
           <summary>高级：Claude Provider 管理</summary>
@@ -1356,6 +1414,17 @@ INDEX_HTML = """<!doctype html>
     let tokenVisible = false;
     let lastAccounts = [];
     const GUIDES = {
+      simpleFlow: {
+        title: '日常模式',
+        target: '上方板块：先选账号，再选工具',
+        steps: [
+          '先选“今天用哪个账号”。',
+          'Claude Code 要切账号，就点“Claude Code 用这个账号”。',
+          'Codex CLI 要开新窗口，就点“准备 Codex CLI 窗口”。',
+          'Codex Desktop 只看状态，不在这里切换。',
+          '下方高级区只在排查时使用。'
+        ]
+      },
       providerCreate: {
         title: 'Claude 桥接账号',
         target: '右侧板块：Claude 桥接账号',
@@ -1435,6 +1504,24 @@ INDEX_HTML = """<!doctype html>
       box.value += `[${new Date().toLocaleTimeString()}] ${msg}\\n`;
       box.scrollTop = box.scrollHeight;
     }
+    function accountLabel(item) {
+      if (!item) return '';
+      return maskEmail(item.email || item.label || maskId(item.account_id || ''));
+    }
+    function accountSlug(item) {
+      if (!item) return '';
+      const fallback = String(item.account_id || '').slice(0, 8);
+      const label = item.email && item.email.includes('@') ? item.email.split('@')[0] : fallback;
+      return label || fallback;
+    }
+    function findAccount(accountId) {
+      return lastAccounts.find((a) => a.account_id === accountId);
+    }
+    function setSimpleResult(message, level='') {
+      const box = document.getElementById('simpleResult');
+      const cls = level === 'ok' ? 'ok' : (level === 'warn' ? 'warnText' : (level === 'bad' ? 'bad' : ''));
+      box.innerHTML = cls ? `<strong class="${cls}">${esc(message)}</strong>` : esc(message);
+    }
     function selectedProviderId() {
       const chosen = document.querySelector('input[name="providerPick"]:checked');
       return chosen ? chosen.value : '';
@@ -1479,17 +1566,27 @@ INDEX_HTML = """<!doctype html>
     }
     function applyCliAccountDefaults(item) {
       if (!item) return;
-      const shortId = item.account_id.slice(0, 8);
-      const label = item.email && item.email.includes('@') ? item.email.split('@')[0] : shortId;
+      const label = accountSlug(item);
       document.getElementById('cliHome').value = humanPath(item.default_cli_home || `~/.codex-cli-${label}`);
       document.getElementById('cliProfileName').value = label;
     }
-    function selectCliAccount(accountId) {
-      const cliSel = document.getElementById('cliAccount');
+    function syncSelectedAccount(accountId) {
       const idx = lastAccounts.findIndex((a) => a.account_id === accountId);
-      if (idx < 0) return;
+      if (idx < 0) return null;
+      const item = lastAccounts[idx];
+      const simpleSel = document.getElementById('simpleAccount');
+      const accountSel = document.getElementById('account');
+      const cliSel = document.getElementById('cliAccount');
+      simpleSel.selectedIndex = idx;
+      accountSel.selectedIndex = idx;
       cliSel.selectedIndex = idx;
-      applyCliAccountDefaults(lastAccounts[idx]);
+      document.getElementById('providerName').value = `Local Codex Bridge - ${accountSlug(item)}`;
+      applyCliAccountDefaults(item);
+      return item;
+    }
+    function selectCliAccount(accountId) {
+      const item = syncSelectedAccount(accountId);
+      if (!item) return;
       log(`CLI 账号已选中: ${maskId(accountId)}`);
     }
     async function api(path, method='GET', payload=null) {
@@ -1509,8 +1606,10 @@ INDEX_HTML = """<!doctype html>
       lastAccounts = accounts;
       const sel = document.getElementById('account');
       const cliSel = document.getElementById('cliAccount');
+      const simpleSel = document.getElementById('simpleAccount');
       sel.innerHTML = '';
       cliSel.innerHTML = '';
+      simpleSel.innerHTML = '';
       accounts.forEach((a) => {
         const opt = document.createElement('option');
         opt.value = a.account_id;
@@ -1518,11 +1617,11 @@ INDEX_HTML = """<!doctype html>
         opt.textContent = `${maskId(a.account_id)}${mail}`;
         sel.appendChild(opt);
         cliSel.appendChild(opt.cloneNode(true));
+        simpleSel.appendChild(opt.cloneNode(true));
       });
       function applyAccountDefaults(item) {
         if (!item) return;
-        const shortId = item.account_id.slice(0, 8);
-        const label = item.email && item.email.includes('@') ? item.email.split('@')[0] : shortId;
+        const label = accountSlug(item);
         if (!document.getElementById('providerName').value.trim()) {
           document.getElementById('providerName').value = `Local Codex Bridge - ${label}`;
         }
@@ -1535,13 +1634,18 @@ INDEX_HTML = """<!doctype html>
       sel.onchange = () => {
         const idx = sel.selectedIndex;
         const item = accounts[idx];
-        if (!item) return;
-        const shortId = item.account_id.slice(0, 8);
-        let name = `Local Codex Bridge - ${shortId}`;
-        if (item.email && item.email.includes('@')) name = `Local Codex Bridge - ${item.email.split('@')[0]}`;
-        document.getElementById('providerName').value = name;
+        if (item) syncSelectedAccount(item.account_id);
       };
-      cliSel.onchange = () => applyAccountDefaults(accounts[cliSel.selectedIndex]);
+      cliSel.onchange = () => {
+        const item = accounts[cliSel.selectedIndex];
+        if (item) syncSelectedAccount(item.account_id);
+      };
+      simpleSel.onchange = () => {
+        const item = accounts[simpleSel.selectedIndex];
+        if (!item) return;
+        syncSelectedAccount(item.account_id);
+        setSimpleResult(`已选择 ${accountLabel(item)}。现在点下面的工具按钮。`);
+      };
       renderCliAccounts(accounts);
     }
     function renderCliAccounts(accounts) {
@@ -1657,7 +1761,7 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('tileCliHomes').textContent = cliHomeCount;
       const box = document.getElementById('recommendation');
       let state = 'okState';
-      let text = '状态正常。需要切账号时，直接使用上方两个创建入口。';
+      let text = '状态正常。日常只需要用下面的“先选账号，再选工具”。';
       if (accountCount === 0) {
         state = 'warnState';
         text = '未发现 CC Switch Codex OAuth 账号。先在 CC Switch 登录目标 ChatGPT 账号，再回这里刷新。';
@@ -1669,7 +1773,7 @@ INDEX_HTML = """<!doctype html>
         text = `发现 ${mismatchCount} 个 Codex Provider 账号不匹配。回 CC Switch 重新授权对应账号。`;
       } else if (providerCount === 0) {
         state = 'warnState';
-        text = '还没有 Claude Provider。点击“创建 Claude 桥接”，选择账号后创建。';
+        text = '还没有 Claude 配置。选择账号后点“Claude Code 用这个账号”。';
       }
       box.className = `recommend ${state}`;
       box.textContent = text;
@@ -1724,6 +1828,10 @@ INDEX_HTML = """<!doctype html>
       renderCodexProviders(data);
       renderCliHomes(data);
       renderDiagnosis(data);
+      if (data.accounts.length > 0 && !document.getElementById('simpleResult').dataset.touched) {
+        const selected = data.accounts[document.getElementById('simpleAccount').selectedIndex] || data.accounts[0];
+        setSimpleResult(`已准备好。当前选择：${accountLabel(selected)}。`);
+      }
       log('数据已刷新');
     }
     async function createProvider() {
@@ -1737,6 +1845,7 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/create-provider', 'POST', { account_id: accountId, provider_name: providerName, set_current: setCurrent });
       log(`${res.message}: ${res.provider_name} (${res.provider_id})`);
       await refreshData();
+      return res;
     }
     async function createCliHome() {
       const accountId = document.getElementById('cliAccount').value;
@@ -1747,6 +1856,26 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('cliCommand').textContent = `启动命令: ${humanPath(res.run_command)}\\n启动脚本: ${humanPath(res.launcher)}`;
       log(`${res.message}: ${res.target_dir}`);
       await refreshData();
+      return res;
+    }
+    async function simpleClaude() {
+      const accountId = document.getElementById('simpleAccount').value;
+      const item = syncSelectedAccount(accountId);
+      if (!item) return setSimpleResult('先选择一个账号。', 'warn');
+      document.getElementById('setCurrent').checked = true;
+      document.getElementById('simpleResult').dataset.touched = '1';
+      setSimpleResult(`正在让 Claude Code 使用 ${accountLabel(item)}...`);
+      await createProvider();
+      setSimpleResult(`完成：Claude Code 现在使用 ${accountLabel(item)}。`, 'ok');
+    }
+    async function simpleCli() {
+      const accountId = document.getElementById('simpleAccount').value;
+      const item = syncSelectedAccount(accountId);
+      if (!item) return setSimpleResult('先选择一个账号。', 'warn');
+      document.getElementById('simpleResult').dataset.touched = '1';
+      setSimpleResult(`正在准备 ${accountLabel(item)} 的 Codex CLI 窗口...`);
+      const res = await createCliHome();
+      setSimpleResult(`完成：Codex CLI 窗口已准备好。启动器：${humanPath(res.launcher)}。`, 'ok');
     }
     async function migrateCliHome() {
       const accountId = document.getElementById('cliAccount').value;
@@ -1757,6 +1886,7 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('cliCommand').textContent = `启动命令: ${humanPath(res.run_command)}\\n启动脚本: ${humanPath(res.launcher)}`;
       log(`${res.message}: ${res.target_dir}`);
       await refreshData();
+      return res;
     }
     async function setCurrentFromSelected() {
       const id = selectedProviderId();
@@ -1787,6 +1917,8 @@ INDEX_HTML = """<!doctype html>
           if (action === 'refresh') return refreshData();
           if (action === 'create-provider') return createProvider();
           if (action === 'create-cli-home') return createCliHome();
+          if (action === 'simple-claude') return simpleClaude();
+          if (action === 'simple-cli') return simpleCli();
           if (action === 'migrate-cli-home') return migrateCliHome();
           if (action === 'toggle-tokens') return toggleTokens();
           if (action === 'set-current-selected') return setCurrentFromSelected();
