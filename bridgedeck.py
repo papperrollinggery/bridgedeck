@@ -531,8 +531,10 @@ class BridgeManager:
         m = copy.deepcopy(meta) if isinstance(meta, dict) else {}
         if not isinstance(m, dict):
             m = {}
-        # Keep Codex OAuth binding semantics for quota/account UI, route via local bridge transport.
-        m["providerType"] = "codex_oauth"
+        # Keep Codex OAuth account binding so CC Switch can show quota for the card,
+        # but do not mark the provider itself as codex_oauth. CC Switch routes that
+        # provider type through its own ChatGPT transport and bypasses the local bridge.
+        m.pop("providerType", None)
         m["apiFormat"] = "openai_responses"
         m["codexOauthTransport"] = "local_bridge"
         binding = m.get("authBinding")
@@ -729,7 +731,7 @@ class BridgeManager:
                     updates = {
                         "settings_config": settings_text,
                         "meta": meta_text,
-                        "provider_type": "codex_oauth",
+                        "provider_type": None,
                     }
                     assignments = []
                     values: list[Any] = []
@@ -751,7 +753,7 @@ class BridgeManager:
                         "name": provider_name,
                         "settings_config": settings_text,
                         "meta": meta_text,
-                        "provider_type": "codex_oauth",
+                        "provider_type": None,
                         "created_at": int(time.time()),
                         "sort_index": conn.execute(
                             "SELECT COALESCE(MAX(sort_index), 0) + 1 FROM providers WHERE app_type = 'claude'"
@@ -821,7 +823,7 @@ class BridgeManager:
                 updates = {
                     "settings_config": json.dumps(new_settings, ensure_ascii=False),
                     "meta": json.dumps(new_meta, ensure_ascii=False),
-                    "provider_type": "codex_oauth",
+                    "provider_type": None,
                 }
                 assignments = []
                 values: list[Any] = []
@@ -878,7 +880,7 @@ class BridgeManager:
                     updates = {
                         "settings_config": json.dumps(new_settings, ensure_ascii=False),
                         "meta": json.dumps(new_meta, ensure_ascii=False),
-                        "provider_type": "codex_oauth",
+                        "provider_type": None,
                     }
                     assignments = []
                     values: list[Any] = []

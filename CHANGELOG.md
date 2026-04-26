@@ -6,6 +6,7 @@
 - Renamed the default Codex workflow to global Codex CLI to clarify when `~/.codex/config.toml` is changed.
 - Added an actual Claude Code provider status line so CC Switch changes are visible without changing the selected account dropdown.
 - Made the macOS command and app launcher idempotent: if BridgeDeck is already running, they only open the page.
+- Fixed Local Codex Bridge provider metadata so CC Switch forwards Claude requests to the local bridge while keeping Codex account quota visible.
 
 ## 0.2.4
 

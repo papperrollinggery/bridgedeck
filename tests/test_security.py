@@ -371,6 +371,24 @@ class LauncherCase(unittest.TestCase):
             self.assertIn('base_url="http://127.0.0.1:8876/accounts/acct-1/v1"', body)
             self.assertNotIn("secret-refresh-token", body)
 
+    def test_local_bridge_provider_payload_does_not_use_codex_oauth_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+
+            settings, meta = manager._build_provider_payload(
+                "acct-1",
+                settings_config={"env": {}},
+                meta={"providerType": "codex_oauth", "authBinding": {"authProvider": "codex_oauth"}},
+            )
+
+            env = settings["env"]
+            self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8876/accounts/acct-1")
+            self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "local-bridge")
+            self.assertEqual(meta["apiFormat"], "openai_responses")
+            self.assertEqual(meta["codexOauthTransport"], "local_bridge")
+            self.assertEqual(meta["authBinding"]["authProvider"], "codex_oauth")
+            self.assertNotIn("providerType", meta)
+
     def test_create_cli_home_compatibility_wrapper_is_launcher_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
