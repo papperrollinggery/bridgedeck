@@ -11,12 +11,11 @@ import json
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,8 +33,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
 APP_VERSION = "0.2.4"
 MAX_REQUEST_BYTES = 1024 * 1024
-CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
+CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
 
 
 def now_ts() -> str:
@@ -116,6 +115,27 @@ def jwt_identity(token: str | None) -> dict[str, Any]:
         "plan": auth_obj.get("chatgpt_plan_type") or "",
         "exp": payload.get("exp"),
     }
+
+
+def classify_error_text(text: str | None) -> str:
+    value = (text or "").lower()
+    if "refresh_token_reused" in value or "refresh token reused" in value:
+        return "refresh_token_reused"
+    if "unsupported_country_region_territory" in value or "country, region, or territory not supported" in value:
+        return "unsupported_region"
+    if "connection refused" in value or "bridge_down" in value:
+        return "bridge_down"
+    if "proxy_down" in value:
+        return "proxy_down"
+    return "network_error" if value else "ok"
+
+
+def tcp_open(host: str, port: int, timeout: float = 0.25) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 @dataclass
@@ -212,8 +232,17 @@ class BridgeManager:
         token_obj = tokens if isinstance(tokens, dict) else {}
         access_token = token_obj.get("access_token") if isinstance(token_obj.get("access_token"), str) else ""
         refresh_token = token_obj.get("refresh_token") if isinstance(token_obj.get("refresh_token"), str) else ""
+        id_token = token_obj.get("id_token") if isinstance(token_obj.get("id_token"), str) else ""
         identity = jwt_identity(access_token)
         is_default = codex_home == DEFAULT_CODEX_HOME
+        token_fields = {
+            "access_token": bool(access_token),
+            "refresh_token": bool(refresh_token),
+            "id_token": bool(id_token),
+        }
+        risk_flags = []
+        if not is_default and any(token_fields.values()):
+            risk_flags.append("stale_cli_token_profile")
         return {
             "path": str(codex_home),
             "exists": auth_path.exists(),
@@ -227,6 +256,9 @@ class BridgeManager:
             "plan": identity.get("plan") or "",
             "refresh_sha12": sha12(refresh_token),
             "access_exp": identity.get("exp"),
+            "token_fields": token_fields,
+            "risk_flags": risk_flags,
+            "status": "stale_launcher" if risk_flags else "ok",
         }
 
     def _known_cli_homes(self) -> list[dict[str, Any]]:
@@ -235,6 +267,60 @@ class BridgeManager:
             if item.is_dir() and item not in homes:
                 homes.append(item)
         return [self._codex_auth_summary(home) for home in homes]
+
+    def _known_cli_launchers(self) -> list[dict[str, Any]]:
+        if not DEFAULT_CLI_LAUNCHER_DIR.exists():
+            return []
+        launchers: list[dict[str, Any]] = []
+        for item in sorted(DEFAULT_CLI_LAUNCHER_DIR.glob("codex-*.command")):
+            if not item.is_file():
+                continue
+            try:
+                body = item.read_text(encoding="utf-8")
+            except Exception:
+                body = ""
+            account_match = re.search(r"/accounts/([^/'\" ]+)/v1", body)
+            home_match = re.search(r"CODEX_HOME=(?:'([^']+)'|\"([^\"]+)\"|([^ \n]+))", body)
+            launchers.append(
+                {
+                    "path": str(item),
+                    "name": item.stem.removeprefix("codex-"),
+                    "account_id": account_match.group(1) if account_match else "",
+                    "codex_home": next((v for v in (home_match.groups() if home_match else ()) if v), ""),
+                    "launcher_only": "OPENAI_API_KEY" in body and "/accounts/" in body and "/v1" in body,
+                }
+            )
+        return launchers
+
+    def _codex_desktop_status(self) -> dict[str, Any]:
+        config_path = DEFAULT_CODEX_HOME / "config.toml"
+        data = {
+            "detected": config_path.exists(),
+            "config_path": str(config_path),
+            "base_url": "",
+            "managed_by": "unknown",
+            "risk_flags": [],
+        }
+        if not config_path.exists():
+            return data
+        try:
+            text = config_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            data["risk_flags"].append(f"config_read_error:{exc}")
+            return data
+        match = re.search(r'^\s*base_url\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+        if match:
+            data["base_url"] = match.group(1)
+        if CC_SWITCH_BASE_URL in data["base_url"]:
+            data["managed_by"] = "cc_switch"
+        elif LOCAL_BRIDGE_BASE_URL in data["base_url"]:
+            data["managed_by"] = "bridgedeck_or_local_bridge"
+            data["risk_flags"].append("desktop_local_bridge_route")
+        elif data["base_url"]:
+            data["managed_by"] = "custom"
+        else:
+            data["managed_by"] = "default"
+        return data
 
     def _list_codex_providers(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         rows = conn.execute(
@@ -270,6 +356,123 @@ class BridgeManager:
                 }
             )
         return providers
+
+    def _account_matrix(
+        self,
+        accounts: list[dict[str, Any]],
+        providers: list[dict[str, Any]],
+        codex_providers: list[dict[str, Any]],
+        cli_homes: list[dict[str, Any]],
+        cli_launchers: list[dict[str, Any]],
+        desktop: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        provider_by_account: dict[str, list[dict[str, Any]]] = {}
+        for provider in providers:
+            account_id = str(provider.get("account_id") or "")
+            if account_id:
+                provider_by_account.setdefault(account_id, []).append(provider)
+        codex_by_account: dict[str, list[dict[str, Any]]] = {}
+        for provider in codex_providers:
+            account_id = str(provider.get("meta_account_id") or provider.get("token_account_id") or "")
+            if account_id:
+                codex_by_account.setdefault(account_id, []).append(provider)
+        homes_by_account: dict[str, list[dict[str, Any]]] = {}
+        for home in cli_homes:
+            account_id = str(home.get("token_account_id") or home.get("access_account_id") or "")
+            if account_id:
+                homes_by_account.setdefault(account_id, []).append(home)
+        launchers_by_account: dict[str, list[dict[str, Any]]] = {}
+        for launcher in cli_launchers:
+            account_id = str(launcher.get("account_id") or "")
+            if account_id:
+                launchers_by_account.setdefault(account_id, []).append(launcher)
+
+        bridge_ok = tcp_open("127.0.0.1", 8876)
+        proxy_ok = tcp_open("127.0.0.1", 15721)
+        matrix: list[dict[str, Any]] = []
+        for account in accounts:
+            account_id = str(account.get("account_id") or "")
+            account_providers = provider_by_account.get(account_id, [])
+            account_codex = codex_by_account.get(account_id, [])
+            account_homes = homes_by_account.get(account_id, [])
+            account_launchers = launchers_by_account.get(account_id, [])
+            risk_flags: list[str] = []
+            if not bridge_ok:
+                risk_flags.append("bridge_down")
+            if not proxy_ok:
+                risk_flags.append("proxy_down")
+            if any(p.get("token_mismatch") for p in account_codex):
+                risk_flags.append("codex_provider_mismatch")
+            if any("stale_cli_token_profile" in h.get("risk_flags", []) for h in account_homes):
+                risk_flags.append("stale_cli_token_profile")
+            if not account_launchers:
+                risk_flags.append("missing_cli_launcher")
+            if desktop.get("managed_by") == "cc_switch":
+                desktop_state = "cc_switch"
+            elif desktop.get("detected"):
+                desktop_state = str(desktop.get("managed_by") or "detected")
+            else:
+                desktop_state = "not_detected"
+            status = "ok"
+            if "bridge_down" in risk_flags:
+                status = "bridge_down"
+            elif "proxy_down" in risk_flags:
+                status = "proxy_down"
+            elif "stale_cli_token_profile" in risk_flags:
+                status = "stale_launcher"
+            elif "codex_provider_mismatch" in risk_flags:
+                status = "refresh_token_reused"
+            advice = "正常"
+            if status == "bridge_down":
+                advice = "启动 local_codex_bridge.py"
+            elif status == "proxy_down":
+                advice = "启动 CC Switch"
+            elif status == "stale_launcher":
+                advice = "迁移旧 tokenful CLI profile"
+            elif status == "refresh_token_reused":
+                advice = "回 CC Switch 重新授权该账号"
+            elif "missing_cli_launcher" in risk_flags:
+                advice = "生成 Codex CLI 启动器"
+            matrix.append(
+                {
+                    "account_id": account_id,
+                    "email": account.get("email") or "",
+                    "label": account.get("label") or "",
+                    "account_status": status,
+                    "quota_status": "unknown",
+                    "claude_current": any(bool(p.get("is_current")) for p in account_providers),
+                    "claude_providers": [p.get("name") for p in account_providers],
+                    "cli_launchers": account_launchers,
+                    "codex_cli_homes": account_homes,
+                    "codex_desktop": desktop_state,
+                    "desktop_detected": bool(desktop.get("detected")),
+                    "risk_flags": risk_flags,
+                    "advice": advice,
+                }
+            )
+        return matrix
+
+    def health(self) -> dict[str, Any]:
+        snapshot = self.snapshot(include_secrets=False)
+        risk_flags: list[str] = []
+        if not tcp_open("127.0.0.1", 8876):
+            risk_flags.append("bridge_down")
+        if not tcp_open("127.0.0.1", 15721):
+            risk_flags.append("proxy_down")
+        for home in snapshot.get("cli_homes", []):
+            if isinstance(home, dict):
+                risk_flags.extend(str(item) for item in home.get("risk_flags", []))
+        for provider in snapshot.get("codex_providers", []):
+            if isinstance(provider, dict) and provider.get("token_mismatch"):
+                risk_flags.append("codex_provider_mismatch")
+        status = "ok" if not risk_flags else str(risk_flags[0])
+        return {
+            "ok": True,
+            "status": status,
+            "risk_flags": sorted(set(risk_flags)),
+            "account_matrix": snapshot.get("account_matrix", []),
+            "codex_desktop": snapshot.get("codex_desktop", {}),
+        }
 
     def _default_provider_name(self, account: dict[str, Any], existing: set[str]) -> str:
         email = account.get("email") or ""
@@ -376,10 +579,21 @@ class BridgeManager:
             "providers": [],
             "codex_providers": [],
             "cli_homes": self._known_cli_homes(),
+            "cli_launchers": self._known_cli_launchers(),
+            "codex_desktop": self._codex_desktop_status(),
+            "account_matrix": [],
             "current_provider_from_settings": self._current_provider_from_settings(),
         }
 
         if not self.paths.db.exists():
+            data["account_matrix"] = self._account_matrix(
+                data["accounts"],
+                data["providers"],
+                data["codex_providers"],
+                data["cli_homes"],
+                data["cli_launchers"],
+                data["codex_desktop"],
+            )
             return data
 
         with self._connect() as conn:
@@ -425,6 +639,15 @@ class BridgeManager:
                 )
 
             data["codex_providers"] = self._list_codex_providers(conn)
+
+        data["account_matrix"] = self._account_matrix(
+            data["accounts"],
+            data["providers"],
+            data["codex_providers"],
+            data["cli_homes"],
+            data["cli_launchers"],
+            data["codex_desktop"],
+        )
 
         return data
 
@@ -676,114 +899,15 @@ class BridgeManager:
                 "backups": [db_bak],
             }
 
-    def _refresh_codex_token(self, refresh_token: str) -> dict[str, Any]:
-        payload = urllib.parse.urlencode(
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": CODEX_CLIENT_ID,
-                "scope": "openid profile email",
-            }
-        ).encode("utf-8")
-        request = urllib.request.Request(
-            CODEX_OAUTH_TOKEN_URL,
-            data=payload,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": "bridgedeck",
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=25) as response:
-                parsed = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            if exc.code in (401, 403):
-                raise ValueError("该账号 refresh_token 已失效，需要先在 CC Switch 重新登录") from exc
-            raise RuntimeError(f"刷新 Codex token 失败: HTTP {exc.code} {detail[:300]}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"刷新 Codex token 失败: 网络错误 {exc.reason}") from exc
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("刷新 Codex token 失败: 响应不是 JSON") from exc
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("access_token"), str):
-            raise RuntimeError("刷新 Codex token 失败: 响应缺少 access_token")
-        return parsed
-
-    def _sync_codex_provider_tokens(
-        self,
-        conn: sqlite3.Connection,
-        account_id: str,
-        token_payload: dict[str, Any],
-        refresh_token: str,
-        last_refresh: str,
-    ) -> list[str]:
-        rows = conn.execute(
-            """
-            SELECT id, name, settings_config, meta
-            FROM providers
-            WHERE app_type = 'codex'
-              AND json_extract(meta, '$.authBinding.accountId') = ?
-            """,
-            (account_id,),
-        ).fetchall()
-        updated: list[str] = []
-        columns = self._provider_columns(conn)
-        for row in rows:
-            settings = self._extract_json(row["settings_config"])
-            meta = self._extract_json(row["meta"])
-            auth = settings.get("auth")
-            if not isinstance(auth, dict):
-                auth = {}
-            auth["auth_mode"] = "chatgpt"
-            auth["OPENAI_API_KEY"] = None
-            auth["last_refresh"] = last_refresh
-            tokens = auth.get("tokens")
-            if not isinstance(tokens, dict):
-                tokens = {}
-            tokens["account_id"] = account_id
-            tokens["access_token"] = token_payload["access_token"]
-            tokens["refresh_token"] = refresh_token
-            if isinstance(token_payload.get("id_token"), str):
-                tokens["id_token"] = token_payload["id_token"]
-            auth["tokens"] = tokens
-            settings["auth"] = auth
-            meta["providerType"] = "codex_oauth"
-            binding = meta.get("authBinding")
-            if not isinstance(binding, dict):
-                binding = {}
-            binding["source"] = "managed_account"
-            binding["authProvider"] = "codex_oauth"
-            binding["accountId"] = account_id
-            meta["authBinding"] = binding
-            updates = {
-                "provider_type": "codex_oauth",
-                "settings_config": json.dumps(settings, ensure_ascii=False),
-                "meta": json.dumps(meta, ensure_ascii=False),
-            }
-            assignments = []
-            values: list[Any] = []
-            for key, value in updates.items():
-                if key in columns:
-                    assignments.append(f"{key} = ?")
-                    values.append(value)
-            if assignments:
-                values.extend([row["id"], "codex"])
-                conn.execute(
-                    f"UPDATE providers SET {', '.join(assignments)} WHERE id = ? AND app_type = ?",
-                    values,
-                )
-                updated.append(str(row["name"]))
-        return updated
-
     def create_or_sync_cli_home(
         self,
         account_id: str,
         target_dir: str,
         profile_name: str,
     ) -> dict[str, Any]:
-        account_id = account_id.strip()
-        if not account_id:
-            raise ValueError("account_id 不能为空")
+        return self.create_cli_launcher(account_id, target_dir, profile_name, compatibility=True)
+
+    def _validate_cli_home(self, target_dir: str) -> Path:
         target = Path(target_dir).expanduser()
         if not target.is_absolute():
             target = Path.home() / target
@@ -798,7 +922,20 @@ class BridgeManager:
         target_auth = target / "auth.json"
         if target_auth.is_symlink():
             raise ValueError("auth.json 不能是符号链接")
+        return target
 
+    def create_cli_launcher(
+        self,
+        account_id: str,
+        target_dir: str,
+        profile_name: str,
+        *,
+        compatibility: bool = False,
+    ) -> dict[str, Any]:
+        account_id = account_id.strip()
+        if not account_id:
+            raise ValueError("account_id 不能为空")
+        target = self._validate_cli_home(target_dir)
         with self._lock:
             store = self._load_auth_store_raw()
             accounts = store.get("accounts")
@@ -807,96 +944,52 @@ class BridgeManager:
             account_payload = accounts.get(account_id)
             if not isinstance(account_payload, dict):
                 raise ValueError(f"未找到账号: {account_id}")
-            refresh_token = account_payload.get("refresh_token")
-            if not isinstance(refresh_token, str) or not refresh_token.strip():
-                raise ValueError("该账号缺少 refresh_token")
-
-            token_payload = self._refresh_codex_token(refresh_token)
-            identity = jwt_identity(token_payload.get("access_token"))
-            token_account_id = identity.get("account_id")
-            if token_account_id and token_account_id != account_id:
-                raise RuntimeError(f"刷新后的 token 账号不匹配: {token_account_id}")
-
-            new_refresh = token_payload.get("refresh_token")
-            if not isinstance(new_refresh, str) or not new_refresh:
-                new_refresh = refresh_token
-            account_payload["account_id"] = account_id
-            account_payload["refresh_token"] = new_refresh
-            if isinstance(identity.get("email"), str) and identity.get("email"):
-                account_payload["email"] = identity["email"]
-            account_payload.setdefault("authenticated_at", int(time.time()))
-            accounts[account_id] = account_payload
-
-            auth_bak = self._backup_file(self.paths.auth_store, "cli-home")
-            db_bak = self._backup_file(self.paths.db, "cli-home")
             target.mkdir(parents=True, exist_ok=True)
             os.chmod(target, 0o700)
-            config_src = DEFAULT_CODEX_HOME / "config.toml"
-            env_src = DEFAULT_CODEX_HOME / ".env"
-            copied: list[str] = []
-            if config_src.exists() and not (target / "config.toml").exists():
-                copy2(config_src, target / "config.toml")
-                os.chmod(target / "config.toml", 0o600)
-                copied.append("config.toml")
-            if env_src.exists() and not (target / ".env").exists():
-                copy2(env_src, target / ".env")
-                os.chmod(target / ".env", 0o600)
-                copied.append(".env")
-
-            target_auth_bak = self._backup_file(target_auth, "cli-home")
-            last_refresh = utc_now_iso()
-            auth_json = {
-                "OPENAI_API_KEY": None,
-                "tokens": {
-                    "access_token": token_payload["access_token"],
-                    "refresh_token": new_refresh,
-                    "account_id": account_id,
-                },
-                "last_refresh": last_refresh,
-                "auth_mode": "chatgpt",
-            }
-            if isinstance(token_payload.get("id_token"), str):
-                auth_json["tokens"]["id_token"] = token_payload["id_token"]
-            dump_json(target_auth, auth_json)
-            dump_json(self.paths.auth_store, store)
-
-            updated_providers: list[str] = []
-            with self._connect() as conn:
-                updated_providers = self._sync_codex_provider_tokens(
-                    conn,
-                    account_id,
-                    token_payload,
-                    new_refresh,
-                    last_refresh,
-                )
-                conn.commit()
-
             launcher_dir = DEFAULT_CLI_LAUNCHER_DIR
             launcher_dir.mkdir(parents=True, exist_ok=True)
             os.chmod(launcher_dir, 0o700)
             launcher_name = safe_slug(profile_name or account_payload.get("email") or account_id[:8])
             launcher_path = launcher_dir / f"codex-{launcher_name}.command"
             codex_bin = which("codex") or "codex"
+            base_url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1"
+            config_arg = f'base_url="{base_url}"'
             launcher_path.write_text(
                 "#!/bin/zsh\n"
                 f"export CODEX_HOME={json.dumps(str(target))}\n"
-                f"exec {json.dumps(codex_bin)} \"$@\"\n",
+                'export OPENAI_API_KEY="local-bridge"\n'
+                f"exec {json.dumps(codex_bin)} -c '{config_arg}' \"$@\"\n",
                 encoding="utf-8",
             )
             launcher_path.chmod(0o755)
 
             return {
                 "ok": True,
-                "message": "CLI Home 已创建/同步",
+                "message": "CLI 启动器已创建",
                 "account_id": account_id,
                 "target_dir": str(target),
-                "run_command": f"CODEX_HOME={target} codex",
+                "run_command": f"CODEX_HOME={target} OPENAI_API_KEY=local-bridge codex -c 'base_url=\"{base_url}\"'",
                 "launcher": str(launcher_path),
-                "refresh_sha12": sha12(new_refresh),
-                "copied": copied,
-                "updated_codex_providers": updated_providers,
-                "backups": [auth_bak, db_bak, target_auth_bak],
+                "base_url": base_url,
+                "launcher_only": True,
+                "compatibility": compatibility,
+                "warning": "不再复制或刷新 OpenAI token；旧 auth.json 如存在会在状态页标记为 stale_launcher。",
+                "backups": [],
             }
+
+    def migrate_cli_launcher(self, account_id: str, target_dir: str, profile_name: str) -> dict[str, Any]:
+        target = self._validate_cli_home(target_dir)
+        auth_path = target / "auth.json"
+        backups: list[str | None] = []
+        if auth_path.exists():
+            backup = self._backup_file(auth_path, "migrate-cli-launcher")
+            backups.append(backup)
+            archived = target / f"auth.json.disabled-by-bridgedeck-{now_ts()}"
+            os.replace(auth_path, archived)
+        result = self.create_cli_launcher(account_id, str(target), profile_name)
+        result["message"] = "CLI 启动器已迁移"
+        result["backups"] = [item for item in backups if item]
+        return result
 
 
 def is_loopback_host(host: str) -> bool:
@@ -977,6 +1070,25 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             home["token_account_id"] = mask_id_value(home.get("token_account_id"))
             home["access_account_id"] = mask_id_value(home.get("access_account_id"))
             home["email"] = mask_email_value(home.get("email"))
+    for launcher in redacted.get("cli_launchers", []):
+        if isinstance(launcher, dict):
+            launcher["path"] = redact_path_value(launcher.get("path"))
+            launcher["codex_home"] = redact_path_value(launcher.get("codex_home"))
+            launcher["account_id"] = mask_id_value(launcher.get("account_id"))
+    desktop = redacted.get("codex_desktop")
+    if isinstance(desktop, dict):
+        desktop["config_path"] = redact_path_value(desktop.get("config_path"))
+        desktop["base_url"] = re.sub(r"/accounts/[^/?#]+", "/accounts/<redacted>", str(desktop.get("base_url") or ""))
+    for row in redacted.get("account_matrix", []):
+        if isinstance(row, dict):
+            row["account_id"] = mask_id_value(row.get("account_id"))
+            row["email"] = mask_email_value(row.get("email"))
+            row["label"] = mask_email_value(row.get("label"))
+            for launcher in row.get("cli_launchers", []):
+                if isinstance(launcher, dict):
+                    launcher["path"] = redact_path_value(launcher.get("path"))
+                    launcher["codex_home"] = redact_path_value(launcher.get("codex_home"))
+                    launcher["account_id"] = mask_id_value(launcher.get("account_id"))
     return redacted
 
 
@@ -1128,7 +1240,7 @@ INDEX_HTML = """<!doctype html>
 
         <div class="card guideSection" id="cliHomeCard" data-guide="cliHome">
           <h2>Codex CLI 切换</h2>
-          <div class="sectionHint">Codex CLI 通过不同 <code>CODEX_HOME</code> 启动不同账号；这里生成独立账号目录和启动命令，不改默认 <code>~/.codex</code>。</div>
+          <div class="sectionHint">生成 launcher-only 启动器：只设置 <code>CODEX_HOME</code>、<code>OPENAI_API_KEY</code> 和账号路由，不复制 OpenAI token，不改默认 <code>~/.codex</code>。</div>
           <div class="row">
             <label>账号</label>
             <select id="cliAccount"></select>
@@ -1136,9 +1248,10 @@ INDEX_HTML = """<!doctype html>
             <input id="cliHome" placeholder="~/.codex-cli-pro20x" />
             <label>启动器名称</label>
             <input id="cliProfileName" placeholder="pro20x" />
-            <button class="primary" onclick="createCliHome()">创建/同步并生成启动命令</button>
+            <button class="primary" onclick="createCliHome()">生成启动器</button>
+            <button onclick="migrateCliHome()">迁移旧 CLI 目录</button>
           </div>
-          <div class="muted">切换 CLI 账号 = 使用对应启动命令打开新的 Codex CLI。</div>
+          <div class="muted">切换 CLI 账号 = 使用对应启动脚本打开新的 Codex CLI，可多个账号同时运行。</div>
           <div class="paths" id="cliCommand"></div>
           <div class="muted" style="margin-top:10px;">可用账号：点“选用”自动填入推荐目录。</div>
           <div class="tableWrap">
@@ -1188,7 +1301,18 @@ INDEX_HTML = """<!doctype html>
         <details class="card guideSection" id="statusCard" data-guide="status" open>
           <summary>账号状态检查</summary>
           <div class="detailsBody">
-          <div class="sectionHint">用于确认 Codex Provider、CLI Home 是否绑定到正确账号。红色 mismatch 表示可能串号。</div>
+          <div class="sectionHint">自动检测 Claude Code、Codex CLI、Codex Desktop 当前状态。BridgeDeck 只检测 Desktop，不接管默认配置。</div>
+          <div class="tableWrap">
+            <table id="accountMatrixTable">
+              <thead>
+                <tr>
+                  <th class="nameCol">账号</th><th class="smallCol">Claude</th><th class="smallCol">CLI</th><th class="smallCol">Desktop</th><th class="smallCol">状态</th><th class="urlCol">建议</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <br />
           <div class="tableWrap">
             <table id="codexProvidersTable">
               <thead>
@@ -1206,7 +1330,7 @@ INDEX_HTML = """<!doctype html>
             <table id="cliHomesTable">
               <thead>
                 <tr>
-                  <th class="urlCol">CLI 目录</th><th class="urlCol">切换命令</th><th class="accountCol">账号</th><th class="urlCol">email</th><th class="smallCol">套餐</th><th class="urlCol">更新时间</th>
+                  <th class="urlCol">CLI 目录</th><th class="urlCol">切换命令</th><th class="accountCol">账号</th><th class="urlCol">email</th><th class="smallCol">状态</th><th class="urlCol">更新时间</th>
                 </tr>
               </thead>
               <tbody></tbody>
@@ -1248,8 +1372,8 @@ INDEX_HTML = """<!doctype html>
         steps: [
           '在可用账号表点“选用”。',
           '保存目录保持 ~/.codex-cli-xxx。',
-          '点击“创建/同步并生成启动命令”。',
-          '用页面输出的 CODEX_HOME=... codex 启动该账号。',
+          '点击“生成启动器”。',
+          '用页面输出的 launcher 启动该账号。',
           '以后也可双击生成的 .command 启动器。'
         ]
       },
@@ -1268,11 +1392,11 @@ INDEX_HTML = """<!doctype html>
         title: '状态检查',
         target: '右侧板块：账号状态检查',
         steps: [
-          'Codex Provider 表看是否 mismatch。',
-          'mismatch 表示显示账号和实际 token 不一致。',
-          'CLI 目录表看当前有哪些 CODEX_HOME。',
-          '~/.codex 是默认 Codex 账号目录。',
-          '~/.codex-cli-* 是独立 CLI 账号目录。'
+          '账号矩阵看 Claude、CLI、Desktop 三端状态。',
+          'stale_launcher 表示旧 CLI 目录里还有 token。',
+          'Codex Provider mismatch 表示绑定账号和实际 token 不一致。',
+          '~/.codex 只检测，不由 BridgeDeck 接管。',
+          '~/.codex-cli-* 用 launcher-only 方式启动。'
         ]
       },
       log: {
@@ -1282,7 +1406,7 @@ INDEX_HTML = """<!doctype html>
           '每次刷新、创建、修复都会写日志。',
           '失败时先看这里的错误文本。',
           'refresh_token 失效时，回 CC Switch 重新登录该账号。',
-          'mismatch 时，回 CLI 独立账号区重新同步对应账号。'
+          'stale_launcher 时，用“迁移旧 CLI 目录”。'
         ]
       }
     };
@@ -1466,6 +1590,37 @@ INDEX_HTML = """<!doctype html>
         body.appendChild(tr);
       });
     }
+    function statusText(value) {
+      const map = {
+        ok: 'ok',
+        near_limit: '接近限额',
+        limit_reached: '额度用完',
+        refresh_token_reused: '需重新授权',
+        unsupported_region: '地区受限',
+        bridge_down: 'bridge 断开',
+        proxy_down: 'CC Switch 断开',
+        stale_launcher: '旧 CLI token'
+      };
+      return map[value] || value || '';
+    }
+    function renderAccountMatrix(data) {
+      const body = document.querySelector('#accountMatrixTable tbody');
+      body.innerHTML = '';
+      (data.account_matrix || []).forEach((row) => {
+        const status = row.account_status || 'ok';
+        const cls = status === 'ok' ? 'ok' : (status === 'stale_launcher' ? 'warnText' : 'bad');
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${esc(maskEmail(row.email || row.label || maskId(row.account_id || '')))}</td>
+          <td>${row.claude_current ? '<span class="ok">当前</span>' : '<span class="muted">备用</span>'}</td>
+          <td>${(row.cli_launchers || []).length ? '<span class="ok">launcher</span>' : '<span class="warnText">未生成</span>'}</td>
+          <td>${esc(statusText(row.codex_desktop || ''))}</td>
+          <td><span class="${cls}">${esc(statusText(status))}</span></td>
+          <td>${esc(row.advice || '')}</td>
+        `;
+        body.appendChild(tr);
+      });
+    }
     function cliRunCommand(home) {
       if (home.run_command) return humanPath(home.run_command);
       const path = humanPath(home.path || '');
@@ -1476,12 +1631,13 @@ INDEX_HTML = """<!doctype html>
       body.innerHTML = '';
       data.cli_homes.forEach((h) => {
         const tr = document.createElement('tr');
+        const stale = (h.risk_flags || []).includes('stale_cli_token_profile');
         tr.innerHTML = `
           <td class="cmd">${esc(humanPath(h.path))}</td>
           <td class="cmd">${esc(cliRunCommand(h))}</td>
           <td>${esc(maskId(h.token_account_id || h.access_account_id || ''))}</td>
           <td>${esc(maskEmail(h.email || ''))}</td>
-          <td>${esc(h.plan || '')}</td>
+          <td>${stale ? '<span class="warnText">stale_launcher</span>' : '<span class="ok">ok</span>'}</td>
           <td>${esc(h.last_refresh || '')}</td>
         `;
         body.appendChild(tr);
@@ -1491,6 +1647,7 @@ INDEX_HTML = """<!doctype html>
       const accountCount = data.accounts.length;
       const providerCount = data.providers.length;
       const mismatchCount = data.codex_providers.filter((p) => p.token_mismatch).length;
+      const staleCount = data.cli_homes.filter((h) => (h.risk_flags || []).includes('stale_cli_token_profile')).length;
       const cliHomeCount = data.cli_homes.length;
       document.getElementById('tileAccounts').textContent = accountCount;
       document.getElementById('tileProviders').textContent = providerCount;
@@ -1503,9 +1660,12 @@ INDEX_HTML = """<!doctype html>
       if (accountCount === 0) {
         state = 'warnState';
         text = '未发现 CC Switch Codex OAuth 账号。先在 CC Switch 登录目标 ChatGPT 账号，再回这里刷新。';
+      } else if (staleCount > 0) {
+        state = 'warnState';
+        text = `发现 ${staleCount} 个旧 CLI tokenful profile。建议迁移为 launcher-only，避免 refresh_token 重复使用。`;
       } else if (mismatchCount > 0) {
         state = 'badState';
-        text = `发现 ${mismatchCount} 个 Codex Provider 账号不匹配。打开“账号状态检查”，重新同步对应 CLI 账号。`;
+        text = `发现 ${mismatchCount} 个 Codex Provider 账号不匹配。回 CC Switch 重新授权对应账号。`;
       } else if (providerCount === 0) {
         state = 'warnState';
         text = '还没有 Claude Provider。点击“创建 Claude 桥接”，选择账号后创建。';
@@ -1517,6 +1677,7 @@ INDEX_HTML = """<!doctype html>
       const currentCodex = data.codex_providers.filter((p) => p.is_current);
       const mismatches = data.codex_providers.filter((p) => p.token_mismatch);
       const defaultCli = data.cli_homes.find((h) => humanPath(h.path) === '~/.codex');
+      const staleHomes = data.cli_homes.filter((h) => (h.risk_flags || []).includes('stale_cli_token_profile'));
       const advice = [];
       let state = 'okState';
       if (data.accounts.length === 0) {
@@ -1531,15 +1692,19 @@ INDEX_HTML = """<!doctype html>
       }
       if (mismatches.length > 0) {
         state = 'badState';
-        advice.push(`发现 ${mismatches.length} 个账号不一致：重新同步对应 CLI 账号，或回 CC Switch 重新登录。`);
+        advice.push(`发现 ${mismatches.length} 个账号不一致：回 CC Switch 重新授权对应账号。`);
       } else {
         advice.push('绑定账号与实际 token 账号一致。');
       }
+      if (staleHomes.length > 0) {
+        state = state === 'badState' ? state : 'warnState';
+        advice.push(`发现 ${staleHomes.length} 个旧 CLI tokenful profile：建议迁移为 launcher-only。`);
+      }
       if (defaultCli) {
-        advice.push(`默认 Codex CLI 账号：${defaultCli.plan || '未知套餐'}，${maskEmail(defaultCli.email || '') || '无邮箱信息'}。`);
+        advice.push(`默认 Codex Desktop/CLI：只检测，不由 BridgeDeck 接管，${maskEmail(defaultCli.email || '') || '无邮箱信息'}。`);
       } else {
         state = state === 'badState' ? state : 'warnState';
-        advice.push('未检测到默认 ~/.codex/auth.json：Codex CLI 可能还没登录。');
+        advice.push('未检测到默认 ~/.codex/auth.json：Codex Desktop/默认 CLI 可能还没登录。');
       }
       const box = document.getElementById('diagnosis');
       box.className = `recommend ${state}`;
@@ -1553,6 +1718,7 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('paths').textContent = `db: ${humanPath(data.paths.db)}\\nsettings: ${humanPath(data.paths.settings)}\\nauth_store: ${humanPath(data.paths.auth_store)}`;
       renderHealth(data);
       renderAccounts(data.accounts);
+      renderAccountMatrix(data);
       renderProviders(data);
       renderCodexProviders(data);
       renderCliHomes(data);
@@ -1576,7 +1742,17 @@ INDEX_HTML = """<!doctype html>
       const targetDir = document.getElementById('cliHome').value.trim();
       const profileName = document.getElementById('cliProfileName').value.trim();
       if (!accountId || !targetDir) return log('请选择账号并填写 CLI Home');
-      const res = await api('/api/create-cli-home', 'POST', { account_id: accountId, target_dir: targetDir, profile_name: profileName });
+      const res = await api('/api/create-cli-launcher', 'POST', { account_id: accountId, target_dir: targetDir, profile_name: profileName });
+      document.getElementById('cliCommand').textContent = `启动命令: ${humanPath(res.run_command)}\\n启动脚本: ${humanPath(res.launcher)}`;
+      log(`${res.message}: ${res.target_dir}`);
+      await refreshData();
+    }
+    async function migrateCliHome() {
+      const accountId = document.getElementById('cliAccount').value;
+      const targetDir = document.getElementById('cliHome').value.trim();
+      const profileName = document.getElementById('cliProfileName').value.trim();
+      if (!accountId || !targetDir) return log('请选择账号并填写 CLI Home');
+      const res = await api('/api/migrate-cli-launcher', 'POST', { account_id: accountId, target_dir: targetDir, profile_name: profileName });
       document.getElementById('cliCommand').textContent = `启动命令: ${humanPath(res.run_command)}\\n启动脚本: ${humanPath(res.launcher)}`;
       log(`${res.message}: ${res.target_dir}`);
       await refreshData();
@@ -1676,6 +1852,21 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
+            if parsed.path == "/api/health":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    payload = manager.health()
+                    if not allow_sensitive:
+                        payload = redact_snapshot(payload)
+                    json_response(self, 200, payload)
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
             json_response(self, 404, {"ok": False, "error": "Not Found"})
 
         def do_POST(self) -> None:
@@ -1711,7 +1902,7 @@ def build_handler(
                 payload = {}
 
             try:
-                if self.path == "/api/set-current":
+                if self.path in {"/api/set-current", "/api/switch-claude"}:
                     provider_id = str(payload.get("provider_id") or "")
                     result = manager.set_current_provider(provider_id)
                     json_response(self, 200, result)
@@ -1732,11 +1923,21 @@ def build_handler(
                     result = manager.repair_plus_pro()
                     json_response(self, 200, result)
                     return
-                if self.path == "/api/create-cli-home":
+                if self.path in {"/api/create-cli-home", "/api/create-cli-launcher"}:
                     account_id = str(payload.get("account_id") or "")
                     target_dir = str(payload.get("target_dir") or "")
                     profile_name = str(payload.get("profile_name") or "")
-                    result = manager.create_or_sync_cli_home(account_id, target_dir, profile_name)
+                    if self.path == "/api/create-cli-home":
+                        result = manager.create_or_sync_cli_home(account_id, target_dir, profile_name)
+                    else:
+                        result = manager.create_cli_launcher(account_id, target_dir, profile_name)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/migrate-cli-launcher":
+                    account_id = str(payload.get("account_id") or "")
+                    target_dir = str(payload.get("target_dir") or "")
+                    profile_name = str(payload.get("profile_name") or "")
+                    result = manager.migrate_cli_launcher(account_id, target_dir, profile_name)
                     json_response(self, 200, result)
                     return
                 json_response(self, 404, {"ok": False, "error": "Not Found"})

@@ -30,8 +30,10 @@
 - JSON 写入已改为原子写。
 - Backups go to `~/.cc-switch/bridgedeck-backups/`.
 - 备份统一写入 `~/.cc-switch/bridgedeck-backups/`。
-- Isolated CLI profiles are restricted to `~/.codex-cli-*`.
-- 独立 CLI 配置目录已限制为 `~/.codex-cli-*`。
+- Codex CLI launchers are launcher-only and do not copy OAuth tokens.
+- Codex CLI 启动器已改为 launcher-only，不复制 OAuth token。
+- Old tokenful `~/.codex-cli-*` profiles are detected and can be migrated.
+- 旧 tokenful `~/.codex-cli-*` 配置可被检测并迁移。
 
 ## Remaining Before Public Release / 公开发布前建议补充
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import http.client
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -9,6 +10,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import sys
 
@@ -68,8 +70,18 @@ class FakeManager:
                     "token_account_id": "01234567-89ab-cdef-0123-456789abcdef",
                     "access_account_id": "01234567-89ab-cdef-0123-456789abcdef",
                     "email": "person@example.com",
+                    "risk_flags": [],
                 }
             ],
+            "cli_launchers": [],
+            "codex_desktop": {
+                "detected": True,
+                "config_path": f"{home}/.codex/config.toml",
+                "base_url": "http://127.0.0.1:15721/v1",
+                "managed_by": "cc_switch",
+                "risk_flags": [],
+            },
+            "account_matrix": [],
             "current_provider_from_settings": "",
         }
 
@@ -88,6 +100,15 @@ class FakeManager:
 
     def create_or_sync_cli_home(self, account_id: str, target_dir: str, profile_name: str) -> dict[str, Any]:
         return {"ok": True}
+
+    def create_cli_launcher(self, account_id: str, target_dir: str, profile_name: str) -> dict[str, Any]:
+        return {"ok": True}
+
+    def migrate_cli_launcher(self, account_id: str, target_dir: str, profile_name: str) -> dict[str, Any]:
+        return {"ok": True}
+
+    def health(self) -> dict[str, Any]:
+        return {"ok": True, "status": "ok", "risk_flags": []}
 
 
 class ServerCase(unittest.TestCase):
@@ -272,6 +293,144 @@ class ServerCase(unittest.TestCase):
 
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "Invalid Host header")
+
+    def test_health_requires_csrf_token(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(server, "/api/health")
+
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "Invalid CSRF token")
+
+
+class LauncherCase(unittest.TestCase):
+    def make_manager(self, root: Path) -> bridgedeck.BridgeManager:
+        auth_store = root / ".cc-switch" / "codex_oauth_auth.json"
+        auth_store.parent.mkdir(parents=True, exist_ok=True)
+        auth_store.write_text(
+            json.dumps(
+                {
+                    "accounts": {
+                        "acct-1": {
+                            "email": "person@example.com",
+                            "refresh_token": "secret-refresh-token",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return bridgedeck.BridgeManager(
+            bridgedeck.ManagerPaths(
+                db=root / ".cc-switch" / "cc-switch.db",
+                settings=root / ".cc-switch" / "settings.json",
+                auth_store=auth_store,
+            )
+        )
+
+    def test_create_cli_launcher_does_not_refresh_or_write_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            target = root / ".codex-cli-person"
+            launcher_dir = root / ".cc-switch" / "codex-cli-launchers"
+            with (
+                mock.patch.object(bridgedeck.Path, "home", return_value=root),
+                mock.patch.object(bridgedeck, "DEFAULT_CLI_LAUNCHER_DIR", launcher_dir),
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", root / ".codex"),
+            ):
+                result = manager.create_cli_launcher("acct-1", str(target), "person")
+
+            self.assertTrue(result["launcher_only"])
+            self.assertFalse(hasattr(manager, "_refresh_codex_token"))
+            self.assertFalse((target / "auth.json").exists())
+            launcher = Path(result["launcher"])
+            body = launcher.read_text(encoding="utf-8")
+            self.assertIn('export OPENAI_API_KEY="local-bridge"', body)
+            self.assertIn('base_url="http://127.0.0.1:8876/accounts/acct-1/v1"', body)
+            self.assertNotIn("secret-refresh-token", body)
+
+    def test_create_cli_home_compatibility_wrapper_is_launcher_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            target = root / ".codex-cli-person"
+            launcher_dir = root / ".cc-switch" / "codex-cli-launchers"
+            with (
+                mock.patch.object(bridgedeck.Path, "home", return_value=root),
+                mock.patch.object(bridgedeck, "DEFAULT_CLI_LAUNCHER_DIR", launcher_dir),
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", root / ".codex"),
+            ):
+                result = manager.create_or_sync_cli_home("acct-1", str(target), "person")
+
+            self.assertTrue(result["compatibility"])
+            self.assertFalse((target / "auth.json").exists())
+
+    def test_migrate_cli_launcher_disables_old_tokenful_auth_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            target = root / ".codex-cli-person"
+            target.mkdir()
+            (target / "auth.json").write_text(
+                json.dumps({"tokens": {"access_token": "a", "refresh_token": "r", "id_token": "i"}}),
+                encoding="utf-8",
+            )
+            launcher_dir = root / ".cc-switch" / "codex-cli-launchers"
+            with (
+                mock.patch.object(bridgedeck.Path, "home", return_value=root),
+                mock.patch.object(bridgedeck, "DEFAULT_CLI_LAUNCHER_DIR", launcher_dir),
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", root / ".codex"),
+            ):
+                result = manager.migrate_cli_launcher("acct-1", str(target), "person")
+
+            self.assertEqual(result["message"], "CLI 启动器已迁移")
+            self.assertFalse((target / "auth.json").exists())
+            self.assertTrue(list(target.glob("auth.json.disabled-by-bridgedeck-*")))
+
+    def test_stale_tokenful_cli_home_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            target = root / ".codex-cli-person"
+            target.mkdir()
+            (target / "auth.json").write_text(
+                json.dumps({"tokens": {"access_token": "a", "refresh_token": "r", "id_token": "i"}}),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(bridgedeck.Path, "home", return_value=root),
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", root / ".codex"),
+            ):
+                summary = manager._codex_auth_summary(target)
+
+            self.assertEqual(summary["status"], "stale_launcher")
+            self.assertIn("stale_cli_token_profile", summary["risk_flags"])
+
+    def test_codex_desktop_detection_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            original = 'base_url = "http://127.0.0.1:15721/v1"\n'
+            config.write_text(original, encoding="utf-8")
+            with mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home):
+                status = manager._codex_desktop_status()
+
+            self.assertEqual(status["managed_by"], "cc_switch")
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
+
+    def test_error_classifier(self) -> None:
+        self.assertEqual(
+            bridgedeck.classify_error_text('{"error":"refresh_token_reused"}'),
+            "refresh_token_reused",
+        )
+        self.assertEqual(
+            bridgedeck.classify_error_text("unsupported_country_region_territory"),
+            "unsupported_region",
+        )
 
 
 if __name__ == "__main__":

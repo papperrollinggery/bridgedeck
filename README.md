@@ -1,8 +1,8 @@
 # BridgeDeck / BridgeDeck 本地账号桥接面板
 
-Local web helper for managing CC Switch Codex OAuth bridge providers and isolated Codex CLI accounts.
+Local web helper for managing CC Switch Codex OAuth bridge providers and launcher-only Codex CLI account routes.
 
-本工具是一个本地网页助手，用于管理 CC Switch 的 Codex OAuth 桥接 Provider，以及为 Codex CLI 创建独立账号目录。
+本工具是一个本地网页助手，用于管理 CC Switch 的 Codex OAuth 桥接 Provider，以及为 Codex CLI 生成不复制 token 的账号启动器。
 
 ## What It Does / 功能
 
@@ -10,10 +10,12 @@ Local web helper for managing CC Switch Codex OAuth bridge providers and isolate
 - 创建或修复走本地 Codex bridge 的 Claude Provider。
 - Keep Claude provider account binding and quota identity intact.
 - 保留 Claude Provider 的账号绑定和额度身份。
-- Create isolated Codex CLI profiles under `~/.codex-cli-*` and show the exact `CODEX_HOME=... codex` switch command.
-- 在 `~/.codex-cli-*` 下创建独立 Codex CLI 配置，并显示精确的 `CODEX_HOME=... codex` 切换命令。
-- Generate `.command` launchers for isolated CLI profiles.
-- 为独立 CLI 账号生成 `.command` 启动器。
+- Generate launcher-only Codex CLI routes under `~/.cc-switch/codex-cli-launchers/`.
+- 在 `~/.cc-switch/codex-cli-launchers/` 下生成 launcher-only Codex CLI 账号路由。
+- Detect stale tokenful `~/.codex-cli-*` profiles without copying or refreshing OpenAI tokens.
+- 检测旧的 tokenful `~/.codex-cli-*` 配置，不复制、不刷新 OpenAI token。
+- Detect Codex Desktop config state without taking over `~/.codex/config.toml`.
+- 只检测 Codex Desktop 配置状态，不接管 `~/.codex/config.toml`。
 - Detect Codex provider account/token mismatch.
 - 检查 Codex Provider 的显示账号和实际 token 账号是否不一致。
 - Hide tokens by default; reveal only on explicit user action.
@@ -97,16 +99,16 @@ python3 bridgedeck.py --host 127.0.0.1 --port 8899
 
 1. In `Codex CLI 切换`, click `选用` for the account.
 2. Keep the generated directory such as `~/.codex-cli-pro`.
-3. Click `创建/同步并生成启动命令`.
+3. Click `生成启动器`.
 4. Start CLI using the displayed command:
 
 1. 在 `Codex CLI 切换` 中，对目标账号点击 `选用`。
 2. 保持生成的目录，例如 `~/.codex-cli-pro`。
-3. 点击 `创建/同步并生成启动命令`。
+3. 点击 `生成启动器`。
 4. 使用页面输出命令启动 CLI：
 
 ```bash
-CODEX_HOME=/Users/you/.codex-cli-pro codex
+CODEX_HOME=/Users/you/.codex-cli-pro OPENAI_API_KEY=local-bridge codex -c 'base_url="http://127.0.0.1:8876/accounts/<account_id>/v1"'
 ```
 
 or use the generated launcher:
@@ -129,9 +131,13 @@ The tool reads/writes these local files:
 - `~/.codex-cli-*`
 - `~/.cc-switch/codex-cli-launchers/*`
 
-It reads but does not overwrite the default Codex config unless explicitly creating an isolated CLI profile:
+Codex CLI launchers no longer write `auth.json` or copy OAuth tokens. Migration may disable an old `~/.codex-cli-*/auth.json` after backing it up.
 
-除非用户明确创建独立 CLI 账号，否则只读取、不覆盖默认 Codex 配置：
+Codex CLI 启动器不再写 `auth.json`，也不复制 OAuth token。迁移旧配置时会先备份，再禁用旧的 `~/.codex-cli-*/auth.json`。
+
+It reads but does not overwrite the default Codex config:
+
+只读取、不覆盖默认 Codex 配置：
 
 - `~/.codex/config.toml`
 - `~/.codex/.env`
