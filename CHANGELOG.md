@@ -7,6 +7,7 @@
 - Added an actual Claude Code provider status line so CC Switch changes are visible without changing the selected account dropdown.
 - Made the macOS command and app launcher idempotent: if BridgeDeck is already running, they only open the page.
 - Fixed Local Codex Bridge provider metadata so CC Switch forwards Claude requests to the local bridge while keeping Codex account quota visible.
+- Added a BridgeDeck OpenAI quota board and optional auto-switch mode with Plus -> Pro -> Pro 20x priority. Auto-switch only runs while the current target is Local Codex Bridge, so third-party CC Switch providers are left alone.
 
 ## 0.2.4
 

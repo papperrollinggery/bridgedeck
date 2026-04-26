@@ -113,6 +113,26 @@ class FakeManager:
     def health(self) -> dict[str, Any]:
         return {"ok": True, "status": "ok", "risk_flags": []}
 
+    def quotas(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "quotas": [
+                {
+                    "account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "email": "person@example.com",
+                    "quota_status": "ok",
+                    "plan_type": "plus",
+                    "windows": [{"name": "5小时", "used_percent": 0}],
+                }
+            ],
+        }
+
+    def update_auto_switch_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True, "auto_switch": payload}
+
+    def run_auto_switch(self, *, force: bool = False) -> dict[str, Any]:
+        return {"ok": True, "enabled": True, "actions": [], "force": force}
+
 
 class ServerCase(unittest.TestCase):
     def start_server(self, *, allow_sensitive: bool = True, allow_remote_access: bool = False):
@@ -208,8 +228,26 @@ class ServerCase(unittest.TestCase):
         self.assertIn("单独 Codex CLI", html)
         self.assertIn("全局 Codex CLI", html)
         self.assertIn("当前实际", html)
+        self.assertIn('id="autoSwitchEnabled"', html)
+        self.assertIn("OpenAI 自动切换", html)
         self.assertNotIn('id="simpleAccount"', html)
         self.assertNotIn("今天用哪个账号", html)
+
+    def test_quota_summary_marks_limit_states(self) -> None:
+        payload = {
+            "plan_type": "plus",
+            "rate_limit": {
+                "limit_reached": False,
+                "primary_window": {"used_percent": 0, "limit_window_seconds": 18000},
+                "secondary_window": {"used_percent": 84, "limit_window_seconds": 604800},
+            },
+        }
+
+        result = bridgedeck.summarize_quota_payload(payload)
+
+        self.assertEqual(result["quota_status"], "near_limit")
+        self.assertEqual(result["windows"][0]["name"], "5小时")
+        self.assertEqual(result["windows"][1]["name"], "7天")
 
     def test_remote_mode_blocks_secret_reveal(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
@@ -388,6 +426,42 @@ class LauncherCase(unittest.TestCase):
             self.assertEqual(meta["codexOauthTransport"], "local_bridge")
             self.assertEqual(meta["authBinding"]["authProvider"], "codex_oauth")
             self.assertNotIn("providerType", meta)
+
+    def test_auto_switch_does_not_touch_third_party_current_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+            snapshot = {
+                "providers": [
+                    {
+                        "id": "minimax",
+                        "name": "MiniMax",
+                        "is_current": True,
+                        "account_id": "",
+                        "base_url": "https://platform.minimaxi.com",
+                    },
+                    {
+                        "id": "plus",
+                        "name": "Local Codex Bridge - Plus",
+                        "is_current": False,
+                        "account_id": "acct-plus",
+                        "base_url": "http://127.0.0.1:8876/accounts/acct-plus",
+                    },
+                ],
+                "current_provider_from_settings": "minimax",
+                "codex_desktop": {"managed_by": "custom"},
+            }
+            with mock.patch.object(manager, "_load_auto_switch_config", return_value={"enabled": True, "claude": True, "default_codex": True, "priority": [], "last_result": {}}), \
+                mock.patch.object(manager, "snapshot", return_value=snapshot), \
+                mock.patch.object(manager, "quotas", return_value={"ok": True, "quotas": [{"account_id": "acct-plus", "quota_status": "ok", "limit_reached": False}]}), \
+                mock.patch.object(manager, "set_current_provider") as set_current, \
+                mock.patch.object(manager, "set_default_codex_account") as set_codex, \
+                mock.patch.object(manager, "_save_auto_switch_config"):
+                result = manager.run_auto_switch()
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(set_current.called)
+            self.assertFalse(set_codex.called)
+            self.assertEqual(result["actions"][0]["reason"], "current_provider_is_not_local_bridge")
 
     def test_create_cli_home_compatibility_wrapper_is_launcher_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

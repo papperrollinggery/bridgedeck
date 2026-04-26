@@ -16,6 +16,8 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +31,7 @@ DEFAULT_SETTINGS_PATH = Path.home() / ".cc-switch" / "settings.json"
 DEFAULT_AUTH_PATH = Path.home() / ".cc-switch" / "codex_oauth_auth.json"
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
+DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
 APP_VERSION = "0.2.5"
@@ -148,7 +151,7 @@ class ManagerPaths:
 class BridgeManager:
     def __init__(self, paths: ManagerPaths) -> None:
         self.paths = paths
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def _backup_file(self, path: Path, label: str) -> str | None:
         if not path.exists():
@@ -191,6 +194,30 @@ class BridgeManager:
         settings = self._load_settings()
         settings["currentProviderClaude"] = provider_id
         self._save_settings(settings)
+
+    def _load_auto_switch_config(self) -> dict[str, Any]:
+        raw = load_json(DEFAULT_AUTO_SWITCH_PATH, {})
+        config = raw if isinstance(raw, dict) else {}
+        return {
+            "enabled": bool(config.get("enabled", False)),
+            "claude": bool(config.get("claude", True)),
+            "default_codex": bool(config.get("default_codex", False)),
+            "priority": ["plus", "pro", "pro20x"],
+            "last_result": config.get("last_result") if isinstance(config.get("last_result"), dict) else {},
+        }
+
+    def _save_auto_switch_config(self, config: dict[str, Any]) -> None:
+        current = self._load_auto_switch_config()
+        current.update(
+            {
+                "enabled": bool(config.get("enabled", current["enabled"])),
+                "claude": bool(config.get("claude", current["claude"])),
+                "default_codex": bool(config.get("default_codex", current["default_codex"])),
+                "priority": ["plus", "pro", "pro20x"],
+                "last_result": config.get("last_result", current.get("last_result", {})),
+            }
+        )
+        dump_json(DEFAULT_AUTO_SWITCH_PATH, current)
 
     def _load_accounts(self) -> list[dict[str, Any]]:
         store = load_json(self.paths.auth_store, {})
@@ -478,6 +505,151 @@ class BridgeManager:
             "codex_desktop": snapshot.get("codex_desktop", {}),
         }
 
+    def _fetch_quota(self, account: dict[str, Any]) -> dict[str, Any]:
+        account_id = str(account.get("account_id") or "")
+        result: dict[str, Any] = {
+            "account_id": account_id,
+            "email": account.get("email") or "",
+            "label": account.get("label") or "",
+            "quota_status": "unknown",
+            "plan_type": "",
+            "allowed": False,
+            "limit_reached": False,
+            "windows": [],
+            "error": "",
+        }
+        if not account_id:
+            result["quota_status"] = "network_error"
+            result["error"] = "missing account id"
+            return result
+        if not tcp_open("127.0.0.1", 8876):
+            result["quota_status"] = "bridge_down"
+            result["error"] = "local bridge is not running"
+            return result
+
+        url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{urllib.parse.quote(account_id, safe='')}/quota"
+        try:
+            with urllib.request.urlopen(url, timeout=18) as response:
+                raw = response.read(512 * 1024)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(2048).decode("utf-8", "replace")
+            result["quota_status"] = classify_error_text(detail or str(exc))
+            result["error"] = detail or str(exc)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            result["quota_status"] = classify_error_text(str(exc))
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            return result
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("quota response is not an object")
+        except Exception as exc:  # noqa: BLE001
+            result["quota_status"] = "network_error"
+            result["error"] = f"parse error: {exc}"
+            return result
+
+        result.update(summarize_quota_payload(payload))
+        if isinstance(payload.get("email"), str) and payload.get("email"):
+            result["email"] = payload["email"]
+        return result
+
+    def quotas(self) -> dict[str, Any]:
+        accounts = self._load_accounts()
+        return {"ok": True, "quotas": [self._fetch_quota(account) for account in accounts]}
+
+    def update_auto_switch_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._save_auto_switch_config(payload)
+        return {"ok": True, "auto_switch": self._load_auto_switch_config()}
+
+    def _priority_rank(self, account_id: str, providers: list[dict[str, Any]]) -> tuple[int, str]:
+        names = " ".join(str(p.get("name") or "").lower() for p in providers if p.get("account_id") == account_id)
+        if "plus" in names:
+            return (0, names)
+        if "20x" in names:
+            return (2, names)
+        if "pro" in names:
+            return (1, names)
+        return (9, account_id)
+
+    def _is_bridge_provider(self, provider: dict[str, Any] | None) -> bool:
+        if not provider:
+            return False
+        base_url = str(provider.get("base_url") or "")
+        return LOCAL_BRIDGE_BASE_URL in base_url and "/accounts/" in base_url
+
+    def _current_claude_provider(self, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+        providers = snapshot.get("providers") if isinstance(snapshot.get("providers"), list) else []
+        current_id = snapshot.get("current_provider_from_settings")
+        for provider in providers:
+            if isinstance(provider, dict) and current_id and provider.get("id") == current_id:
+                return provider
+        for provider in providers:
+            if isinstance(provider, dict) and provider.get("is_current"):
+                return provider
+        return None
+
+    def _best_quota_account(self, snapshot: dict[str, Any], quotas: list[dict[str, Any]]) -> dict[str, Any] | None:
+        providers = [p for p in snapshot.get("providers", []) if isinstance(p, dict)]
+        usable = [
+            quota for quota in quotas
+            if quota.get("quota_status") in {"ok", "near_limit"} and not quota.get("limit_reached")
+        ]
+        if not usable:
+            return None
+        usable.sort(key=lambda q: self._priority_rank(str(q.get("account_id") or ""), providers))
+        return usable[0]
+
+    def run_auto_switch(self, *, force: bool = False) -> dict[str, Any]:
+        config = self._load_auto_switch_config()
+        if not force and not config["enabled"]:
+            return {"ok": True, "enabled": False, "message": "自动切换未开启", "actions": []}
+
+        snapshot = self.snapshot(include_secrets=False)
+        quotas = self.quotas().get("quotas", [])
+        best = self._best_quota_account(snapshot, quotas if isinstance(quotas, list) else [])
+        actions: list[dict[str, Any]] = []
+        if not best:
+            result = {"ok": False, "enabled": config["enabled"], "message": "没有可用 OpenAI 账号", "actions": []}
+            self._save_auto_switch_config({**config, "last_result": result})
+            return result
+
+        best_account_id = str(best.get("account_id") or "")
+        providers = [p for p in snapshot.get("providers", []) if isinstance(p, dict)]
+        target_provider = next((p for p in providers if p.get("account_id") == best_account_id and self._is_bridge_provider(p)), None)
+        current_provider = self._current_claude_provider(snapshot)
+        if config["claude"]:
+            if self._is_bridge_provider(current_provider):
+                if target_provider and current_provider and target_provider.get("id") != current_provider.get("id"):
+                    changed = self.set_current_provider(str(target_provider["id"]))
+                    actions.append({"target": "claude", "changed": True, "provider_id": target_provider["id"], "result": changed})
+                else:
+                    actions.append({"target": "claude", "changed": False, "reason": "already_best_or_missing_provider"})
+            else:
+                actions.append({"target": "claude", "changed": False, "reason": "current_provider_is_not_local_bridge"})
+
+        desktop = snapshot.get("codex_desktop") if isinstance(snapshot.get("codex_desktop"), dict) else {}
+        if config["default_codex"]:
+            if desktop.get("managed_by") == "bridgedeck_or_local_bridge":
+                if desktop.get("account_id") != best_account_id:
+                    changed = self.set_default_codex_account(best_account_id)
+                    actions.append({"target": "default_codex", "changed": True, "result": changed})
+                else:
+                    actions.append({"target": "default_codex", "changed": False, "reason": "already_best"})
+            else:
+                actions.append({"target": "default_codex", "changed": False, "reason": "default_codex_is_not_local_bridge"})
+
+        result = {
+            "ok": True,
+            "enabled": config["enabled"],
+            "selected_account_id": best_account_id,
+            "selected_quota_status": best.get("quota_status"),
+            "actions": actions,
+        }
+        self._save_auto_switch_config({**config, "last_result": result})
+        return result
+
     def _default_provider_name(self, account: dict[str, Any], existing: set[str]) -> str:
         email = account.get("email") or ""
         prefix = "Local Codex Bridge"
@@ -575,6 +747,7 @@ class BridgeManager:
                 "db": str(self.paths.db),
                 "settings": str(self.paths.settings),
                 "auth_store": str(self.paths.auth_store),
+                "auto_switch": str(DEFAULT_AUTO_SWITCH_PATH),
             },
             "exists": {
                 "db": self.paths.db.exists(),
@@ -589,6 +762,7 @@ class BridgeManager:
             "codex_desktop": self._codex_desktop_status(),
             "account_matrix": [],
             "current_provider_from_settings": self._current_provider_from_settings(),
+            "auto_switch": self._load_auto_switch_config(),
         }
 
         if not self.paths.db.exists():
@@ -1079,6 +1253,62 @@ def mask_id_value(value: Any) -> Any:
     return f"{value[:8]}...{value[-4:]}"
 
 
+def quota_window_name(seconds: Any) -> str:
+    try:
+        value = int(seconds)
+    except (TypeError, ValueError):
+        return "unknown"
+    if value == 18_000:
+        return "5小时"
+    if value == 604_800:
+        return "7天"
+    if value % 86_400 == 0:
+        return f"{value // 86_400}天"
+    if value % 3_600 == 0:
+        return f"{value // 3_600}小时"
+    return f"{value}s"
+
+
+def summarize_quota_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    rate_limit = payload.get("rate_limit") if isinstance(payload.get("rate_limit"), dict) else {}
+    windows: list[dict[str, Any]] = []
+    max_used = 0.0
+    for key in ("primary_window", "secondary_window"):
+        window = rate_limit.get(key) if isinstance(rate_limit.get(key), dict) else {}
+        used_raw = window.get("used_percent")
+        try:
+            used = float(used_raw)
+        except (TypeError, ValueError):
+            continue
+        max_used = max(max_used, used)
+        window_seconds = window.get("limit_window_seconds")
+        windows.append(
+            {
+                "name": quota_window_name(window_seconds),
+                "used_percent": int(used) if used.is_integer() else round(used, 1),
+                "reset_after_seconds": window.get("reset_after_seconds"),
+                "reset_at": window.get("reset_at"),
+            }
+        )
+
+    limit_reached = bool(rate_limit.get("limit_reached") or payload.get("rate_limit_reached_type"))
+    if limit_reached or max_used >= 100:
+        status = "limit_reached"
+    elif max_used >= 80:
+        status = "near_limit"
+    else:
+        status = "ok"
+
+    return {
+        "plan_type": payload.get("plan_type") if isinstance(payload.get("plan_type"), str) else "",
+        "allowed": bool(rate_limit.get("allowed", True)),
+        "limit_reached": limit_reached,
+        "quota_status": status,
+        "windows": windows,
+        "queried_at": int(time.time()),
+    }
+
+
 def redact_path_value(value: Any) -> Any:
     if not isinstance(value, str):
         return value
@@ -1138,6 +1368,10 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
                     launcher["path"] = redact_path_value(launcher.get("path"))
                     launcher["codex_home"] = redact_path_value(launcher.get("codex_home"))
                     launcher["account_id"] = mask_id_value(launcher.get("account_id"))
+    for quota in redacted.get("quotas", []):
+        if isinstance(quota, dict):
+            quota["account_id"] = mask_id_value(quota.get("account_id"))
+            quota["email"] = mask_email_value(quota.get("email"))
     return redacted
 
 
@@ -1246,6 +1480,14 @@ INDEX_HTML = """<!doctype html>
     .toolCard button { min-height:42px; font-weight:700; }
     .simpleResult { margin-top:12px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#0f1320; min-height:42px; color:var(--muted); font-size:13px; line-height:1.5; }
     .simpleResult strong { color:var(--text); }
+    .quotaBar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:10px 0; }
+    .quotaPill { border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:#101827; min-width:180px; }
+    .quotaPill.current { border-color:#2f6fb2; background:#102033; }
+    .quotaTitle { font-weight:800; font-size:13px; margin-bottom:4px; }
+    .quotaWindows { font-size:12px; color:var(--muted); line-height:1.5; }
+    .toggleLine { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:10px; color:var(--muted); font-size:12px; }
+    .toggleLine label { display:flex; gap:6px; align-items:center; }
+    .toggleLine input { min-width:0; }
     .advancedIntro { color:var(--muted); font-size:12px; margin-bottom:10px; }
     summary { cursor:pointer; font-weight:700; }
     details.card { padding:0; }
@@ -1277,6 +1519,19 @@ INDEX_HTML = """<!doctype html>
         <div class="tile"><div class="tileLabel">CLI 配置</div><div id="tileCliHomes" class="tileValue">-</div></div>
       </div>
       <div id="recommendation" class="recommend">加载中...</div>
+      <div class="recommend">
+        <b>OpenAI 额度与自动切换</b>
+        <div class="sectionHint">只接管 Local Codex Bridge。你切到 MiniMax、Nvidia、SSSAiCode 等第三方供应商时不会自动改回 OpenAI。</div>
+        <div id="quotaBoard" class="quotaBar">额度加载中...</div>
+        <div class="toggleLine">
+          <label><input type="checkbox" id="autoSwitchEnabled"> OpenAI 自动切换</label>
+          <label><input type="checkbox" id="autoSwitchClaude" checked> 自动切 Claude Code</label>
+          <label><input type="checkbox" id="autoSwitchDefaultCodex"> 自动切全局 Codex CLI</label>
+          <button class="miniBtn" data-action="save-auto-switch">保存</button>
+          <button class="miniBtn" data-action="run-auto-switch">立即检查并切换</button>
+        </div>
+        <div id="autoSwitchStatus" class="muted mt10">未运行</div>
+      </div>
       <details>
         <summary>技术信息</summary>
         <div class="paths" id="paths"></div>
@@ -1615,6 +1870,82 @@ INDEX_HTML = """<!doctype html>
       const mode = isBridgeClaudeProvider(provider) ? 'BridgeDeck 同步' : '外部供应商';
       const cls = isBridgeClaudeProvider(provider) ? 'ok' : 'warnText';
       box.innerHTML = `当前实际：<strong>${esc(providerDisplayName(provider))}</strong><br><span class="${cls}">${esc(mode)}</span>`;
+    }
+    function renderAutoSwitchConfig(data) {
+      const config = data.auto_switch || {};
+      document.getElementById('autoSwitchEnabled').checked = Boolean(config.enabled);
+      document.getElementById('autoSwitchClaude').checked = config.claude !== false;
+      document.getElementById('autoSwitchDefaultCodex').checked = Boolean(config.default_codex);
+      const last = config.last_result || {};
+      if (last.message || last.selected_account_id) {
+        document.getElementById('autoSwitchStatus').textContent = last.selected_account_id
+          ? `上次选择：${maskId(last.selected_account_id)}，${last.selected_quota_status || ''}`
+          : `上次结果：${last.message || '无'}`;
+      }
+    }
+    function quotaStatusText(value) {
+      const map = {
+        ok: '可用',
+        near_limit: '接近限额',
+        limit_reached: '已达限',
+        refresh_token_reused: '需重新授权',
+        unsupported_region: '地区受限',
+        bridge_down: 'bridge 断开',
+        network_error: '查询失败'
+      };
+      return map[value] || value || '未知';
+    }
+    function renderQuotaBoard(payload) {
+      const board = document.getElementById('quotaBoard');
+      const quotas = payload.quotas || [];
+      if (!quotas.length) {
+        board.textContent = '没有可显示的 OpenAI 账号额度。';
+        return;
+      }
+      const current = currentClaudeProvider(lastData || {});
+      board.innerHTML = quotas.map((q) => {
+        const status = q.quota_status || 'unknown';
+        const cls = status === 'ok' ? 'ok' : (status === 'near_limit' ? 'warnText' : 'bad');
+        const currentCls = current && current.account_id === q.account_id ? ' current' : '';
+        const windows = (q.windows || []).map((w) => `${esc(w.name)}: <span class="${Number(w.used_percent) >= 100 ? 'bad' : Number(w.used_percent) >= 80 ? 'warnText' : 'ok'}">${esc(w.used_percent)}%</span>`).join('  ');
+        return `<div class="quotaPill${currentCls}">
+          <div class="quotaTitle">${esc(maskEmail(q.email || q.label || maskId(q.account_id || '')))} ${q.plan_type ? `<span class="muted">(${esc(q.plan_type)})</span>` : ''}</div>
+          <div class="quotaWindows"><span class="${cls}">${esc(quotaStatusText(status))}</span>${windows ? '<br>' + windows : ''}</div>
+        </div>`;
+      }).join('');
+    }
+    async function refreshQuotas() {
+      try {
+        const payload = await api('/api/quotas');
+        renderQuotaBoard(payload);
+        return payload;
+      } catch (e) {
+        document.getElementById('quotaBoard').textContent = `额度查询失败: ${e.message}`;
+        return null;
+      }
+    }
+    async function saveAutoSwitch() {
+      const payload = {
+        enabled: document.getElementById('autoSwitchEnabled').checked,
+        claude: document.getElementById('autoSwitchClaude').checked,
+        default_codex: document.getElementById('autoSwitchDefaultCodex').checked
+      };
+      const res = await api('/api/auto-switch-config', 'POST', payload);
+      document.getElementById('autoSwitchStatus').textContent = payload.enabled
+        ? '已开启：只在当前是 Local Codex Bridge 时自动切换。'
+        : '已关闭自动切换。';
+      if (res.auto_switch?.enabled) await runAutoSwitch(false, false);
+      await refreshData();
+    }
+    async function runAutoSwitch(force=true, refresh=true) {
+      const res = await api('/api/auto-switch-run', 'POST', { force });
+      const actions = (res.actions || []).map((a) => `${a.target}:${a.changed ? '已切换' : (a.reason || '未变')}`).join('，');
+      document.getElementById('autoSwitchStatus').textContent = res.selected_account_id
+        ? `当前优先账号：${maskId(res.selected_account_id)}，${quotaStatusText(res.selected_quota_status)}。${actions}`
+        : (res.message || '未切换');
+      log(`自动切换检查: ${document.getElementById('autoSwitchStatus').textContent}`);
+      if (refresh) await refreshData();
+      return res;
     }
     function setSimpleResult(message, level='') {
       const box = document.getElementById('simpleResult');
@@ -1976,6 +2307,11 @@ INDEX_HTML = """<!doctype html>
       renderCliHomes(data);
       renderDiagnosis(data);
       renderActualClaude(data);
+      renderAutoSwitchConfig(data);
+      refreshQuotas();
+      if (data.auto_switch && data.auto_switch.enabled) {
+        runAutoSwitch(false, false).catch((e) => log(`自动切换失败: ${e.message}`));
+      }
       if (data.accounts.length > 0 && !document.getElementById('simpleResult').dataset.touched) {
         setSimpleResult('已准备好。Claude Code、单独 Codex CLI、全局 Codex CLI 可以分别选不同账号。');
       }
@@ -2083,6 +2419,8 @@ INDEX_HTML = """<!doctype html>
           if (action === 'set-current-selected') return setCurrentFromSelected();
           if (action === 'patch-selected') return patchSelected();
           if (action === 'repair-plus-pro') return repairPlusPro();
+          if (action === 'save-auto-switch') return saveAutoSwitch();
+          if (action === 'run-auto-switch') return runAutoSwitch(true, true);
           if (action === 'select-cli-account') return selectCliAccount(button.dataset.accountId || '');
         };
         Promise.resolve(run()).catch((e) => log(`操作失败: ${e.message}`));
@@ -2091,6 +2429,12 @@ INDEX_HTML = """<!doctype html>
     bindActions();
     initGuideObserver();
     refreshData().catch((e) => log(`初始化失败: ${e.message}`));
+    setInterval(() => {
+      if (document.getElementById('autoSwitchEnabled')?.checked) {
+        runAutoSwitch(false, false).catch((e) => log(`自动切换失败: ${e.message}`));
+        refreshQuotas();
+      }
+    }, 60000);
   </script>
 </body>
 </html>
@@ -2180,6 +2524,21 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
+            if parsed.path == "/api/quotas":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    payload = manager.quotas()
+                    if not allow_sensitive:
+                        payload = redact_snapshot(payload)
+                    json_response(self, 200, payload)
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
             json_response(self, 404, {"ok": False, "error": "Not Found"})
 
         def do_POST(self) -> None:
@@ -2256,6 +2615,14 @@ def build_handler(
                     target_dir = str(payload.get("target_dir") or "")
                     profile_name = str(payload.get("profile_name") or "")
                     result = manager.migrate_cli_launcher(account_id, target_dir, profile_name)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/auto-switch-config":
+                    result = manager.update_auto_switch_config(payload)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/auto-switch-run":
+                    result = manager.run_auto_switch(force=bool(payload.get("force", False)))
                     json_response(self, 200, result)
                     return
                 json_response(self, 404, {"ok": False, "error": "Not Found"})
