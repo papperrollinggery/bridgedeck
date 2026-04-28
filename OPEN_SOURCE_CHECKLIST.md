@@ -4,8 +4,10 @@
 
 - README is bilingual.
 - README 已改为中英双语。
-- Source-available non-commercial license is included.
-- 已加入源码可见非商用许可证。
+- PolyForm Noncommercial 1.0.0 license is included.
+- 已加入 PolyForm Noncommercial 1.0.0 非商用许可证。
+- Commercial licensing notes are included.
+- 已加入商业授权说明。
 - Security policy is included.
 - 已加入安全政策。
 - Contribution guide is included.
