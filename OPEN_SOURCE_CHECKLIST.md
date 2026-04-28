@@ -1,11 +1,11 @@
-# Open Source Readiness Checklist / 开源准备清单
+# Public Source Release Checklist / 公开源码发布清单
 
 ## Completed / 已完成
 
 - README is bilingual.
 - README 已改为中英双语。
-- MIT license is included.
-- 已加入 MIT 许可证。
+- Source-available non-commercial license is included.
+- 已加入源码可见非商用许可证。
 - Security policy is included.
 - 已加入安全政策。
 - Contribution guide is included.

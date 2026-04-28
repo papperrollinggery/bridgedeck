@@ -287,7 +287,7 @@ SECURITY.md                    security policy / 安全说明
 CONTRIBUTING.md                contribution guide / 贡献说明
 CHANGELOG.md                   changelog / 变更记录
 OPEN_SOURCE_CHECKLIST.md       release checklist / 开源发布清单
-LICENSE                        MIT license / MIT 许可证
+LICENSE                        source-available non-commercial license / 源码可见非商用许可证
 .github/                       issue and PR templates / issue 和 PR 模板
 ```
 
@@ -317,4 +317,8 @@ Before publishing, make sure the repository does not contain:
 
 ## License / 许可证
 
-MIT
+BridgeDeck is source-available for personal, educational, research, and internal non-commercial use.
+Commercial use requires a separate written commercial license.
+
+BridgeDeck 源码可见，允许个人、教育、研究和内部非商用用途。
+商业使用需要单独取得书面商业授权。
