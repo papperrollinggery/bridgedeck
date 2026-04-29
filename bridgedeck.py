@@ -807,6 +807,69 @@ class BridgeManager:
         except Exception:
             return {}
 
+    def _build_usage_script(self, account_id: str) -> dict[str, Any]:
+        quota_url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/quota"
+        code = f"""({{
+  request: {{
+    url: "{quota_url}",
+    method: "GET",
+    headers: {{}}
+  }},
+  extractor: function(response) {{
+    if (!response || response.error) {{
+      return {{
+        isValid: false,
+        invalidMessage: response && (response.error || response.detail) || "quota query failed"
+      }};
+    }}
+    var rate = response.rate_limit || {{}};
+    var primary = rate.primary_window || {{}};
+    var secondary = rate.secondary_window || {{}};
+    var rows = [
+      {{
+        planName: "five_hour",
+        used: Number(primary.used_percent || 0),
+        total: 100,
+        remaining: Math.max(0, 100 - Number(primary.used_percent || 0)),
+        unit: "%",
+        extra: primary.reset_after_seconds ? String(primary.reset_after_seconds) + "s" : undefined
+      }},
+      {{
+        planName: "weekly_limit",
+        used: Number(secondary.used_percent || 0),
+        total: 100,
+        remaining: Math.max(0, 100 - Number(secondary.used_percent || 0)),
+        unit: "%",
+        extra: secondary.reset_after_seconds ? String(secondary.reset_after_seconds) + "s" : undefined
+      }}
+    ];
+    var extraLimits = Array.isArray(response.additional_rate_limits) ? response.additional_rate_limits : [];
+    extraLimits.forEach(function(item) {{
+      var limit = item && item.rate_limit || {{}};
+      var win = limit.secondary_window || limit.primary_window || {{}};
+      var used = Number(win.used_percent || 0);
+      rows.push({{
+        planName: item.limit_name || item.metered_feature || "extra_limit",
+        used: used,
+        total: 100,
+        remaining: Math.max(0, 100 - used),
+        unit: "%",
+        extra: win.reset_after_seconds ? String(win.reset_after_seconds) + "s" : undefined
+      }});
+    }});
+    return rows;
+  }}
+}})"""
+        return {
+            "enabled": True,
+            "language": "javascript",
+            "code": code,
+            "timeout": 10,
+            "templateType": "custom",
+            "autoQueryInterval": 5,
+            "bridgeDeckManaged": True,
+        }
+
     def _build_provider_payload(
         self,
         account_id: str,
@@ -837,6 +900,7 @@ class BridgeManager:
         m.pop("providerType", None)
         m["apiFormat"] = "openai_responses"
         m["codexOauthTransport"] = "local_bridge"
+        m["usage_script"] = self._build_usage_script(account_id)
         binding = m.get("authBinding")
         if not isinstance(binding, dict):
             binding = {}

@@ -463,6 +463,11 @@ class LauncherCase(unittest.TestCase):
             self.assertEqual(meta["apiFormat"], "openai_responses")
             self.assertEqual(meta["codexOauthTransport"], "local_bridge")
             self.assertEqual(meta["authBinding"]["authProvider"], "codex_oauth")
+            self.assertTrue(meta["usage_script"]["enabled"])
+            self.assertEqual(meta["usage_script"]["templateType"], "custom")
+            self.assertIn("http://127.0.0.1:8876/accounts/acct-1/quota", meta["usage_script"]["code"])
+            self.assertIn('planName: "five_hour"', meta["usage_script"]["code"])
+            self.assertIn('planName: "weekly_limit"', meta["usage_script"]["code"])
             self.assertNotIn("providerType", meta)
 
     def test_auto_switch_does_not_touch_third_party_current_provider(self) -> None:
