@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.7
+
+- Redacted service process details, local paths, and upstream proxy values in remote read-only mode.
+- Masked proxy credentials in local service status responses.
+
 ## 0.2.6
 
 - Forced local quota requests to bypass system proxies.

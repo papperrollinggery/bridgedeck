@@ -36,7 +36,7 @@ DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.6"
+APP_VERSION = "0.2.7"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -150,6 +150,18 @@ def read_local_url(url: str, *, timeout: float, max_bytes: int) -> bytes:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(request, timeout=timeout) as response:
         return response.read(max_bytes)
+
+
+def mask_url_credentials(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except Exception:
+        return value
+    if not parsed.scheme or not parsed.netloc or ("@" not in parsed.netloc):
+        return value
+    host = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    return urllib.parse.urlunsplit((parsed.scheme, f"<redacted>@{host}{port}", parsed.path, parsed.query, parsed.fragment))
 
 
 def run_quiet(args: list[str], *, timeout: float = 3) -> subprocess.CompletedProcess[str] | None:
@@ -616,7 +628,7 @@ class BridgeManager:
                     "processes": bridge_processes,
                     "script": str(bridge_script) if bridge_script else "",
                     "can_start": bool(bridge_script),
-                    "upstream_proxy": upstream_proxy,
+                    "upstream_proxy": mask_url_credentials(upstream_proxy),
                     "log_path": str(self.paths.db.parent / "bridgedeck-local-bridge.log"),
                 },
                 "cc_switch_proxy": {
@@ -1846,6 +1858,16 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             if isinstance(item, dict):
                 item["account_id"] = mask_id_value(item.get("account_id"))
                 item["email"] = mask_email_value(item.get("email"))
+    services = redacted.get("services")
+    if isinstance(services, dict):
+        for service in services.values():
+            if not isinstance(service, dict):
+                continue
+            service.pop("processes", None)
+            service.pop("script", None)
+            service.pop("log_path", None)
+            if service.get("upstream_proxy"):
+                service["upstream_proxy"] = "<redacted>"
     return redacted
 
 
@@ -3136,7 +3158,10 @@ def build_handler(
                     if not self._valid_csrf():
                         json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
                         return
-                    json_response(self, 200, manager.services(server_port=int(self.server.server_port)))
+                    payload = manager.services(server_port=int(self.server.server_port))
+                    if not allow_sensitive:
+                        payload = redact_snapshot(payload)
+                    json_response(self, 200, payload)
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return

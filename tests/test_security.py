@@ -145,7 +145,15 @@ class FakeManager:
             "ok": True,
             "services": {
                 "bridgedeck": {"name": "BridgeDeck", "running": True, "port": server_port},
-                "local_bridge": {"name": "Local Codex Bridge", "running": True, "port": 8876},
+                "local_bridge": {
+                    "name": "Local Codex Bridge",
+                    "running": True,
+                    "port": 8876,
+                    "processes": [{"pid": 123, "command": "/Users/person/local_codex_bridge.py"}],
+                    "script": "/Users/person/local_codex_bridge.py",
+                    "log_path": "/Users/person/.cc-switch/bridgedeck-local-bridge.log",
+                    "upstream_proxy": "http://user:pass@127.0.0.1:1087",
+                },
                 "cc_switch_proxy": {"name": "CC Switch Proxy", "running": True, "port": 15721},
             },
         }
@@ -337,6 +345,16 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(fake_opener.timeout, 3)
         self.assertEqual(fake_opener.request.headers["Connection"], "close")
 
+    def test_mask_url_credentials_redacts_proxy_password(self) -> None:
+        self.assertEqual(
+            bridgedeck.mask_url_credentials("http://user:pass@127.0.0.1:1087"),
+            "http://<redacted>@127.0.0.1:1087",
+        )
+        self.assertEqual(
+            bridgedeck.mask_url_credentials("http://127.0.0.1:1087"),
+            "http://127.0.0.1:1087",
+        )
+
     def test_remote_mode_blocks_secret_reveal(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
 
@@ -456,6 +474,7 @@ class ServerCase(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertTrue(payload["services"]["local_bridge"]["running"])
+        self.assertIn("processes", payload["services"]["local_bridge"])
 
     def test_local_bridge_control_requires_local_write_mode(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
@@ -470,6 +489,20 @@ class ServerCase(unittest.TestCase):
 
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "Write APIs are disabled for remote mode")
+
+    def test_remote_services_redacts_process_paths_and_proxy(self) -> None:
+        server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
+
+        status, payload = self.request(server, "/api/services", headers={"X-CCSBT-Token": "test-token"})
+
+        local_bridge = payload["services"]["local_bridge"]
+        self.assertEqual(status, 200)
+        self.assertNotIn("processes", local_bridge)
+        self.assertNotIn("script", local_bridge)
+        self.assertNotIn("log_path", local_bridge)
+        self.assertEqual(local_bridge["upstream_proxy"], "<redacted>")
+        self.assertNotIn("/Users/person", json.dumps(payload))
+        self.assertNotIn("user:pass", json.dumps(payload))
 
 
 class LauncherCase(unittest.TestCase):
