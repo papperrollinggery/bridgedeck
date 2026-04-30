@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import http.client
 import io
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -52,6 +53,9 @@ class FakeManager:
                     "base_url": "http://127.0.0.1:8876/accounts/01234567-89ab-cdef-0123-456789abcdef",
                     "auth_token": "full-token" if include_secrets else "",
                     "auth_token_masked": "full...oken",
+                    "compact_enabled": True,
+                    "compact_window_tokens": "220000",
+                    "compact_threshold_percent": "80",
                 }
             ],
             "codex_providers": [
@@ -90,11 +94,52 @@ class FakeManager:
         self.set_current_called = True
         return {"ok": True, "provider_id": provider_id}
 
-    def create_or_update_provider(self, account_id: str, provider_name: str, set_current: bool) -> dict[str, Any]:
+    def create_or_update_provider(
+        self,
+        account_id: str,
+        provider_name: str,
+        set_current: bool,
+        compact_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         return {"ok": True}
 
     def patch_provider(self, provider_id: str) -> dict[str, Any]:
         return {"ok": True}
+
+    def update_provider_compact(self, provider_id: str, compact_config: dict[str, Any] | None) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "message": "上下文配置已保存",
+            "provider_id": provider_id,
+            "compact_config": bridgedeck.normalize_compact_config(compact_config),
+        }
+
+    def sync_common_env_to_bridge_providers(self, provider_id: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "message": "通用 env 已同步",
+            "source_provider_id": provider_id,
+            "env_keys": ["ANTHROPIC_MODEL", "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "HUB_CLAUDE_MEM"],
+            "updated": [{"id": "provider-1", "name": "Provider"}],
+            "skipped": [],
+        }
+
+    def dedupe_bridge_providers(self, *, apply: bool = False) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "message": "重复 provider 预览" if not apply else "重复 Local Bridge provider 已清理",
+            "apply": apply,
+            "plan": [
+                {
+                    "account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "keep": {"id": "provider-1", "name": "Provider"},
+                    "delete": [{"id": "provider-old", "name": "Provider Old"}],
+                    "switch_current_to": "",
+                }
+            ],
+            "deleted": [{"id": "provider-old", "name": "Provider Old"}] if apply else [],
+            "backups": [],
+        }
 
     def repair_plus_pro(self) -> dict[str, Any]:
         return {"ok": True}
@@ -259,13 +304,27 @@ class ServerCase(unittest.TestCase):
         self.assertIn('id="simpleCliAccount"', html)
         self.assertIn('id="simpleDefaultAccount"', html)
         self.assertIn('id="simpleClaudeActual"', html)
+        self.assertIn('id="simpleCliActual"', html)
+        self.assertIn('id="simpleDesktopActual"', html)
+        self.assertIn('id="simpleDefaultActual"', html)
+        self.assertIn("button:disabled", html)
+        self.assertIn("刷新中...", html)
+        self.assertIn("refreshData(true)", html)
         self.assertIn("单独 Codex CLI", html)
         self.assertIn("全局 Codex CLI", html)
         self.assertIn("当前实际", html)
         self.assertIn('id="autoSwitchEnabled"', html)
         self.assertIn("OpenAI 自动切换", html)
         self.assertIn("为新账号创建 Local Codex Bridge", html)
+        self.assertIn('id="compactWindow"', html)
+        self.assertIn('data-action="compact-preset-1m"', html)
+        self.assertIn('data-action="save-compact-selected"', html)
+        self.assertIn('data-action="sync-common-env-selected"', html)
+        self.assertIn('data-action="preview-bridge-dedupe"', html)
+        self.assertIn('data-action="apply-bridge-dedupe"', html)
         self.assertIn('id="actualCurrentAccounts"', html)
+        self.assertIn("const actualGlobalAccount = data.codex_desktop", html)
+        self.assertIn("renderAccounts(data);", html)
         self.assertIn("Spark", html)
         self.assertNotIn('id="simpleAccount"', html)
         self.assertNotIn("今天用哪个账号", html)
@@ -381,6 +440,54 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "Write APIs are disabled for remote mode")
         self.assertFalse(manager.set_current_called)
+
+    def test_provider_compact_endpoint_accepts_1m_window(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/provider-compact",
+            method="POST",
+            body={
+                "provider_id": "provider-1",
+                "compact_config": {"enabled": True, "window_tokens": "1000000", "threshold_percent": "80"},
+            },
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["compact_config"]["window_tokens"], "1000000")
+
+    def test_sync_common_env_endpoint_uses_selected_provider(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/sync-common-env",
+            method="POST",
+            body={"provider_id": "provider-1"},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["source_provider_id"], "provider-1")
+        self.assertIn("HUB_CLAUDE_MEM", payload["env_keys"])
+
+    def test_dedupe_bridge_providers_endpoint_defaults_to_preview(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/dedupe-bridge-providers",
+            method="POST",
+            body={},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["apply"])
+        self.assertEqual(payload["deleted"], [])
+        self.assertEqual(payload["plan"][0]["delete"][0]["id"], "provider-old")
 
     def test_remote_mode_redacts_snapshot_fields(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
@@ -596,6 +703,268 @@ class LauncherCase(unittest.TestCase):
             self.assertIn('planName: "five_hour"', meta["usage_script"]["code"])
             self.assertIn('planName: "weekly_limit"', meta["usage_script"]["code"])
             self.assertNotIn("providerType", meta)
+
+    def test_provider_payload_applies_adjustable_compact_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+
+            settings, _ = manager._build_provider_payload(
+                "acct-1",
+                settings_config={"env": {}},
+                compact_config={"enabled": True, "window_tokens": "1000000", "threshold_percent": "85"},
+            )
+
+            env = settings["env"]
+            self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000")
+            self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "85")
+
+            settings, _ = manager._build_provider_payload(
+                "acct-1",
+                settings_config={
+                    "env": {
+                        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "220000",
+                        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80",
+                    }
+                },
+                compact_config={"enabled": False},
+            )
+
+            self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", settings["env"])
+            self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", settings["env"])
+
+    def test_provider_payload_normalizes_gpt_model_env_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+
+            settings, _ = manager._build_provider_payload(
+                "acct-1",
+                settings_config={"env": {"ANTHROPIC_DEFAULT_HAIKU_MODEL": "GPT-5.3-Codex-Spark"}},
+            )
+
+            self.assertEqual(settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gpt-5.3-codex-spark")
+
+    def test_sync_common_env_preserves_provider_scoped_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE providers (
+                        id TEXT,
+                        name TEXT,
+                        app_type TEXT,
+                        settings_config TEXT,
+                        sort_index INTEGER
+                    )
+                    """
+                )
+                rows = [
+                    (
+                        "source",
+                        "Local Codex Bridge - Source",
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-source",
+                                "ANTHROPIC_AUTH_TOKEN": "source-token",
+                                "ANTHROPIC_MODEL": "GPT-5.5",
+                                "HUB_CLAUDE_MEM": "1",
+                                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "220000",
+                            }
+                        },
+                        1,
+                    ),
+                    (
+                        "target",
+                        "Local Codex Bridge - Target",
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-target",
+                                "ANTHROPIC_AUTH_TOKEN": "target-token",
+                                "TARGET_ONLY": "keep",
+                            }
+                        },
+                        2,
+                    ),
+                    (
+                        "external",
+                        "External",
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": "https://example.com",
+                                "ANTHROPIC_AUTH_TOKEN": "external-token",
+                            }
+                        },
+                        3,
+                    ),
+                ]
+                for provider_id, name, settings, sort_index in rows:
+                    conn.execute(
+                        "INSERT INTO providers VALUES (?, ?, ?, ?, ?)",
+                        (provider_id, name, "claude", json.dumps(settings), sort_index),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = manager.sync_common_env_to_bridge_providers("source")
+
+            self.assertTrue(result["ok"])
+            self.assertIn("HUB_CLAUDE_MEM", result["env_keys"])
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                loaded = {
+                    row[0]: json.loads(row[1])
+                    for row in conn.execute("SELECT id, settings_config FROM providers")
+                }
+            finally:
+                conn.close()
+            source_env = loaded["source"]["env"]
+            target_env = loaded["target"]["env"]
+            external_env = loaded["external"]["env"]
+            self.assertEqual(source_env["ANTHROPIC_MODEL"], "gpt-5.5")
+            self.assertEqual(source_env["ANTHROPIC_AUTH_TOKEN"], "source-token")
+            self.assertEqual(target_env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8876/accounts/acct-target")
+            self.assertEqual(target_env["ANTHROPIC_AUTH_TOKEN"], "target-token")
+            self.assertEqual(target_env["ANTHROPIC_MODEL"], "gpt-5.5")
+            self.assertEqual(target_env["HUB_CLAUDE_MEM"], "1")
+            self.assertEqual(target_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "220000")
+            self.assertEqual(target_env["TARGET_ONLY"], "keep")
+            self.assertEqual(external_env["ANTHROPIC_AUTH_TOKEN"], "external-token")
+
+    def test_create_provider_reuses_existing_bridge_account(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE providers (
+                        id TEXT,
+                        name TEXT,
+                        app_type TEXT,
+                        settings_config TEXT,
+                        meta TEXT,
+                        provider_type TEXT,
+                        sort_index INTEGER
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "existing",
+                        "Local Codex Bridge - Pro 20x",
+                        "claude",
+                        json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-1"}}),
+                        json.dumps({}),
+                        None,
+                        1,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = manager.create_or_update_provider("acct-1", "Local Codex Bridge - person", False)
+
+            self.assertEqual(result["provider_id"], "existing")
+            self.assertEqual(result["provider_name"], "Local Codex Bridge - Pro 20x")
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                count = conn.execute("SELECT COUNT(*) FROM providers").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(count, 1)
+
+    def test_dedupe_bridge_providers_switches_current_before_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            manager.paths.settings.parent.mkdir(parents=True, exist_ok=True)
+            manager.paths.settings.write_text(json.dumps({"currentProviderClaude": "old"}), encoding="utf-8")
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE providers (
+                        id TEXT,
+                        name TEXT,
+                        app_type TEXT,
+                        is_current INTEGER,
+                        settings_config TEXT,
+                        meta TEXT,
+                        sort_index INTEGER
+                    )
+                    """
+                )
+                rows = [
+                    (
+                        "keep",
+                        "Local Codex Bridge - Pro 20x",
+                        0,
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-1",
+                                "ANTHROPIC_AUTH_TOKEN": "keep-token",
+                                "ANTHROPIC_MODEL": "gpt-5.4",
+                            }
+                        },
+                    ),
+                    (
+                        "old",
+                        "Local Codex Bridge - person",
+                        1,
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-1",
+                                "ANTHROPIC_AUTH_TOKEN": "old-token",
+                                "ANTHROPIC_MODEL": "GPT-5.5",
+                                "HUB_CLAUDE_MEM": "1",
+                            }
+                        },
+                    ),
+                    (
+                        "external",
+                        "MiniMax",
+                        0,
+                        {"env": {"ANTHROPIC_BASE_URL": "https://example.com", "ANTHROPIC_AUTH_TOKEN": "external-token"}},
+                    ),
+                ]
+                for index, (provider_id, name, is_current, settings) in enumerate(rows, start=1):
+                    conn.execute(
+                        "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (provider_id, name, "claude", is_current, json.dumps(settings), json.dumps({}), index),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            preview = manager.dedupe_bridge_providers(apply=False)
+            result = manager.dedupe_bridge_providers(apply=True)
+
+            self.assertEqual(preview["plan"][0]["keep"]["id"], "keep")
+            self.assertEqual(preview["plan"][0]["delete"][0]["id"], "old")
+            self.assertEqual(preview["plan"][0]["switch_current_to"], "keep")
+            self.assertEqual(result["deleted"][0]["id"], "old")
+            self.assertEqual(json.loads(manager.paths.settings.read_text(encoding="utf-8"))["currentProviderClaude"], "keep")
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                ids = [row[0] for row in conn.execute("SELECT id FROM providers ORDER BY id")]
+                keep_settings = json.loads(conn.execute("SELECT settings_config FROM providers WHERE id = 'keep'").fetchone()[0])
+                keep_current = conn.execute("SELECT is_current FROM providers WHERE id = 'keep'").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(ids, ["external", "keep"])
+            self.assertEqual(keep_current, 1)
+            self.assertEqual(keep_settings["env"]["ANTHROPIC_AUTH_TOKEN"], "keep-token")
+            self.assertEqual(keep_settings["env"]["ANTHROPIC_MODEL"], "gpt-5.5")
+            self.assertEqual(keep_settings["env"]["HUB_CLAUDE_MEM"], "1")
 
     def test_auto_switch_does_not_touch_third_party_current_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

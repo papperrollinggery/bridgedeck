@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.14
+
+- Added provider-level Claude Code auto-compact controls, including 220k and 1m context window presets.
+- Added a one-click sync for common provider env values across Local Codex Bridge providers while preserving account-specific URL/token fields.
+- Added safe duplicate Local Codex Bridge provider cleanup with preview, current-provider handoff, and DB/settings backups.
+- Fixed the Global Codex CLI selector so refresh reflects the actual `~/.codex/config.toml` account instead of falling back to the first account.
+- Added per-tool actual-account status lines and refresh buttons to the daily account selector.
+- Added visible refresh feedback so status buttons show a busy state and completion time.
+
 ## 0.2.13
 
 - Fixed the macOS launcher so clicking BridgeDeck in the Dock reopens the browser page while keeping the web server in the background.

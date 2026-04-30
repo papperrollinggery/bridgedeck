@@ -36,12 +36,31 @@ DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.13"
+APP_VERSION = "0.2.14"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
 LOCAL_BRIDGE_PORT = 8876
 COMMON_UPSTREAM_PROXY_PORTS = (1087, 7890, 6152, 8080)
+COMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+COMPACT_THRESHOLD_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+DEFAULT_COMPACT_WINDOW_TOKENS = 220_000
+DEFAULT_COMPACT_THRESHOLD_PERCENT = 80
+MODEL_ENV_KEYS = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+)
+PROVIDER_SCOPED_ENV_KEYS = {
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+}
+CANONICAL_BRIDGE_NAMES = (
+    "Local Codex Bridge - Plus",
+    "Local Codex Bridge - Pro",
+    "Local Codex Bridge - Pro 20x",
+)
 
 
 def now_ts() -> str:
@@ -88,6 +107,100 @@ def sha12(value: str | None) -> str:
 
 def utc_now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def default_compact_config() -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "window_tokens": str(DEFAULT_COMPACT_WINDOW_TOKENS),
+        "threshold_percent": str(DEFAULT_COMPACT_THRESHOLD_PERCENT),
+    }
+
+
+def _parse_int_setting(value: Any, field_name: str, *, min_value: int, max_value: int) -> int:
+    text = str(value or "").strip().replace(",", "").replace("_", "")
+    if not text or not re.fullmatch(r"\d+", text):
+        raise ValueError(f"{field_name} 必须是数字")
+    parsed = int(text)
+    if parsed < min_value or parsed > max_value:
+        raise ValueError(f"{field_name} 必须在 {min_value}-{max_value} 之间")
+    return parsed
+
+
+def _bool_setting(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    return bool(value)
+
+
+def normalize_compact_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    config = config if isinstance(config, dict) else {}
+    window_raw = str(config.get("window_tokens") or config.get("window") or "").strip()
+    enabled = _bool_setting(config["enabled"]) if "enabled" in config else bool(window_raw)
+    if not enabled:
+        return {"enabled": False, "window_tokens": "", "threshold_percent": ""}
+
+    window = (
+        _parse_int_setting(window_raw, "上下文窗口", min_value=10_000, max_value=2_000_000)
+        if window_raw
+        else DEFAULT_COMPACT_WINDOW_TOKENS
+    )
+    threshold_raw = str(config.get("threshold_percent") or config.get("pct") or "").strip()
+    threshold = (
+        _parse_int_setting(threshold_raw, "压缩阈值", min_value=1, max_value=100)
+        if threshold_raw
+        else DEFAULT_COMPACT_THRESHOLD_PERCENT
+    )
+    return {"enabled": True, "window_tokens": str(window), "threshold_percent": str(threshold)}
+
+
+def apply_compact_config_to_env(env: dict[str, Any], compact_config: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = normalize_compact_config(compact_config)
+    if normalized["enabled"]:
+        env[COMPACT_WINDOW_ENV] = normalized["window_tokens"]
+        env[COMPACT_THRESHOLD_ENV] = normalized["threshold_percent"]
+    else:
+        env.pop(COMPACT_WINDOW_ENV, None)
+        env.pop(COMPACT_THRESHOLD_ENV, None)
+    return normalized
+
+
+def normalize_openai_model_id(value: Any) -> str:
+    model = str(value or "").strip()
+    if re.match(r"(?i)^gpt-", model):
+        return model.lower()
+    return model
+
+
+def normalize_provider_model_env(env: dict[str, Any]) -> None:
+    for key in MODEL_ENV_KEYS:
+        if isinstance(env.get(key), str):
+            env[key] = normalize_openai_model_id(env[key])
+
+
+def common_provider_env(env: dict[str, Any]) -> dict[str, Any]:
+    common = {
+        str(key): copy.deepcopy(value)
+        for key, value in env.items()
+        if isinstance(key, str) and key not in PROVIDER_SCOPED_ENV_KEYS
+    }
+    normalize_provider_model_env(common)
+    return common
+
+
+def bridge_account_id_from_env(env: dict[str, Any]) -> str:
+    base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
+    marker = f"{LOCAL_BRIDGE_BASE_URL}/accounts/"
+    if not base_url.startswith(marker):
+        return ""
+    rest = base_url[len(marker):]
+    account_id = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    return urllib.parse.unquote(account_id).strip()
 
 
 def safe_slug(value: str) -> str:
@@ -921,6 +1034,40 @@ class BridgeManager:
         base_url = str(provider.get("base_url") or "")
         return LOCAL_BRIDGE_BASE_URL in base_url and "/accounts/" in base_url
 
+    def _provider_row_bridge_account_id(self, row: sqlite3.Row) -> str:
+        settings = self._extract_json(row["settings_config"])
+        env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+        account_id = bridge_account_id_from_env(env)
+        if account_id:
+            return account_id
+        meta = self._extract_json(row["meta"])
+        binding = meta.get("authBinding")
+        if isinstance(binding, dict) and isinstance(binding.get("accountId"), str):
+            return binding["accountId"].strip()
+        return ""
+
+    def _select_existing_bridge_provider_for_account(self, conn: sqlite3.Connection, account_id: str) -> sqlite3.Row | None:
+        rows = conn.execute(
+            """
+            SELECT id, name, settings_config, meta, sort_index
+            FROM providers
+            WHERE app_type = 'claude'
+            ORDER BY
+              CASE
+                WHEN name = 'Local Codex Bridge - Plus' THEN 0
+                WHEN name = 'Local Codex Bridge - Pro' THEN 1
+                WHEN name = 'Local Codex Bridge - Pro 20x' THEN 2
+                ELSE 9
+              END,
+              sort_index ASC,
+              name ASC
+            """
+        ).fetchall()
+        for row in rows:
+            if self._provider_row_bridge_account_id(row) == account_id:
+                return row
+        return None
+
     def _current_claude_provider(self, snapshot: dict[str, Any]) -> dict[str, Any] | None:
         providers = snapshot.get("providers") if isinstance(snapshot.get("providers"), list) else []
         current_id = snapshot.get("current_provider_from_settings")
@@ -963,10 +1110,10 @@ class BridgeManager:
         account = self._account_for_id(account_id) or {"account_id": account_id, "email": quota.get("email") or ""}
         plan = str(quota.get("plan_type") or "").strip().lower()
         suffix = ""
-        if "plus" in plan:
-            suffix = "Plus"
-        elif "20x" in plan:
+        if "20x" in plan or "pro max" in plan or "promax" in plan:
             suffix = "Pro 20x"
+        elif "plus" in plan:
+            suffix = "Plus"
         elif "pro" in plan:
             suffix = "Pro"
         if suffix:
@@ -1147,6 +1294,7 @@ class BridgeManager:
         *,
         settings_config: dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
+        compact_config: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         settings = copy.deepcopy(settings_config) if isinstance(settings_config, dict) else {}
         if not isinstance(settings, dict):
@@ -1160,6 +1308,9 @@ class BridgeManager:
         env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "gpt-5.4-mini")
         env.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", "gpt-5.3-codex")
         env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "gpt-5.4")
+        normalize_provider_model_env(env)
+        if compact_config is not None:
+            apply_compact_config_to_env(env, compact_config)
         settings["env"] = env
 
         m = copy.deepcopy(meta) if isinstance(meta, dict) else {}
@@ -1278,6 +1429,9 @@ class BridgeManager:
                         "base_url": env.get("ANTHROPIC_BASE_URL") if isinstance(env.get("ANTHROPIC_BASE_URL"), str) else "",
                         "auth_token": auth_token if include_secrets else "",
                         "auth_token_masked": mask_token(auth_token),
+                        "compact_enabled": bool(str(env.get(COMPACT_WINDOW_ENV) or "").strip()),
+                        "compact_window_tokens": env.get(COMPACT_WINDOW_ENV) if isinstance(env.get(COMPACT_WINDOW_ENV), str) else "",
+                        "compact_threshold_percent": env.get(COMPACT_THRESHOLD_ENV) if isinstance(env.get(COMPACT_THRESHOLD_ENV), str) else "",
                     }
                 )
 
@@ -1326,6 +1480,7 @@ class BridgeManager:
         account_id: str,
         provider_name: str,
         set_current: bool,
+        compact_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not account_id.strip():
             raise ValueError("account_id 不能为空")
@@ -1342,12 +1497,15 @@ class BridgeManager:
 
             with self._connect() as conn:
                 columns = self._provider_columns(conn)
-                existing = conn.execute(
-                    "SELECT id, settings_config, meta FROM providers WHERE app_type = 'claude' AND name = ? LIMIT 1",
-                    (provider_name,),
-                ).fetchone()
+                existing = self._select_existing_bridge_provider_for_account(conn, account_id)
+                if not existing:
+                    existing = conn.execute(
+                        "SELECT id, name, settings_config, meta FROM providers WHERE app_type = 'claude' AND name = ? LIMIT 1",
+                        (provider_name,),
+                    ).fetchone()
                 if existing:
                     provider_id = str(existing["id"])
+                    provider_name = str(existing["name"])
                     current_settings = self._extract_json(existing["settings_config"])
                     current_meta = self._extract_json(existing["meta"])
                 else:
@@ -1356,10 +1514,15 @@ class BridgeManager:
                     current_settings = template_settings
                     current_meta = template_meta
 
+                effective_compact_config = compact_config
+                if effective_compact_config is None and not existing:
+                    effective_compact_config = default_compact_config()
+
                 new_settings, new_meta = self._build_provider_payload(
                     account_id,
                     settings_config=current_settings,
                     meta=current_meta,
+                    compact_config=effective_compact_config,
                 )
                 settings_text = json.dumps(new_settings, ensure_ascii=False)
                 meta_text = json.dumps(new_meta, ensure_ascii=False)
@@ -1482,6 +1645,286 @@ class BridgeManager:
                 "message": "provider 已打桥接补丁",
                 "provider_id": provider_id,
                 "backups": [db_bak],
+            }
+
+    def update_provider_compact(self, provider_id: str, compact_config: dict[str, Any] | None) -> dict[str, Any]:
+        if not provider_id.strip():
+            raise ValueError("provider_id 不能为空")
+
+        with self._lock:
+            db_bak = self._backup_file(self.paths.db, "provider-compact")
+            with self._connect() as conn:
+                columns = self._provider_columns(conn)
+                row = conn.execute(
+                    "SELECT id, settings_config FROM providers WHERE app_type = 'claude' AND id = ? LIMIT 1",
+                    (provider_id,),
+                ).fetchone()
+                if not row:
+                    raise ValueError(f"provider 不存在: {provider_id}")
+                if "settings_config" not in columns:
+                    raise RuntimeError("providers 表缺少 settings_config 字段")
+
+                settings = self._extract_json(row["settings_config"])
+                env = settings.get("env")
+                if not isinstance(env, dict):
+                    env = {}
+                base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
+                if not base_url.startswith(f"{LOCAL_BRIDGE_BASE_URL}/accounts/"):
+                    raise ValueError("仅支持 Local Codex Bridge provider")
+                normalized = apply_compact_config_to_env(env, compact_config)
+                settings["env"] = env
+                conn.execute(
+                    "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = ?",
+                    (json.dumps(settings, ensure_ascii=False), provider_id, "claude"),
+                )
+                conn.commit()
+
+            return {
+                "ok": True,
+                "message": "上下文配置已保存",
+                "provider_id": provider_id,
+                "compact_config": normalized,
+                "backups": [db_bak],
+            }
+
+    def sync_common_env_to_bridge_providers(self, provider_id: str) -> dict[str, Any]:
+        if not provider_id.strip():
+            raise ValueError("provider_id 不能为空")
+
+        with self._lock:
+            db_bak = self._backup_file(self.paths.db, "sync-common-env")
+            conn = self._connect()
+            try:
+                columns = self._provider_columns(conn)
+                if "settings_config" not in columns:
+                    raise RuntimeError("providers 表缺少 settings_config 字段")
+
+                source = conn.execute(
+                    """
+                    SELECT id, name, settings_config
+                    FROM providers
+                    WHERE app_type = 'claude' AND id = ? LIMIT 1
+                    """,
+                    (provider_id,),
+                ).fetchone()
+                if not source:
+                    raise ValueError(f"provider 不存在: {provider_id}")
+
+                source_settings = self._extract_json(source["settings_config"])
+                source_env = source_settings.get("env")
+                if not isinstance(source_env, dict):
+                    source_env = {}
+                source_base_url = str(source_env.get("ANTHROPIC_BASE_URL") or "")
+                if not source_base_url.startswith(f"{LOCAL_BRIDGE_BASE_URL}/accounts/"):
+                    raise ValueError("仅支持 Local Codex Bridge provider")
+
+                common_env = common_provider_env(source_env)
+                rows = conn.execute(
+                    """
+                    SELECT id, name, settings_config
+                    FROM providers
+                    WHERE app_type = 'claude'
+                    ORDER BY sort_index ASC, name ASC
+                    """
+                ).fetchall()
+
+                updated: list[dict[str, Any]] = []
+                skipped: list[dict[str, Any]] = []
+                for row in rows:
+                    settings = self._extract_json(row["settings_config"])
+                    env = settings.get("env")
+                    if not isinstance(env, dict):
+                        env = {}
+                    base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
+                    if not base_url.startswith(f"{LOCAL_BRIDGE_BASE_URL}/accounts/"):
+                        skipped.append({"id": row["id"], "name": row["name"], "reason": "not_local_bridge"})
+                        continue
+
+                    auth_token = env.get("ANTHROPIC_AUTH_TOKEN")
+                    before = json.dumps(settings, ensure_ascii=False, sort_keys=True)
+                    merged = copy.deepcopy(env)
+                    merged.update(copy.deepcopy(common_env))
+                    merged["ANTHROPIC_BASE_URL"] = base_url
+                    if isinstance(auth_token, str):
+                        merged["ANTHROPIC_AUTH_TOKEN"] = auth_token
+                    normalize_provider_model_env(merged)
+                    settings["env"] = merged
+                    after = json.dumps(settings, ensure_ascii=False, sort_keys=True)
+                    if after == before:
+                        skipped.append({"id": row["id"], "name": row["name"], "reason": "unchanged"})
+                        continue
+
+                    conn.execute(
+                        "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = ?",
+                        (json.dumps(settings, ensure_ascii=False), row["id"], "claude"),
+                    )
+                    updated.append({"id": row["id"], "name": row["name"]})
+
+                conn.commit()
+            finally:
+                conn.close()
+
+            return {
+                "ok": True,
+                "message": "通用 env 已同步",
+                "source_provider_id": provider_id,
+                "env_keys": sorted(common_env.keys()),
+                "updated": updated,
+                "skipped": skipped,
+                "backups": [db_bak],
+            }
+
+    def _canonical_bridge_name_rank(self, name: str) -> int:
+        try:
+            return CANONICAL_BRIDGE_NAMES.index(name)
+        except ValueError:
+            return len(CANONICAL_BRIDGE_NAMES) + 1
+
+    def _bridge_provider_duplicate_plan(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT id, name, is_current, sort_index, settings_config, meta
+            FROM providers
+            WHERE app_type = 'claude'
+            ORDER BY sort_index ASC, name ASC
+            """
+        ).fetchall()
+        current_id = self._current_provider_from_settings()
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            settings = self._extract_json(row["settings_config"])
+            env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+            account_id = bridge_account_id_from_env(env)
+            if not account_id:
+                continue
+            groups.setdefault(account_id, []).append(
+                {
+                    "id": str(row["id"]),
+                    "name": str(row["name"] or ""),
+                    "account_id": account_id,
+                    "is_current": bool(row["is_current"]),
+                    "sort_index": int(row["sort_index"] or 0),
+                    "settings": settings,
+                    "env": env,
+                }
+            )
+
+        plan: list[dict[str, Any]] = []
+        for account_id, group in groups.items():
+            if len(group) < 2:
+                continue
+            canonical = [item for item in group if item["name"] in CANONICAL_BRIDGE_NAMES]
+            if canonical:
+                current_canonical = [item for item in canonical if item["id"] == current_id or item["is_current"]]
+                keep = (current_canonical or sorted(canonical, key=lambda item: (self._canonical_bridge_name_rank(item["name"]), item["sort_index"], item["name"])))[0]
+            else:
+                current = [item for item in group if item["id"] == current_id or item["is_current"]]
+                keep = (current or sorted(group, key=lambda item: (item["sort_index"], item["name"])))[0]
+            to_delete = [item for item in group if item["id"] != keep["id"]]
+            if not to_delete:
+                continue
+            active_deleted = [item for item in to_delete if item["id"] == current_id or item["is_current"]]
+            plan.append(
+                {
+                    "account_id": account_id,
+                    "keep": {"id": keep["id"], "name": keep["name"]},
+                    "delete": [{"id": item["id"], "name": item["name"]} for item in to_delete],
+                    "switch_current_to": keep["id"] if active_deleted else "",
+                    "_keep": keep,
+                    "_delete": to_delete,
+                }
+            )
+        return plan
+
+    def dedupe_bridge_providers(self, *, apply: bool = False) -> dict[str, Any]:
+        with self._lock:
+            if not self.paths.db.exists():
+                return {"ok": True, "message": "cc-switch 数据库不存在", "apply": apply, "plan": [], "deleted": [], "backups": []}
+
+            db_bak = self._backup_file(self.paths.db, "dedupe-bridge-providers") if apply else None
+            settings_bak = self._backup_file(self.paths.settings, "dedupe-bridge-providers") if apply else None
+            switch_current_to = ""
+            deleted: list[dict[str, Any]] = []
+            updated: list[dict[str, Any]] = []
+            conn = self._connect()
+            try:
+                columns = self._provider_columns(conn)
+                if "settings_config" not in columns:
+                    raise RuntimeError("providers 表缺少 settings_config 字段")
+                plan = self._bridge_provider_duplicate_plan(conn)
+                public_plan = [
+                    {
+                        "account_id": item["account_id"],
+                        "keep": item["keep"],
+                        "delete": item["delete"],
+                        "switch_current_to": item["switch_current_to"],
+                    }
+                    for item in plan
+                ]
+                if not apply:
+                    return {"ok": True, "message": "重复 provider 预览", "apply": False, "plan": public_plan, "deleted": [], "backups": []}
+
+                for item in plan:
+                    keep = item["_keep"]
+                    to_delete = item["_delete"]
+                    keep_env = keep["env"]
+                    keep_base_url = keep_env.get("ANTHROPIC_BASE_URL")
+                    keep_auth_token = keep_env.get("ANTHROPIC_AUTH_TOKEN")
+                    merged_common = common_provider_env(keep_env)
+                    for duplicate in to_delete:
+                        for key, value in common_provider_env(duplicate["env"]).items():
+                            merged_common.setdefault(key, value)
+                    for duplicate in to_delete:
+                        if duplicate["id"] == self._current_provider_from_settings() or duplicate["is_current"]:
+                            merged_common.update(common_provider_env(duplicate["env"]))
+
+                    merged_env = copy.deepcopy(keep_env)
+                    merged_env.update(merged_common)
+                    if isinstance(keep_base_url, str):
+                        merged_env["ANTHROPIC_BASE_URL"] = keep_base_url
+                    if isinstance(keep_auth_token, str):
+                        merged_env["ANTHROPIC_AUTH_TOKEN"] = keep_auth_token
+                    normalize_provider_model_env(merged_env)
+                    keep_settings = copy.deepcopy(keep["settings"])
+                    keep_settings["env"] = merged_env
+                    conn.execute(
+                        "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = ?",
+                        (json.dumps(keep_settings, ensure_ascii=False), keep["id"], "claude"),
+                    )
+                    updated.append(item["keep"])
+
+                    delete_ids = [duplicate["id"] for duplicate in to_delete]
+                    placeholders = ", ".join(["?"] * len(delete_ids))
+                    conn.execute(
+                        f"DELETE FROM providers WHERE app_type = ? AND id IN ({placeholders})",
+                        ["claude", *delete_ids],
+                    )
+                    deleted.extend(item["delete"])
+                    if item["switch_current_to"]:
+                        switch_current_to = str(item["switch_current_to"])
+
+                if switch_current_to and "is_current" in columns:
+                    conn.execute("UPDATE providers SET is_current = 0 WHERE app_type = 'claude'")
+                    conn.execute(
+                        "UPDATE providers SET is_current = 1 WHERE app_type = 'claude' AND id = ?",
+                        (switch_current_to,),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            if switch_current_to:
+                self._set_current_provider_in_settings(switch_current_to)
+
+            return {
+                "ok": True,
+                "message": "重复 Local Bridge provider 已清理",
+                "apply": True,
+                "plan": public_plan,
+                "deleted": deleted,
+                "updated": updated,
+                "switch_current_to": switch_current_to,
+                "backups": [db_bak, settings_bak],
             }
 
     def repair_plus_pro(self) -> dict[str, Any]:
@@ -1960,6 +2403,7 @@ INDEX_HTML = """<!doctype html>
     input, select, button, textarea { border-radius:8px; border:1px solid var(--line); background:#0f1320; color:var(--text); padding:8px 10px; }
     input, select { min-width: 220px; }
     button { cursor:pointer; background:#1d2535; }
+    button:disabled { opacity:.55; cursor:default; }
     button.primary { background: var(--brand); border-color: #3d8ce0; color: #041122; font-weight:700; }
     button.warn { background:#3a2b12; border-color:#6d4f1a; color:#ffd68a; }
     .tableWrap { width:100%; overflow-x:hidden; border-radius:10px; }
@@ -2007,9 +2451,11 @@ INDEX_HTML = """<!doctype html>
     .toolSelect { margin-top:10px; display:grid; gap:6px; }
     .toolSelect label { color:var(--muted); font-size:12px; }
     .toolSelect select { width:100%; min-width:0; }
-    .actualLine { margin-top:8px; color:var(--muted); font-size:12px; line-height:1.45; }
+    .actualRow { display:flex; gap:8px; align-items:flex-start; margin-top:8px; }
+    .actualLine { color:var(--muted); font-size:12px; line-height:1.45; flex:1 1 auto; min-width:0; }
     .actualLine strong { color:var(--text); }
     .toolCard button { min-height:42px; font-weight:700; }
+    .toolCard .actualRow button { min-height:0; padding:4px 8px; font-weight:600; flex:0 0 auto; }
     .simpleResult { margin-top:12px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#0f1320; min-height:42px; color:var(--muted); font-size:13px; line-height:1.5; }
     .simpleResult strong { color:var(--text); }
     .quotaBar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:10px 0; }
@@ -2026,6 +2472,10 @@ INDEX_HTML = """<!doctype html>
     .toggleLine label { display:flex; gap:6px; align-items:center; }
     .toggleLine input { min-width:0; }
     .advancedIntro { color:var(--muted); font-size:12px; margin-bottom:10px; }
+    .compactPanel { border:1px solid var(--line); border-radius:8px; padding:10px; margin:10px 0; background:#101827; }
+    .compactTitle { font-weight:800; font-size:13px; margin-bottom:8px; }
+    .compactPanel input[type="checkbox"] { min-width:0; }
+    .compactPanel input[type="number"] { min-width:120px; width:150px; }
     summary { cursor:pointer; font-weight:700; }
     details.card { padding:0; }
     details.card > summary { padding:14px; list-style:none; }
@@ -2068,6 +2518,8 @@ INDEX_HTML = """<!doctype html>
           <button class="miniBtn" data-action="save-auto-switch">保存</button>
           <button class="miniBtn" data-action="run-auto-switch">立即检查并切换</button>
           <button class="miniBtn" data-action="create-missing-bridges">为新账号创建 Local Codex Bridge</button>
+          <button class="miniBtn" data-action="preview-bridge-dedupe">预览重复 Local Bridge</button>
+          <button class="miniBtn warn" data-action="apply-bridge-dedupe">清理重复 Local Bridge</button>
         </div>
         <div id="missingBridgeStatus" class="muted mt10">新账号检测中...</div>
         <div id="autoSwitchStatus" class="muted mt10">未运行</div>
@@ -2107,7 +2559,10 @@ INDEX_HTML = """<!doctype html>
               <label for="simpleClaudeAccount">Claude Code 用哪个账号</label>
               <select id="simpleClaudeAccount"></select>
             </div>
-            <div class="actualLine" id="simpleClaudeActual">当前实际：检测中...</div>
+            <div class="actualRow">
+              <div class="actualLine" id="simpleClaudeActual">当前实际：检测中...</div>
+              <button class="miniBtn" data-action="refresh">刷新</button>
+            </div>
           </div>
           <button class="primary" data-action="simple-claude">应用到 Claude Code</button>
         </div>
@@ -2119,6 +2574,10 @@ INDEX_HTML = """<!doctype html>
               <label for="simpleCliAccount">单独 Codex CLI 用哪个账号</label>
               <select id="simpleCliAccount"></select>
             </div>
+            <div class="actualRow">
+              <div class="actualLine" id="simpleCliActual">当前实际：检测中...</div>
+              <button class="miniBtn" data-action="refresh">刷新</button>
+            </div>
           </div>
           <button class="primary" data-action="simple-cli">准备单独 Codex CLI</button>
         </div>
@@ -2126,6 +2585,10 @@ INDEX_HTML = """<!doctype html>
           <div>
             <div class="toolName">Codex Desktop</div>
             <div class="toolText">桌面版不由 BridgeDeck 接管。这里帮你看它当前是否正常。</div>
+            <div class="actualRow">
+              <div class="actualLine" id="simpleDesktopActual">当前实际：检测中...</div>
+              <button class="miniBtn" data-action="refresh">刷新</button>
+            </div>
           </div>
           <button data-action="scroll" data-target="statusCard">查看桌面版状态</button>
         </div>
@@ -2136,6 +2599,10 @@ INDEX_HTML = """<!doctype html>
             <div class="toolSelect">
               <label for="simpleDefaultAccount">全局 Codex CLI 用哪个账号</label>
               <select id="simpleDefaultAccount"></select>
+            </div>
+            <div class="actualRow">
+              <div class="actualLine" id="simpleDefaultActual">当前实际：检测中...</div>
+              <button class="miniBtn" data-action="refresh">刷新</button>
             </div>
           </div>
           <button class="warn" data-action="simple-default-codex">设为全局 Codex CLI</button>
@@ -2166,6 +2633,22 @@ INDEX_HTML = """<!doctype html>
             <input id="providerName" placeholder="Local Codex Bridge - xxx" />
             <label><input type="checkbox" id="setCurrent" checked /> 设为当前</label>
             <button class="primary" data-action="create-provider">创建/更新 Claude 桥接</button>
+          </div>
+          <div class="compactPanel">
+            <div class="compactTitle">Claude Code 自动压缩</div>
+            <div class="row">
+              <label><input type="checkbox" id="compactEnabled" checked /> 启用</label>
+              <label>窗口 tokens</label>
+              <input id="compactWindow" type="number" min="10000" max="2000000" step="1000" value="220000" />
+              <label>阈值 %</label>
+              <input id="compactPct" type="number" min="1" max="100" step="1" value="80" />
+              <button class="miniBtn" data-action="compact-preset-220k">220k</button>
+              <button class="miniBtn" data-action="compact-preset-1m">1m</button>
+              <button class="miniBtn" data-action="compact-off">关闭</button>
+              <button class="miniBtn" data-action="save-compact-selected">保存到选中 provider</button>
+              <button class="miniBtn" data-action="sync-common-env-selected">同步通用 env 到全部</button>
+            </div>
+            <div class="muted">220000 适合实际窗口偏小的 GPT；1000000 适合 1m 模型。</div>
           </div>
           <div class="muted">工具会自动写入本地 bridge 配置，不需要手动编辑 URL/token。</div>
           </div>
@@ -2225,6 +2708,7 @@ INDEX_HTML = """<!doctype html>
                   <th class="smallCol">当前</th>
                   <th class="accountCol">account</th>
                   <th class="urlCol">base_url</th>
+                  <th class="smallCol">compact</th>
                   <th class="tokenCol">token</th>
                 </tr>
               </thead>
@@ -2290,6 +2774,8 @@ INDEX_HTML = """<!doctype html>
     let lastData = null;
     let tokenVisible = false;
     let lastAccounts = [];
+    const DEFAULT_COMPACT_WINDOW = '220000';
+    const DEFAULT_COMPACT_PCT = '80';
     const GUIDES = {
       simpleFlow: {
         title: '日常模式',
@@ -2416,26 +2902,53 @@ INDEX_HTML = """<!doctype html>
       if (account) return accountLabel(account);
       return maskId(accountId || '');
     }
+    function desktopAccountText(data) {
+      const desktop = data.codex_desktop || {};
+      if (desktop.account_id) return accountDisplay(desktop.account_id);
+      return statusText(desktop.managed_by || 'unknown');
+    }
+    function desktopModeText(data) {
+      const desktop = data.codex_desktop || {};
+      const mode = statusText(desktop.managed_by || 'unknown');
+      return desktop.base_url ? `${mode} / ${humanPath(desktop.config_path || '')}` : mode;
+    }
     function renderActualCurrentAccounts(data) {
       const box = document.getElementById('actualCurrentAccounts');
       if (!box) return;
       const provider = currentClaudeProvider(data);
       const claudeAccount = provider && provider.account_id ? accountDisplay(provider.account_id) : '外部供应商/未检测到';
-      const desktop = data.codex_desktop || {};
-      const codexAccount = desktop.account_id ? accountDisplay(desktop.account_id) : statusText(desktop.managed_by || 'unknown');
+      const codexAccount = desktopAccountText(data);
       box.innerHTML = `实际当前使用：Claude Code <strong>${esc(claudeAccount)}</strong>；全局 Codex CLI <strong>${esc(codexAccount)}</strong>`;
     }
-    function renderActualClaude(data) {
+    function renderSimpleActuals(data) {
       const box = document.getElementById('simpleClaudeActual');
-      if (!box) return;
       const provider = currentClaudeProvider(data);
-      if (!provider) {
-        box.innerHTML = '当前实际：<strong class="warnText">未检测到</strong>';
-        return;
+      if (box) {
+        if (!provider) {
+          box.innerHTML = '当前实际：<strong class="warnText">未检测到</strong>';
+        } else {
+          const mode = isBridgeClaudeProvider(provider) ? 'BridgeDeck 同步' : '外部供应商';
+          const cls = isBridgeClaudeProvider(provider) ? 'ok' : 'warnText';
+          box.innerHTML = `当前实际：<strong>${esc(providerDisplayName(provider))}</strong><br><span class="${cls}">${esc(mode)}</span>`;
+        }
       }
-      const mode = isBridgeClaudeProvider(provider) ? 'BridgeDeck 同步' : '外部供应商';
-      const cls = isBridgeClaudeProvider(provider) ? 'ok' : 'warnText';
-      box.innerHTML = `当前实际：<strong>${esc(providerDisplayName(provider))}</strong><br><span class="${cls}">${esc(mode)}</span>`;
+      const cliBox = document.getElementById('simpleCliActual');
+      if (cliBox) {
+        const selected = selectedAccount('simpleCliAccount');
+        const launcher = selected ? (data.cli_launchers || []).find((item) => item.account_id === selected.account_id) : null;
+        const launcherText = launcher ? `launcher 已生成：${humanPath(launcher.path || '')}` : 'launcher 未生成';
+        cliBox.innerHTML = selected
+          ? `当前实际：<strong>${esc(accountLabel(selected))}</strong><br><span class="${launcher ? 'ok' : 'warnText'}">${esc(launcherText)}</span>`
+          : '当前实际：<strong class="warnText">未选择</strong>';
+      }
+      const defaultBox = document.getElementById('simpleDefaultActual');
+      if (defaultBox) {
+        defaultBox.innerHTML = `当前实际：<strong>${esc(desktopAccountText(data))}</strong><br><span class="ok">${esc(desktopModeText(data))}</span>`;
+      }
+      const desktopBox = document.getElementById('simpleDesktopActual');
+      if (desktopBox) {
+        desktopBox.innerHTML = `当前实际：<strong>${esc(desktopAccountText(data))}</strong><br><span class="ok">${esc(desktopModeText(data))}</span>`;
+      }
     }
     function renderAutoSwitchConfig(data) {
       const config = data.auto_switch || {};
@@ -2607,6 +3120,10 @@ INDEX_HTML = """<!doctype html>
       const chosen = document.querySelector('input[name="providerPick"]:checked');
       return chosen ? chosen.value : '';
     }
+    function selectedProvider() {
+      const id = selectedProviderId();
+      return id && lastData ? (lastData.providers || []).find((p) => p.id === id) : null;
+    }
     function scrollToSection(id) {
       const section = document.getElementById(id);
       if (!section) return;
@@ -2661,6 +3178,34 @@ INDEX_HTML = """<!doctype html>
       const sel = document.getElementById(selectId);
       return sel ? findAccount(sel.value) : null;
     }
+    function setCompactFields(enabled, windowTokens, pct) {
+      document.getElementById('compactEnabled').checked = Boolean(enabled);
+      document.getElementById('compactWindow').value = windowTokens || '';
+      document.getElementById('compactPct').value = pct || DEFAULT_COMPACT_PCT;
+    }
+    function compactConfigPayload() {
+      return {
+        enabled: document.getElementById('compactEnabled').checked,
+        window_tokens: document.getElementById('compactWindow').value.trim(),
+        threshold_percent: document.getElementById('compactPct').value.trim() || DEFAULT_COMPACT_PCT
+      };
+    }
+    function applyCompactPreset(windowTokens, pct = DEFAULT_COMPACT_PCT) {
+      setCompactFields(Boolean(windowTokens), windowTokens, pct);
+    }
+    function providerCompactText(provider) {
+      if (!provider || !provider.compact_enabled) return '关闭';
+      const pct = provider.compact_threshold_percent || DEFAULT_COMPACT_PCT;
+      return `${provider.compact_window_tokens || ''} / ${pct}%`;
+    }
+    function applyCompactFromProvider(provider) {
+      if (!provider) return;
+      if (provider.compact_enabled) {
+        setCompactFields(true, provider.compact_window_tokens || DEFAULT_COMPACT_WINDOW, provider.compact_threshold_percent || DEFAULT_COMPACT_PCT);
+      } else {
+        setCompactFields(false, '', DEFAULT_COMPACT_PCT);
+      }
+    }
     function applyClaudeAccount(item) {
       if (!item) return;
       setSelectValue('account', item.account_id);
@@ -2697,7 +3242,9 @@ INDEX_HTML = """<!doctype html>
       }
       return data;
     }
-    function renderAccounts(accounts) {
+    function renderAccounts(data) {
+      const accounts = data.accounts || [];
+      const actualGlobalAccount = data.codex_desktop ? data.codex_desktop.account_id : '';
       lastAccounts = accounts;
       const sel = document.getElementById('account');
       const cliSel = document.getElementById('cliAccount');
@@ -2707,7 +3254,7 @@ INDEX_HTML = """<!doctype html>
       const previous = {
         claude: simpleClaudeSel.value || sel.value,
         cli: simpleCliSel.value || cliSel.value,
-        global: simpleDefaultSel.value
+        global: actualGlobalAccount || simpleDefaultSel.value
       };
       sel.innerHTML = '';
       cliSel.innerHTML = '';
@@ -2765,6 +3312,7 @@ INDEX_HTML = """<!doctype html>
         const item = accounts[simpleCliSel.selectedIndex];
         if (!item) return;
         applyCliAccount(item);
+        if (lastData) renderSimpleActuals(lastData);
         setSimpleResult(`单独 Codex CLI 已选择 ${accountLabel(item)}。`);
       };
       simpleDefaultSel.onchange = () => {
@@ -2801,6 +3349,7 @@ INDEX_HTML = """<!doctype html>
           <td>${p.is_current ? '<span class="ok">当前</span>' : '<span class="muted">未选</span>'} ${currentBySettings ? '<span class="ok">设置同步</span>' : ''}</td>
           <td class="mono">${esc(maskId(p.account_id || ''))}</td>
           <td class="mono">${esc(p.base_url || '')}</td>
+          <td class="mono">${esc(providerCompactText(p))}</td>
           <td class="mono">${esc(tokenText(p))}</td>
         `;
         body.appendChild(tr);
@@ -2944,21 +3493,26 @@ INDEX_HTML = """<!doctype html>
       box.className = `recommend ${state}`;
       box.innerHTML = `<b>自动检测意见</b><br>${advice.map((item) => `- ${esc(item)}`).join('<br>')}`;
     }
-    async function refreshData() {
+    async function refreshData(showFeedback=false) {
+      if (showFeedback) {
+        const result = document.getElementById('simpleResult');
+        if (result) result.dataset.touched = '1';
+        setSimpleResult('正在刷新状态...');
+      }
       const data = await api(tokenVisible ? '/api/data?include_secrets=1' : '/api/data');
       lastData = data;
       const mismatches = data.codex_providers.filter((p) => p.token_mismatch).length;
       document.getElementById('status').innerHTML = `版本: <b>${esc(data.version || '')}</b> | 账号: <b>${data.accounts.length}</b> | Claude providers: <b>${data.providers.length}</b> | Codex mismatches: <b class="${mismatches ? 'bad' : 'ok'}">${mismatches}</b>`;
       document.getElementById('paths').textContent = `db: ${humanPath(data.paths.db)}\\nsettings: ${humanPath(data.paths.settings)}\\nauth_store: ${humanPath(data.paths.auth_store)}`;
       renderHealth(data);
-      renderAccounts(data.accounts);
+      renderAccounts(data);
       renderAccountMatrix(data);
       renderProviders(data);
       renderCodexProviders(data);
       renderCliHomes(data);
       renderDiagnosis(data);
-      renderActualClaude(data);
       renderActualCurrentAccounts(data);
+      renderSimpleActuals(data);
       renderAutoSwitchConfig(data);
       refreshServices().catch((e) => {
         const box = document.getElementById('serviceStatus');
@@ -2971,7 +3525,9 @@ INDEX_HTML = """<!doctype html>
       if (data.accounts.length > 0 && !document.getElementById('simpleResult').dataset.touched) {
         setSimpleResult('已准备好。Claude Code、单独 Codex CLI、全局 Codex CLI 可以分别选不同账号。');
       }
-      log('数据已刷新');
+      const refreshedAt = new Date().toLocaleTimeString();
+      if (showFeedback) setSimpleResult(`已刷新：${refreshedAt}`, 'ok');
+      log(`数据已刷新: ${refreshedAt}`);
     }
     async function createProvider() {
       const accountId = document.getElementById('account').value;
@@ -2981,7 +3537,12 @@ INDEX_HTML = """<!doctype html>
         log('请选择账号并填写 provider 名称');
         return;
       }
-      const res = await api('/api/create-provider', 'POST', { account_id: accountId, provider_name: providerName, set_current: setCurrent });
+      const res = await api('/api/create-provider', 'POST', {
+        account_id: accountId,
+        provider_name: providerName,
+        set_current: setCurrent,
+        compact_config: compactConfigPayload()
+      });
       log(`${res.message}: ${res.provider_name} (${res.provider_id})`);
       await refreshData();
       return res;
@@ -3052,6 +3613,34 @@ INDEX_HTML = """<!doctype html>
       log(`${res.message}: ${id}`);
       await refreshData();
     }
+    async function saveCompactSelected() {
+      const id = selectedProviderId();
+      if (!id) return log('请先选中一个 provider');
+      const res = await api('/api/provider-compact', 'POST', { provider_id: id, compact_config: compactConfigPayload() });
+      log(`${res.message}: ${providerCompactText({ compact_enabled: res.compact_config.enabled, compact_window_tokens: res.compact_config.window_tokens, compact_threshold_percent: res.compact_config.threshold_percent })}`);
+      await refreshData();
+    }
+    async function syncCommonEnvSelected() {
+      const id = selectedProviderId();
+      if (!id) return log('请先选中一个 provider');
+      const res = await api('/api/sync-common-env', 'POST', { provider_id: id });
+      log(`${res.message}: 更新 ${res.updated.length} 个，跳过 ${res.skipped.length} 个；keys: ${res.env_keys.join(', ')}`);
+      await refreshData();
+    }
+    function dedupePlanText(plan) {
+      if (!plan || !plan.length) return '没有重复 Local Bridge provider';
+      return plan.map((item) => {
+        const deleted = item.delete.map((p) => p.name).join(', ');
+        const switchText = item.switch_current_to ? '，会切换当前项' : '';
+        return `${item.keep.name} 保留；删除 ${deleted}${switchText}`;
+      }).join(' | ');
+    }
+    async function dedupeBridgeProviders(apply=false) {
+      if (apply && !confirm('只会删除同账号重复的 Local Bridge provider，并先备份。继续？')) return;
+      const res = await api('/api/dedupe-bridge-providers', 'POST', { apply });
+      log(apply ? `${res.message}: 删除 ${res.deleted.length} 个；${dedupePlanText(res.plan)}` : dedupePlanText(res.plan));
+      await refreshData();
+    }
     async function repairPlusPro() {
       const res = await api('/api/repair-plus-pro', 'POST', {});
       log(`${res.message}: ${JSON.stringify(res.patched)}`);
@@ -3064,7 +3653,7 @@ INDEX_HTML = """<!doctype html>
         const action = button.dataset.action;
         const run = async () => {
           if (action === 'scroll') return scrollToSection(button.dataset.target || '');
-          if (action === 'refresh') return refreshData();
+          if (action === 'refresh') return refreshData(true);
           if (action === 'create-provider') return createProvider();
           if (action === 'create-cli-home') return createCliHome();
           if (action === 'simple-claude') return simpleClaude();
@@ -3075,9 +3664,16 @@ INDEX_HTML = """<!doctype html>
           if (action === 'set-current-selected') return setCurrentFromSelected();
           if (action === 'patch-selected') return patchSelected();
           if (action === 'repair-plus-pro') return repairPlusPro();
+          if (action === 'compact-preset-220k') return applyCompactPreset(DEFAULT_COMPACT_WINDOW);
+          if (action === 'compact-preset-1m') return applyCompactPreset('1000000');
+          if (action === 'compact-off') return applyCompactPreset('');
+          if (action === 'save-compact-selected') return saveCompactSelected();
+          if (action === 'sync-common-env-selected') return syncCommonEnvSelected();
           if (action === 'save-auto-switch') return saveAutoSwitch();
           if (action === 'run-auto-switch') return runAutoSwitch(true, true);
           if (action === 'create-missing-bridges') return createMissingBridges();
+          if (action === 'preview-bridge-dedupe') return dedupeBridgeProviders(false);
+          if (action === 'apply-bridge-dedupe') return dedupeBridgeProviders(true);
           if (action === 'refresh-services') return refreshServices();
           if (action === 'repair-quota-query') return repairQuotaQuery();
           if (action === 'start-local-bridge') return controlLocalBridge('start');
@@ -3085,7 +3681,26 @@ INDEX_HTML = """<!doctype html>
           if (action === 'restart-local-bridge') return controlLocalBridge('restart');
           if (action === 'select-cli-account') return selectCliAccount(button.dataset.accountId || '');
         };
-        Promise.resolve(run()).catch((e) => log(`操作失败: ${e.message}`));
+        const originalText = button.textContent;
+        const shouldShowBusy = action === 'refresh';
+        if (shouldShowBusy) {
+          button.disabled = true;
+          button.textContent = '刷新中...';
+        }
+        Promise.resolve(run())
+          .catch((e) => log(`操作失败: ${e.message}`))
+          .finally(() => {
+            if (shouldShowBusy) {
+              button.disabled = false;
+              button.textContent = originalText;
+            }
+          });
+      });
+      document.addEventListener('change', (event) => {
+        const target = event.target;
+        if (target && target.matches && target.matches('input[name="providerPick"]')) {
+          applyCompactFromProvider(selectedProvider());
+        }
       });
     }
     bindActions();
@@ -3261,12 +3876,28 @@ def build_handler(
                     account_id = str(payload.get("account_id") or "")
                     provider_name = str(payload.get("provider_name") or "")
                     set_current = bool(payload.get("set_current", True))
-                    result = manager.create_or_update_provider(account_id, provider_name, set_current)
+                    compact_config = payload.get("compact_config") if isinstance(payload.get("compact_config"), dict) else None
+                    result = manager.create_or_update_provider(account_id, provider_name, set_current, compact_config=compact_config)
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/patch-provider":
                     provider_id = str(payload.get("provider_id") or "")
                     result = manager.patch_provider(provider_id)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/provider-compact":
+                    provider_id = str(payload.get("provider_id") or "")
+                    compact_config = payload.get("compact_config") if isinstance(payload.get("compact_config"), dict) else {}
+                    result = manager.update_provider_compact(provider_id, compact_config)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/sync-common-env":
+                    provider_id = str(payload.get("provider_id") or "")
+                    result = manager.sync_common_env_to_bridge_providers(provider_id)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/dedupe-bridge-providers":
+                    result = manager.dedupe_bridge_providers(apply=bool(payload.get("apply", False)))
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/repair-plus-pro":
