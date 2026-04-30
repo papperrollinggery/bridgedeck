@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.10
+
+- Added Local Codex Bridge stream completion diagnostics for completed, client-disconnected, and upstream-error streams.
+
 ## 0.2.9
 
 - Stopped mutating streaming Responses SSE in the local bridge.

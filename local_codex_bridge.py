@@ -110,6 +110,28 @@ def log_upstream_result(
     print(summary, file=sys.stderr)
 
 
+def log_stream_result(
+    account_id: str,
+    *,
+    model: str | None,
+    effort: str | None,
+    status: str,
+    bytes_sent: int,
+    chunks_sent: int,
+    started_at: float,
+    detail: str | None = None,
+) -> None:
+    duration_ms = int((time.monotonic() - started_at) * 1000)
+    summary = (
+        f"[bridge-stream] account_id={account_id} model={model or 'unknown'} "
+        f"effort={effort or 'unknown'} status={status} bytes={bytes_sent} "
+        f"chunks={chunks_sent} duration_ms={duration_ms}"
+    )
+    if detail:
+        summary += f" detail={truncate_log_text(detail)}"
+    print(summary, file=sys.stderr)
+
+
 def summarize_request_shape(body: dict[str, Any]) -> dict[str, Any]:
     shape: dict[str, Any] = {"keys": sorted(body.keys())}
 
@@ -673,9 +695,33 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     if error_body is not None:
                         self._write_bytes(error_body, flush=True)
                         return
-                    for chunk in response.iter_bytes():
-                        if chunk:
-                            self._write_bytes(chunk, flush=True)
+                    stream_started_at = time.monotonic()
+                    bytes_sent = 0
+                    chunks_sent = 0
+                    stream_status = "completed"
+                    stream_detail: str | None = None
+                    try:
+                        for chunk in response.iter_bytes():
+                            if not chunk:
+                                continue
+                            bytes_sent += len(chunk)
+                            chunks_sent += 1
+                            if not self._write_bytes(chunk, flush=True):
+                                stream_status = "client_disconnected"
+                                break
+                    except Exception as exc:  # noqa: BLE001
+                        stream_status = "upstream_error"
+                        stream_detail = f"{type(exc).__name__}: {exc}"
+                    log_stream_result(
+                        account_id,
+                        model=requested_model,
+                        effort=requested_effort,
+                        status=stream_status,
+                        bytes_sent=bytes_sent,
+                        chunks_sent=chunks_sent,
+                        started_at=stream_started_at,
+                        detail=stream_detail,
+                    )
                 else:
                     body = error_body if error_body is not None else response.read()
                     if response.is_success:
@@ -703,13 +749,14 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self._write_bytes(payload)
 
-    def _write_bytes(self, payload: bytes, *, flush: bool = False) -> None:
+    def _write_bytes(self, payload: bytes, *, flush: bool = False) -> bool:
         try:
             self.wfile.write(payload)
             if flush:
                 self.wfile.flush()
+            return True
         except (BrokenPipeError, ConnectionResetError):
-            return
+            return False
 
 
 class CodexBridgeServer(ThreadingHTTPServer):
