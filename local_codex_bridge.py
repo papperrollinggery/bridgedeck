@@ -169,42 +169,12 @@ def summarize_request_shape(body: dict[str, Any]) -> dict[str, Any]:
     return shape
 
 
-def reasoning_has_visible_summary(item: dict[str, Any]) -> bool:
-    summary = item.get("summary")
-    if not isinstance(summary, list):
-        return False
-    for entry in summary:
-        if isinstance(entry, dict):
-            text = entry.get("text")
-            if isinstance(text, str) and text.strip():
-                return True
-    return False
-
-
 def extract_reasoning_effort(payload: dict[str, Any]) -> str | None:
     reasoning = payload.get("reasoning")
     if not isinstance(reasoning, dict):
         return None
     effort = reasoning.get("effort")
     return effort if isinstance(effort, str) and effort else None
-
-
-def build_visible_model_hint(
-    actual_model: str | None,
-    requested_model: str | None,
-    actual_effort: str | None,
-    requested_effort: str | None,
-) -> str:
-    model = actual_model or requested_model
-    effort = actual_effort or requested_effort
-    parts = []
-    if model:
-        parts.append(f"当前模型：{model}")
-    if effort:
-        parts.append(f"思考等级：{effort}")
-    if not parts:
-        parts.append("当前模型：unknown")
-    return f"【{'｜'.join(parts)}】\n"
 
 
 def lookup_bridge_provider_names(account_id: str | None) -> list[str]:
@@ -696,12 +666,14 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         if isinstance(normalized_body.get("model"), str)
                         else None
                     )
-                    for chunk in self._iter_stream_with_reasoning_placeholder(
-                        response,
-                        account_id,
-                        requested_effort=requested_effort,
-                        requested_model=requested_model,
-                    ):
+                    print(
+                        f"[bridge-model] account_id={account_id} model={requested_model or 'unknown'} effort={requested_effort or 'unknown'}",
+                        file=sys.stderr,
+                    )
+                    if error_body is not None:
+                        self._write_bytes(error_body, flush=True)
+                        return
+                    for chunk in response.iter_bytes():
                         if chunk:
                             self._write_bytes(chunk, flush=True)
                 else:
@@ -718,114 +690,6 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             self._write_json_error(exc.response.status_code, exc.response.text)
         except Exception as exc:  # noqa: BLE001
             self._write_json_error(500, f"{type(exc).__name__}: {exc}")
-
-    def _iter_stream_with_reasoning_placeholder(
-        self,
-        response: httpx.Response,
-        account_id: str,
-        *,
-        requested_effort: str | None = None,
-        requested_model: str | None = None,
-    ):
-        block_lines: list[str] = []
-        hint_emitted = False
-        for raw_line in response.iter_lines():
-            if isinstance(raw_line, bytes):
-                line = raw_line.decode("utf-8", "replace")
-            else:
-                line = raw_line
-            if line == "":
-                if block_lines:
-                    for chunk, emitted in self._emit_sse_block_with_reasoning_placeholder(
-                        block_lines,
-                        account_id,
-                        hint_emitted=hint_emitted,
-                        requested_effort=requested_effort,
-                        requested_model=requested_model,
-                    ):
-                        hint_emitted = hint_emitted or emitted
-                        yield chunk
-                    block_lines = []
-                continue
-            block_lines.append(line)
-        if block_lines:
-            for chunk, emitted in self._emit_sse_block_with_reasoning_placeholder(
-                block_lines,
-                account_id,
-                hint_emitted=hint_emitted,
-                requested_effort=requested_effort,
-                requested_model=requested_model,
-            ):
-                hint_emitted = hint_emitted or emitted
-                yield chunk
-
-    def _emit_sse_block_with_reasoning_placeholder(
-        self,
-        block_lines: list[str],
-        account_id: str,
-        *,
-        hint_emitted: bool = False,
-        requested_effort: str | None = None,
-        requested_model: str | None = None,
-    ):
-        raw_block = "\n".join(block_lines) + "\n\n"
-        yield raw_block.encode("utf-8"), False
-
-        event_name: str | None = None
-        data_lines: list[str] = []
-        for line in block_lines:
-            if line.startswith("event:"):
-                event_name = line[len("event:") :].strip()
-            elif line.startswith("data:"):
-                data_lines.append(line[len("data:") :].lstrip())
-
-        payload: dict[str, Any] | None = None
-        payload_text = "\n".join(data_lines).strip() if data_lines else ""
-        if payload_text and payload_text != "[DONE]":
-            try:
-                decoded = json.loads(payload_text)
-                if isinstance(decoded, dict):
-                    payload = decoded
-            except Exception:
-                payload = None
-
-        if event_name != "response.output_item.added" or not data_lines:
-            return
-
-        if payload is None:
-            return
-
-        item = payload.get("item")
-        if not isinstance(item, dict):
-            return
-        if item.get("type") != "reasoning":
-            return
-        if reasoning_has_visible_summary(item):
-            return
-        if hint_emitted:
-            return
-
-        placeholder: dict[str, Any] = {
-            "type": "response.output_text.delta",
-            "delta": build_visible_model_hint(None, requested_model, None, requested_effort),
-        }
-        item_id = item.get("id") or payload.get("item_id")
-        if isinstance(item_id, str) and item_id:
-            placeholder["item_id"] = item_id
-        output_index = payload.get("output_index")
-        if isinstance(output_index, int):
-            placeholder["output_index"] = output_index
-            placeholder["content_index"] = 0
-
-        print(
-            f"[bridge-thinking-visible] account_id={account_id} item_id={item_id or 'unknown'} source=reasoning_item effort={requested_effort or 'unknown'}",
-            file=sys.stderr,
-        )
-        sse = (
-            "event: response.output_text.delta\n"
-            f"data: {json.dumps(placeholder, ensure_ascii=False)}\n\n"
-        )
-        yield sse.encode("utf-8"), True
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write(f"[codex-bridge] {self.address_string()} - {fmt % args}\n")

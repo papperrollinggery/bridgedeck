@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.9
+
+- Stopped mutating streaming Responses SSE in the local bridge.
+- Logged the selected model and reasoning effort server-side only.
+- Fixed Claude Code GPT streams stopping early after the bridge inserted visible model hints.
+
 ## 0.2.8
 
 - Bundled the managed Local Codex Bridge script with BridgeDeck.
