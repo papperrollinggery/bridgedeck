@@ -36,7 +36,7 @@ DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.8"
+APP_VERSION = "0.2.12"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -224,6 +224,35 @@ def find_local_bridge_script(processes: list[dict[str, Any]] | None = None) -> P
     for path in candidates:
         if path.exists():
             return path
+    return None
+
+
+def python_supports_local_bridge(python_bin: str) -> bool:
+    proc = run_quiet([python_bin, "-c", "import httpx"], timeout=2)
+    return bool(proc and proc.returncode == 0)
+
+
+def find_local_bridge_python() -> str | None:
+    env_path = os.environ.get("BRIDGEDECK_BRIDGE_PYTHON", "").strip()
+    candidates = [
+        Path(env_path).expanduser() if env_path else None,
+        Path.home() / ".cc-switch/bridgedeck-bridge-venv/bin/python",
+        Path("/opt/homebrew/bin/python3"),
+        Path("/usr/local/bin/python3"),
+        Path(which("python3")).expanduser() if which("python3") else None,
+        Path(sys.executable).expanduser() if sys.executable else None,
+        Path("/usr/bin/python3"),
+    ]
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        python_bin = str(candidate)
+        if python_bin in seen or not candidate.exists():
+            continue
+        seen.add(python_bin)
+        if python_supports_local_bridge(python_bin):
+            return python_bin
     return None
 
 
@@ -662,7 +691,13 @@ class BridgeManager:
 
         log_path = self.paths.db.parent / "bridgedeck-local-bridge.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        python_bin = which("python3") or sys.executable or "/usr/bin/python3"
+        python_bin = find_local_bridge_python()
+        if not python_bin:
+            return {
+                **self.services(),
+                "ok": False,
+                "error": "未找到可运行 Local Codex Bridge 的 Python（缺少 httpx）",
+            }
         with log_path.open("ab") as log:
             subprocess.Popen(
                 [python_bin, str(script)],

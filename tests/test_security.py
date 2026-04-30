@@ -552,6 +552,28 @@ class LauncherCase(unittest.TestCase):
             self.assertIn('base_url="http://127.0.0.1:8876/accounts/acct-1/v1"', body)
             self.assertNotIn("secret-refresh-token", body)
 
+    def test_find_local_bridge_python_prefers_managed_venv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            python_bin = root / ".cc-switch" / "bridgedeck-bridge-venv" / "bin" / "python"
+            python_bin.parent.mkdir(parents=True)
+            python_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(bridgedeck.Path, "home", return_value=root),
+                mock.patch.object(bridgedeck, "which", return_value="/missing/python3"),
+                mock.patch.object(bridgedeck.sys, "executable", str(root / "missing-executable")),
+                mock.patch.object(
+                    bridgedeck,
+                    "python_supports_local_bridge",
+                    side_effect=lambda value: value == str(python_bin),
+                ),
+                mock.patch.dict(bridgedeck.os.environ, {"BRIDGEDECK_BRIDGE_PYTHON": ""}),
+            ):
+                selected = bridgedeck.find_local_bridge_python()
+
+            self.assertEqual(selected, str(python_bin))
+
     def test_local_bridge_provider_payload_does_not_use_codex_oauth_transport(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manager = self.make_manager(Path(tmp))

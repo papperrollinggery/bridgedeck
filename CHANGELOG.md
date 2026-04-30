@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.12
+
+- Restored frequent encrypted reasoning placeholder deltas for Claude Code compatibility.
+- Added reasoning heartbeat deltas during long silent reasoning windows.
+- Made Local Codex Bridge startup prefer a Python runtime that can import `httpx`.
+- Fixed the local LaunchAgent runtime path after Homebrew Python moved.
+
 ## 0.2.8
 
 - Bundled the managed Local Codex Bridge script with BridgeDeck.

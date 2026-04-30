@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import sqlite3
 import sys
@@ -27,6 +28,7 @@ DEFAULT_PORT = 8765
 TOKEN_REFRESH_BUFFER_SECS = 60
 ACCOUNT_ROUTE_RE = re.compile(r"^/accounts/([^/]+)(/.*)?$")
 UPSTREAM_PROXY_ENV = "CODEX_BRIDGE_UPSTREAM_PROXY"
+REASONING_PLACEHOLDER_HEARTBEAT_SECS = 8.0
 
 
 @dataclass
@@ -44,6 +46,17 @@ class CachedToken:
 
     def is_expiring_soon(self) -> bool:
         return (self.expires_at - time.time()) < TOKEN_REFRESH_BUFFER_SECS
+
+
+@dataclass
+class ReasoningPlaceholderState:
+    active: bool = False
+    completed: bool = False
+    saw_text_delta: bool = False
+    item_id: str | None = None
+    output_index: int | None = None
+    emitted_count: int = 0
+    last_emitted_at: float = 0.0
 
 
 def mask_proxy_url(proxy_url: str | None) -> str:
@@ -718,50 +731,79 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         requested_effort: str | None = None,
         requested_model: str | None = None,
     ):
-        block_lines: list[str] = []
-        hint_emitted = False
-        for raw_line in response.iter_lines():
-            if isinstance(raw_line, bytes):
-                line = raw_line.decode("utf-8", "replace")
-            else:
-                line = raw_line
-            if line == "":
+        block_queue: queue.Queue[list[str] | BaseException | object] = queue.Queue()
+        done_marker = object()
+
+        def read_blocks() -> None:
+            block_lines: list[str] = []
+            try:
+                for raw_line in response.iter_lines():
+                    if isinstance(raw_line, bytes):
+                        line = raw_line.decode("utf-8", "replace")
+                    else:
+                        line = raw_line
+                    if line == "":
+                        if block_lines:
+                            block_queue.put(block_lines)
+                            block_lines = []
+                        continue
+                    block_lines.append(line)
                 if block_lines:
-                    for chunk, emitted in self._emit_sse_block_with_reasoning_placeholder(
-                        block_lines,
-                        account_id,
-                        hint_emitted=hint_emitted,
-                        requested_effort=requested_effort,
-                        requested_model=requested_model,
-                    ):
-                        hint_emitted = hint_emitted or emitted
-                        yield chunk
-                    block_lines = []
+                    block_queue.put(block_lines)
+            except BaseException as exc:  # noqa: BLE001
+                block_queue.put(exc)
+            finally:
+                block_queue.put(done_marker)
+
+        reader = threading.Thread(target=read_blocks, daemon=True)
+        reader.start()
+        state = ReasoningPlaceholderState()
+
+        while True:
+            timeout = self._reasoning_placeholder_timeout(state)
+            try:
+                if timeout is None:
+                    queued = block_queue.get()
+                else:
+                    queued = block_queue.get(timeout=timeout)
+            except queue.Empty:
+                heartbeat = self._build_reasoning_placeholder_sse(
+                    account_id,
+                    state,
+                    requested_effort=requested_effort,
+                    requested_model=requested_model,
+                    source="heartbeat",
+                )
+                if heartbeat:
+                    yield heartbeat
                 continue
-            block_lines.append(line)
-        if block_lines:
-            for chunk, emitted in self._emit_sse_block_with_reasoning_placeholder(
-                block_lines,
+
+            if queued is done_marker:
+                break
+            if isinstance(queued, BaseException):
+                raise queued
+
+            for chunk in self._emit_sse_block_with_reasoning_placeholder(
+                queued,
                 account_id,
-                hint_emitted=hint_emitted,
+                state=state,
                 requested_effort=requested_effort,
                 requested_model=requested_model,
             ):
-                hint_emitted = hint_emitted or emitted
                 yield chunk
 
-    def _emit_sse_block_with_reasoning_placeholder(
+        reader.join(timeout=0.1)
+
+    def _reasoning_placeholder_timeout(self, state: ReasoningPlaceholderState) -> float | None:
+        if state.completed or state.saw_text_delta or not state.active or state.emitted_count == 0:
+            return None
+        elapsed = time.monotonic() - state.last_emitted_at
+        return max(REASONING_PLACEHOLDER_HEARTBEAT_SECS - elapsed, 0.001)
+
+    def _parse_sse_block(
         self,
         block_lines: list[str],
-        account_id: str,
-        *,
-        hint_emitted: bool = False,
-        requested_effort: str | None = None,
-        requested_model: str | None = None,
-    ):
-        raw_block = "\n".join(block_lines) + "\n\n"
-        yield raw_block.encode("utf-8"), False
-
+    ) -> tuple[str | None, dict[str, Any] | None, list[str]]:
         event_name: str | None = None
         data_lines: list[str] = []
         for line in block_lines:
@@ -780,43 +822,136 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             except Exception:
                 payload = None
 
-        if event_name != "response.output_item.added" or not data_lines:
+        return event_name, payload, data_lines
+
+    def _block_has_reasoning_signal(
+        self,
+        event_name: str | None,
+        payload: dict[str, Any] | None,
+    ) -> bool:
+        if event_name and "reasoning" in event_name:
+            return True
+        if not isinstance(payload, dict):
+            return False
+        payload_type = payload.get("type")
+        if isinstance(payload_type, str) and "reasoning" in payload_type:
+            return True
+        item = payload.get("item")
+        return isinstance(item, dict) and item.get("type") == "reasoning"
+
+    def _update_reasoning_placeholder_state(
+        self,
+        state: ReasoningPlaceholderState,
+        event_name: str | None,
+        payload: dict[str, Any] | None,
+    ) -> None:
+        if event_name in {
+            "response.completed",
+            "response.failed",
+            "response.cancelled",
+            "response.incomplete",
+            "error",
+        }:
+            state.completed = True
+            state.active = False
             return
 
-        if payload is None:
+        if event_name == "response.output_text.delta":
+            state.saw_text_delta = True
+            state.active = False
+            return
+
+        if not isinstance(payload, dict):
             return
 
         item = payload.get("item")
-        if not isinstance(item, dict):
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            state.active = event_name != "response.output_item.done"
+            item_id = item.get("id") or payload.get("item_id")
+            if isinstance(item_id, str) and item_id:
+                state.item_id = item_id
+            output_index = payload.get("output_index")
+            if isinstance(output_index, int):
+                state.output_index = output_index
             return
-        if item.get("type") != "reasoning":
-            return
-        if reasoning_has_visible_summary(item):
-            return
-        if hint_emitted:
-            return
+
+        if self._block_has_reasoning_signal(event_name, payload):
+            state.active = True
+            item_id = payload.get("item_id")
+            if isinstance(item_id, str) and item_id:
+                state.item_id = item_id
+            output_index = payload.get("output_index")
+            if isinstance(output_index, int):
+                state.output_index = output_index
+
+    def _build_reasoning_placeholder_sse(
+        self,
+        account_id: str,
+        state: ReasoningPlaceholderState,
+        *,
+        requested_effort: str | None = None,
+        requested_model: str | None = None,
+        source: str,
+    ) -> bytes | None:
+        if state.completed or state.saw_text_delta:
+            return None
 
         placeholder: dict[str, Any] = {
             "type": "response.output_text.delta",
             "delta": build_visible_model_hint(None, requested_model, None, requested_effort),
         }
-        item_id = item.get("id") or payload.get("item_id")
-        if isinstance(item_id, str) and item_id:
-            placeholder["item_id"] = item_id
-        output_index = payload.get("output_index")
-        if isinstance(output_index, int):
-            placeholder["output_index"] = output_index
+        if state.item_id:
+            placeholder["item_id"] = state.item_id
+        if state.output_index is not None:
+            placeholder["output_index"] = state.output_index
             placeholder["content_index"] = 0
 
+        state.emitted_count += 1
+        state.last_emitted_at = time.monotonic()
         print(
-            f"[bridge-thinking-visible] account_id={account_id} item_id={item_id or 'unknown'} source=reasoning_item effort={requested_effort or 'unknown'}",
+            f"[bridge-thinking-visible] account_id={account_id} item_id={state.item_id or 'unknown'} source={source} effort={requested_effort or 'unknown'} count={state.emitted_count}",
             file=sys.stderr,
         )
         sse = (
             "event: response.output_text.delta\n"
             f"data: {json.dumps(placeholder, ensure_ascii=False)}\n\n"
         )
-        yield sse.encode("utf-8"), True
+        return sse.encode("utf-8")
+
+    def _emit_sse_block_with_reasoning_placeholder(
+        self,
+        block_lines: list[str],
+        account_id: str,
+        *,
+        state: ReasoningPlaceholderState,
+        requested_effort: str | None = None,
+        requested_model: str | None = None,
+    ):
+        raw_block = "\n".join(block_lines) + "\n\n"
+        yield raw_block.encode("utf-8")
+
+        event_name, payload, data_lines = self._parse_sse_block(block_lines)
+        self._update_reasoning_placeholder_state(state, event_name, payload)
+
+        if not data_lines or payload is None:
+            return
+
+        if not self._block_has_reasoning_signal(event_name, payload):
+            return
+
+        item = payload.get("item")
+        if isinstance(item, dict) and reasoning_has_visible_summary(item):
+            return
+
+        placeholder = self._build_reasoning_placeholder_sse(
+            account_id,
+            state,
+            requested_effort=requested_effort,
+            requested_model=requested_model,
+            source=event_name or "reasoning",
+        )
+        if placeholder:
+            yield placeholder
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write(f"[codex-bridge] {self.address_string()} - {fmt % args}\n")
