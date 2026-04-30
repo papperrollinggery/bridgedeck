@@ -46,19 +46,6 @@ class CachedToken:
         return (self.expires_at - time.time()) < TOKEN_REFRESH_BUFFER_SECS
 
 
-@dataclass
-class StreamDiagnostics:
-    buffer: str = ""
-    event_count: int = 0
-    output_delta_events: int = 0
-    reasoning_items: int = 0
-    last_event: str | None = None
-    terminal_event: str | None = None
-    response_id: str | None = None
-    response_status: str | None = None
-    error_detail: str | None = None
-
-
 def mask_proxy_url(proxy_url: str | None) -> str:
     if not proxy_url:
         return "direct"
@@ -123,88 +110,6 @@ def log_upstream_result(
     print(summary, file=sys.stderr)
 
 
-def log_stream_result(
-    account_id: str,
-    *,
-    model: str | None,
-    effort: str | None,
-    status: str,
-    bytes_sent: int,
-    chunks_sent: int,
-    started_at: float,
-    diagnostics: StreamDiagnostics,
-    detail: str | None = None,
-) -> None:
-    duration_ms = int((time.monotonic() - started_at) * 1000)
-    summary = (
-        f"[bridge-stream] account_id={account_id} model={model or 'unknown'} "
-        f"effort={effort or 'unknown'} status={status} bytes={bytes_sent} "
-        f"chunks={chunks_sent} duration_ms={duration_ms} events={diagnostics.event_count} "
-        f"deltas={diagnostics.output_delta_events} reasoning_items={diagnostics.reasoning_items} "
-        f"last_event={diagnostics.last_event or 'none'} "
-        f"terminal_event={diagnostics.terminal_event or 'none'} "
-        f"response_status={diagnostics.response_status or 'unknown'}"
-    )
-    if diagnostics.response_id:
-        summary += f" response_id={diagnostics.response_id}"
-    if diagnostics.error_detail:
-        summary += f" api_error={truncate_log_text(diagnostics.error_detail)}"
-    if detail:
-        summary += f" detail={truncate_log_text(detail)}"
-    print(summary, file=sys.stderr)
-
-
-def observe_sse_chunk(diagnostics: StreamDiagnostics, chunk: bytes) -> None:
-    diagnostics.buffer += chunk.decode("utf-8", "replace").replace("\r\n", "\n")
-    while "\n\n" in diagnostics.buffer:
-        raw_block, diagnostics.buffer = diagnostics.buffer.split("\n\n", 1)
-        observe_sse_block(diagnostics, raw_block)
-
-
-def observe_sse_block(diagnostics: StreamDiagnostics, raw_block: str) -> None:
-    event_name: str | None = None
-    data_lines: list[str] = []
-    for line in raw_block.splitlines():
-        if line.startswith("event:"):
-            event_name = line[len("event:") :].strip()
-        elif line.startswith("data:"):
-            data_lines.append(line[len("data:") :].lstrip())
-
-    if event_name:
-        diagnostics.event_count += 1
-        diagnostics.last_event = event_name
-        if event_name == "response.output_text.delta":
-            diagnostics.output_delta_events += 1
-        elif event_name in {"response.completed", "response.failed", "response.incomplete"}:
-            diagnostics.terminal_event = event_name
-
-    payload_text = "\n".join(data_lines).strip()
-    if not payload_text or payload_text == "[DONE]":
-        return
-    try:
-        decoded = json.loads(payload_text)
-    except Exception:  # noqa: BLE001
-        return
-    if not isinstance(decoded, dict):
-        return
-
-    response = decoded.get("response")
-    if isinstance(response, dict):
-        response_id = response.get("id")
-        if isinstance(response_id, str):
-            diagnostics.response_id = response_id
-        response_status = response.get("status")
-        if isinstance(response_status, str):
-            diagnostics.response_status = response_status
-        error = response.get("error")
-        if error:
-            diagnostics.error_detail = json.dumps(error, ensure_ascii=False)
-
-    item = decoded.get("item")
-    if isinstance(item, dict) and item.get("type") == "reasoning":
-        diagnostics.reasoning_items += 1
-
-
 def summarize_request_shape(body: dict[str, Any]) -> dict[str, Any]:
     shape: dict[str, Any] = {"keys": sorted(body.keys())}
 
@@ -264,12 +169,33 @@ def summarize_request_shape(body: dict[str, Any]) -> dict[str, Any]:
     return shape
 
 
+def reasoning_has_visible_summary(item: dict[str, Any]) -> bool:
+    summary = item.get("summary")
+    if not isinstance(summary, list):
+        return False
+    for entry in summary:
+        if isinstance(entry, dict):
+            text = entry.get("text")
+            if isinstance(text, str) and text.strip():
+                return True
+    return False
+
+
 def extract_reasoning_effort(payload: dict[str, Any]) -> str | None:
     reasoning = payload.get("reasoning")
     if not isinstance(reasoning, dict):
         return None
     effort = reasoning.get("effort")
     return effort if isinstance(effort, str) and effort else None
+
+
+def build_visible_model_hint(
+    actual_model: str | None,
+    requested_model: str | None,
+    actual_effort: str | None,
+    requested_effort: str | None,
+) -> str:
+    return "【思考等级：xhigh｜上游加密，无法展示明文】\n"
 
 
 def lookup_bridge_provider_names(account_id: str | None) -> list[str]:
@@ -761,52 +687,14 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         if isinstance(normalized_body.get("model"), str)
                         else None
                     )
-                    print(
-                        f"[bridge-model] account_id={account_id} model={requested_model or 'unknown'} effort={requested_effort or 'unknown'}",
-                        file=sys.stderr,
-                    )
-                    if error_body is not None:
-                        self._write_bytes(error_body, flush=True)
-                        return
-                    stream_started_at = time.monotonic()
-                    bytes_sent = 0
-                    chunks_sent = 0
-                    stream_status = "stream_open"
-                    stream_detail: str | None = None
-                    stream_diagnostics = StreamDiagnostics()
-                    try:
-                        for chunk in response.iter_bytes():
-                            if not chunk:
-                                continue
-                            bytes_sent += len(chunk)
-                            chunks_sent += 1
-                            observe_sse_chunk(stream_diagnostics, chunk)
-                            if not self._write_bytes(chunk, flush=True):
-                                stream_status = "client_disconnected"
-                                break
-                    except Exception as exc:  # noqa: BLE001
-                        stream_status = "upstream_error"
-                        stream_detail = f"{type(exc).__name__}: {exc}"
-                    if stream_status == "stream_open":
-                        if stream_diagnostics.terminal_event == "response.completed":
-                            stream_status = "api_completed"
-                        elif stream_diagnostics.terminal_event == "response.failed":
-                            stream_status = "api_failed"
-                        elif stream_diagnostics.terminal_event == "response.incomplete":
-                            stream_status = "api_incomplete"
-                        else:
-                            stream_status = "stream_closed_without_terminal"
-                    log_stream_result(
+                    for chunk in self._iter_stream_with_reasoning_placeholder(
+                        response,
                         account_id,
-                        model=requested_model,
-                        effort=requested_effort,
-                        status=stream_status,
-                        bytes_sent=bytes_sent,
-                        chunks_sent=chunks_sent,
-                        started_at=stream_started_at,
-                        diagnostics=stream_diagnostics,
-                        detail=stream_detail,
-                    )
+                        requested_effort=requested_effort,
+                        requested_model=requested_model,
+                    ):
+                        if chunk:
+                            self._write_bytes(chunk, flush=True)
                 else:
                     body = error_body if error_body is not None else response.read()
                     if response.is_success:
@@ -822,6 +710,114 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self._write_json_error(500, f"{type(exc).__name__}: {exc}")
 
+    def _iter_stream_with_reasoning_placeholder(
+        self,
+        response: httpx.Response,
+        account_id: str,
+        *,
+        requested_effort: str | None = None,
+        requested_model: str | None = None,
+    ):
+        block_lines: list[str] = []
+        hint_emitted = False
+        for raw_line in response.iter_lines():
+            if isinstance(raw_line, bytes):
+                line = raw_line.decode("utf-8", "replace")
+            else:
+                line = raw_line
+            if line == "":
+                if block_lines:
+                    for chunk, emitted in self._emit_sse_block_with_reasoning_placeholder(
+                        block_lines,
+                        account_id,
+                        hint_emitted=hint_emitted,
+                        requested_effort=requested_effort,
+                        requested_model=requested_model,
+                    ):
+                        hint_emitted = hint_emitted or emitted
+                        yield chunk
+                    block_lines = []
+                continue
+            block_lines.append(line)
+        if block_lines:
+            for chunk, emitted in self._emit_sse_block_with_reasoning_placeholder(
+                block_lines,
+                account_id,
+                hint_emitted=hint_emitted,
+                requested_effort=requested_effort,
+                requested_model=requested_model,
+            ):
+                hint_emitted = hint_emitted or emitted
+                yield chunk
+
+    def _emit_sse_block_with_reasoning_placeholder(
+        self,
+        block_lines: list[str],
+        account_id: str,
+        *,
+        hint_emitted: bool = False,
+        requested_effort: str | None = None,
+        requested_model: str | None = None,
+    ):
+        raw_block = "\n".join(block_lines) + "\n\n"
+        yield raw_block.encode("utf-8"), False
+
+        event_name: str | None = None
+        data_lines: list[str] = []
+        for line in block_lines:
+            if line.startswith("event:"):
+                event_name = line[len("event:") :].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:") :].lstrip())
+
+        payload: dict[str, Any] | None = None
+        payload_text = "\n".join(data_lines).strip() if data_lines else ""
+        if payload_text and payload_text != "[DONE]":
+            try:
+                decoded = json.loads(payload_text)
+                if isinstance(decoded, dict):
+                    payload = decoded
+            except Exception:
+                payload = None
+
+        if event_name != "response.output_item.added" or not data_lines:
+            return
+
+        if payload is None:
+            return
+
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            return
+        if item.get("type") != "reasoning":
+            return
+        if reasoning_has_visible_summary(item):
+            return
+        if hint_emitted:
+            return
+
+        placeholder: dict[str, Any] = {
+            "type": "response.output_text.delta",
+            "delta": build_visible_model_hint(None, requested_model, None, requested_effort),
+        }
+        item_id = item.get("id") or payload.get("item_id")
+        if isinstance(item_id, str) and item_id:
+            placeholder["item_id"] = item_id
+        output_index = payload.get("output_index")
+        if isinstance(output_index, int):
+            placeholder["output_index"] = output_index
+            placeholder["content_index"] = 0
+
+        print(
+            f"[bridge-thinking-visible] account_id={account_id} item_id={item_id or 'unknown'} source=reasoning_item effort={requested_effort or 'unknown'}",
+            file=sys.stderr,
+        )
+        sse = (
+            "event: response.output_text.delta\n"
+            f"data: {json.dumps(placeholder, ensure_ascii=False)}\n\n"
+        )
+        yield sse.encode("utf-8"), True
+
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write(f"[codex-bridge] {self.address_string()} - {fmt % args}\n")
 
@@ -834,14 +830,13 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self._write_bytes(payload)
 
-    def _write_bytes(self, payload: bytes, *, flush: bool = False) -> bool:
+    def _write_bytes(self, payload: bytes, *, flush: bool = False) -> None:
         try:
             self.wfile.write(payload)
             if flush:
                 self.wfile.flush()
-            return True
         except (BrokenPipeError, ConnectionResetError):
-            return False
+            return
 
 
 class CodexBridgeServer(ThreadingHTTPServer):

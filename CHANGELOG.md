@@ -1,20 +1,5 @@
 # Changelog
 
-## 0.2.11
-
-- Distinguished transport stream closure from actual Responses API terminal events.
-- Logged SSE terminal event, last event, response status, delta count, and reasoning item count for Claude Code GPT streams.
-
-## 0.2.10
-
-- Added Local Codex Bridge stream completion diagnostics for completed, client-disconnected, and upstream-error streams.
-
-## 0.2.9
-
-- Stopped mutating streaming Responses SSE in the local bridge.
-- Logged the selected model and reasoning effort server-side only.
-- Fixed Claude Code GPT streams stopping early after the bridge inserted visible model hints.
-
 ## 0.2.8
 
 - Bundled the managed Local Codex Bridge script with BridgeDeck.
