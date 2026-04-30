@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.13
+
+- Fixed the macOS launcher so clicking BridgeDeck in the Dock reopens the browser page while keeping the web server in the background.
+
 ## 0.2.12
 
 - Restored frequent encrypted reasoning placeholder deltas for Claude Code compatibility.

@@ -66,12 +66,22 @@ cat > "$MACOS/launcher" <<'LAUNCHER'
 #!/bin/zsh
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESOURCE_DIR="$SCRIPT_DIR/../Resources"
+LOG_DIR="$HOME/Library/Logs"
+LOG_FILE="$LOG_DIR/bridgedeck-app.log"
 if /usr/bin/curl -fsS -H "X-CCSBT-Token: probe" "http://127.0.0.1:8899/" >/dev/null 2>&1; then
   open "http://127.0.0.1:8899"
   exit 0
 fi
-(sleep 1; open "http://127.0.0.1:8899") &
-exec /usr/bin/python3 "$RESOURCE_DIR/bridgedeck.py" --host 127.0.0.1 --port 8899
+mkdir -p "$LOG_DIR"
+/usr/bin/nohup /usr/bin/python3 "$RESOURCE_DIR/bridgedeck.py" --host 127.0.0.1 --port 8899 >> "$LOG_FILE" 2>&1 &
+for _ in {1..20}; do
+  if /usr/bin/curl -fsS -H "X-CCSBT-Token: probe" "http://127.0.0.1:8899/" >/dev/null 2>&1; then
+    open "http://127.0.0.1:8899"
+    exit 0
+  fi
+  sleep 0.2
+done
+open "http://127.0.0.1:8899"
 LAUNCHER
 chmod +x "$MACOS/launcher"
 
