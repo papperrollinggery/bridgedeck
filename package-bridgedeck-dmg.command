@@ -28,6 +28,7 @@ rm -rf "$APP_DIR" "$DMG"
 mkdir -p "$MACOS" "$RESOURCES"
 
 cp "$ROOT/bridgedeck.py" "$RESOURCES/bridgedeck.py"
+cp "$ROOT/local_codex_bridge.py" "$RESOURCES/local_codex_bridge.py"
 cp "$ROOT/README.md" "$RESOURCES/README.md"
 cp "$ROOT/SECURITY.md" "$RESOURCES/SECURITY.md"
 cp "$ROOT/CONTRIBUTING.md" "$RESOURCES/CONTRIBUTING.md"

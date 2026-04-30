@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.8
+
+- Bundled the managed Local Codex Bridge script with BridgeDeck.
+- Prefer the bundled bridge script for service start/restart.
+
 ## 0.2.7
 
 - Redacted service process details, local paths, and upstream proxy values in remote read-only mode.

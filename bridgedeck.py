@@ -36,7 +36,7 @@ DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.7"
+APP_VERSION = "0.2.8"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -216,6 +216,7 @@ def find_local_bridge_script(processes: list[dict[str, Any]] | None = None) -> P
         if path:
             return path
     candidates = [
+        Path(__file__).resolve().with_name("local_codex_bridge.py"),
         Path.home() / "Documents/Codex/2026-04-20-https-github-com-farion1231-cc-switch/local_codex_bridge.py",
         Path.home() / ".cc-switch/local_codex_bridge.py",
         Path.home() / "local_codex_bridge.py",
