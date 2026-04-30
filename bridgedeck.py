@@ -13,6 +13,8 @@ import re
 import secrets
 import socket
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -34,10 +36,12 @@ DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.5"
+APP_VERSION = "0.2.6"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
+LOCAL_BRIDGE_PORT = 8876
+COMMON_UPSTREAM_PROXY_PORTS = (1087, 7890, 6152, 8080)
 
 
 def now_ts() -> str:
@@ -139,6 +143,94 @@ def tcp_open(host: str, port: int, timeout: float = 0.25) -> bool:
             return True
     except OSError:
         return False
+
+
+def read_local_url(url: str, *, timeout: float, max_bytes: int) -> bytes:
+    request = urllib.request.Request(url, headers={"Connection": "close"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=timeout) as response:
+        return response.read(max_bytes)
+
+
+def run_quiet(args: list[str], *, timeout: float = 3) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(args, check=False, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+
+
+def pids_listening_on_port(port: int) -> list[int]:
+    proc = run_quiet(["/usr/sbin/lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"])
+    if not proc or proc.returncode not in (0, 1):
+        return []
+    pids: list[int] = []
+    for line in proc.stdout.splitlines():
+        try:
+            pids.append(int(line.strip()))
+        except ValueError:
+            continue
+    return sorted(set(pids))
+
+
+def process_command(pid: int) -> str:
+    proc = run_quiet(["/bin/ps", "-p", str(pid), "-o", "command="])
+    if not proc or proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def process_environment_text(pid: int) -> str:
+    proc = run_quiet(["/bin/ps", "eww", "-p", str(pid)])
+    if not proc or proc.returncode != 0:
+        return ""
+    return proc.stdout
+
+
+def find_bridge_script_from_command(command: str) -> Path | None:
+    for part in command.split():
+        if part.endswith("local_codex_bridge.py"):
+            path = Path(part)
+            if path.exists():
+                return path
+    return None
+
+
+def find_local_bridge_script(processes: list[dict[str, Any]] | None = None) -> Path | None:
+    env_path = os.environ.get("CODEX_BRIDGE_SCRIPT", "").strip()
+    if env_path and Path(env_path).expanduser().exists():
+        return Path(env_path).expanduser()
+    for proc in processes or []:
+        path = find_bridge_script_from_command(str(proc.get("command") or ""))
+        if path:
+            return path
+    candidates = [
+        Path.home() / "Documents/Codex/2026-04-20-https-github-com-farion1231-cc-switch/local_codex_bridge.py",
+        Path.home() / ".cc-switch/local_codex_bridge.py",
+        Path.home() / "local_codex_bridge.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def detect_upstream_proxy(processes: list[dict[str, Any]] | None = None) -> str:
+    value = os.environ.get("CODEX_BRIDGE_UPSTREAM_PROXY", "").strip()
+    if value:
+        return value
+    for proc in processes or []:
+        env_text = process_environment_text(int(proc.get("pid") or 0))
+        match = re.search(r"CODEX_BRIDGE_UPSTREAM_PROXY=([^ \n]+)", env_text)
+        if match:
+            return match.group(1)
+    for port in COMMON_UPSTREAM_PROXY_PORTS:
+        if tcp_open("127.0.0.1", port):
+            return f"http://127.0.0.1:{port}"
+    return ""
+
+
+def port_processes(port: int) -> list[dict[str, Any]]:
+    return [{"pid": pid, "command": process_command(pid)} for pid in pids_listening_on_port(port)]
 
 
 @dataclass
@@ -505,6 +597,138 @@ class BridgeManager:
             "codex_desktop": snapshot.get("codex_desktop", {}),
         }
 
+    def services(self, *, server_port: int = DEFAULT_PORT) -> dict[str, Any]:
+        bridge_processes = port_processes(LOCAL_BRIDGE_PORT)
+        bridge_script = find_local_bridge_script(bridge_processes)
+        upstream_proxy = detect_upstream_proxy(bridge_processes)
+        return {
+            "ok": True,
+            "services": {
+                "bridgedeck": {
+                    "name": "BridgeDeck",
+                    "running": tcp_open("127.0.0.1", server_port),
+                    "port": server_port,
+                },
+                "local_bridge": {
+                    "name": "Local Codex Bridge",
+                    "running": tcp_open("127.0.0.1", LOCAL_BRIDGE_PORT),
+                    "port": LOCAL_BRIDGE_PORT,
+                    "processes": bridge_processes,
+                    "script": str(bridge_script) if bridge_script else "",
+                    "can_start": bool(bridge_script),
+                    "upstream_proxy": upstream_proxy,
+                    "log_path": str(self.paths.db.parent / "bridgedeck-local-bridge.log"),
+                },
+                "cc_switch_proxy": {
+                    "name": "CC Switch Proxy",
+                    "running": tcp_open("127.0.0.1", 15721),
+                    "port": 15721,
+                    "processes": port_processes(15721),
+                },
+            },
+        }
+
+    def _start_local_bridge(self) -> dict[str, Any]:
+        if tcp_open("127.0.0.1", LOCAL_BRIDGE_PORT):
+            return {**self.services(), "ok": True, "message": "Local Codex Bridge 已在运行"}
+
+        bridge_processes = port_processes(LOCAL_BRIDGE_PORT)
+        script = find_local_bridge_script(bridge_processes)
+        if not script:
+            return {"ok": False, "error": "未找到 local_codex_bridge.py"}
+
+        env = os.environ.copy()
+        env["CODEX_BRIDGE_HOST"] = "127.0.0.1"
+        env["CODEX_BRIDGE_PORT"] = str(LOCAL_BRIDGE_PORT)
+        no_proxy = "127.0.0.1,localhost,::1"
+        env["NO_PROXY"] = ",".join(filter(None, [env.get("NO_PROXY", ""), no_proxy]))
+        env["no_proxy"] = ",".join(filter(None, [env.get("no_proxy", ""), no_proxy]))
+        upstream_proxy = detect_upstream_proxy(bridge_processes)
+        if upstream_proxy:
+            env["CODEX_BRIDGE_UPSTREAM_PROXY"] = upstream_proxy
+
+        log_path = self.paths.db.parent / "bridgedeck-local-bridge.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        python_bin = which("python3") or sys.executable or "/usr/bin/python3"
+        with log_path.open("ab") as log:
+            subprocess.Popen(
+                [python_bin, str(script)],
+                cwd=str(script.parent),
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+        for _ in range(30):
+            if tcp_open("127.0.0.1", LOCAL_BRIDGE_PORT):
+                return {**self.services(), "ok": True, "message": "Local Codex Bridge 已启动"}
+            time.sleep(0.2)
+        return {**self.services(), "ok": False, "error": f"Local Codex Bridge 启动超时，日志：{log_path}"}
+
+    def _stop_local_bridge(self) -> dict[str, Any]:
+        processes = port_processes(LOCAL_BRIDGE_PORT)
+        targets = [
+            proc
+            for proc in processes
+            if "local_codex_bridge.py" in str(proc.get("command") or "")
+        ]
+        if not processes:
+            return {**self.services(), "ok": True, "message": "Local Codex Bridge 未运行"}
+        if not targets:
+            return {**self.services(), "ok": False, "error": f"{LOCAL_BRIDGE_PORT} 端口被其它进程占用，未停止"}
+
+        for proc in targets:
+            try:
+                os.kill(int(proc["pid"]), 15)
+            except OSError:
+                pass
+        for _ in range(20):
+            if not tcp_open("127.0.0.1", LOCAL_BRIDGE_PORT):
+                return {**self.services(), "ok": True, "message": "Local Codex Bridge 已停止"}
+            time.sleep(0.2)
+        for proc in targets:
+            try:
+                os.kill(int(proc["pid"]), 9)
+            except OSError:
+                pass
+        return {**self.services(), "ok": True, "message": "Local Codex Bridge 已强制停止"}
+
+    def control_local_bridge(self, action: str) -> dict[str, Any]:
+        if action == "start":
+            return self._start_local_bridge()
+        if action == "stop":
+            return self._stop_local_bridge()
+        if action == "restart":
+            stopped = self._stop_local_bridge()
+            if not stopped.get("ok"):
+                return stopped
+            return self._start_local_bridge()
+        raise ValueError("unknown local bridge action")
+
+    def repair_quota_query(self) -> dict[str, Any]:
+        actions: list[str] = []
+        if not tcp_open("127.0.0.1", LOCAL_BRIDGE_PORT):
+            started = self._start_local_bridge()
+            actions.append(str(started.get("message") or started.get("error") or "start_local_bridge"))
+            if not started.get("ok"):
+                return {"ok": False, "actions": actions, "error": str(started.get("error") or "bridge start failed")}
+
+        payload = self.quotas()
+        quota_rows = payload.get("quotas", [])
+        rows = quota_rows if isinstance(quota_rows, list) else []
+        statuses = {str(item.get("quota_status") or "") for item in rows if isinstance(item, dict)}
+        if rows and statuses and statuses <= {"network_error", "bridge_down", "unknown"}:
+            restarted = self.control_local_bridge("restart")
+            actions.append(str(restarted.get("message") or restarted.get("error") or "restart_local_bridge"))
+            if restarted.get("ok"):
+                payload = self.quotas()
+
+        payload["actions"] = actions
+        payload["services"] = self.services().get("services", {})
+        return payload
+
     def _fetch_quota(self, account: dict[str, Any]) -> dict[str, Any]:
         account_id = str(account.get("account_id") or "")
         result: dict[str, Any] = {
@@ -529,8 +753,7 @@ class BridgeManager:
 
         url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{urllib.parse.quote(account_id, safe='')}/quota"
         try:
-            with urllib.request.urlopen(url, timeout=18) as response:
-                raw = response.read(512 * 1024)
+            raw = read_local_url(url, timeout=18, max_bytes=512 * 1024)
         except urllib.error.HTTPError as exc:
             detail = exc.read(2048).decode("utf-8", "replace")
             result["quota_status"] = classify_error_text(detail or str(exc))
@@ -1736,6 +1959,11 @@ INDEX_HTML = """<!doctype html>
     .quotaPill.current { border-color:#2f6fb2; background:#102033; }
     .quotaTitle { font-weight:800; font-size:13px; margin-bottom:4px; }
     .quotaWindows { font-size:12px; color:var(--muted); line-height:1.5; }
+    .servicePanel { border-top:1px solid var(--line); margin-top:12px; padding-top:12px; }
+    .serviceGrid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:8px; margin-top:8px; }
+    .serviceItem { border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:#101827; }
+    .serviceName { font-weight:800; font-size:12px; margin-bottom:4px; }
+    .serviceMeta { color:var(--muted); font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
     .toggleLine { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:10px; color:var(--muted); font-size:12px; }
     .toggleLine label { display:flex; gap:6px; align-items:center; }
     .toggleLine input { min-width:0; }
@@ -1785,6 +2013,18 @@ INDEX_HTML = """<!doctype html>
         </div>
         <div id="missingBridgeStatus" class="muted mt10">新账号检测中...</div>
         <div id="autoSwitchStatus" class="muted mt10">未运行</div>
+        <div class="servicePanel">
+          <b>本地服务</b>
+          <div id="serviceStatus" class="serviceGrid">服务状态加载中...</div>
+          <div class="toggleLine">
+            <button class="miniBtn" data-action="refresh-services">刷新服务</button>
+            <button class="miniBtn" data-action="repair-quota-query">一键修复额度查询</button>
+            <button class="miniBtn" data-action="start-local-bridge">启动 Local Bridge</button>
+            <button class="miniBtn" data-action="restart-local-bridge">重启 Local Bridge</button>
+            <button class="miniBtn warn" data-action="stop-local-bridge">停止 Local Bridge</button>
+          </div>
+          <div id="serviceMessage" class="muted mt10">未操作</div>
+        </div>
       </div>
       <details>
         <summary>技术信息</summary>
@@ -2252,6 +2492,54 @@ INDEX_HTML = """<!doctype html>
       await refreshData();
       return res;
     }
+    function renderServices(payload) {
+      const box = document.getElementById('serviceStatus');
+      if (!box) return;
+      const services = payload.services || {};
+      const local = services.local_bridge || {};
+      const items = [
+        services.bridgedeck || { name: 'BridgeDeck', running: true, port: 8899 },
+        local,
+        services.cc_switch_proxy || { name: 'CC Switch Proxy', running: false, port: 15721 }
+      ];
+      box.innerHTML = items.map((item) => {
+        const running = !!item.running;
+        const cls = running ? 'ok' : 'bad';
+        const script = item.script ? `<br>${esc(humanPath(item.script))}` : '';
+        const proxy = item.upstream_proxy ? `<br>proxy: ${esc(item.upstream_proxy)}` : '';
+        return `<div class="serviceItem">
+          <div class="serviceName">${esc(item.name || '')}</div>
+          <div class="serviceMeta"><span class="${cls}">${running ? '运行中' : '未运行'}</span> · ${esc(item.port || '')}${script}${proxy}</div>
+        </div>`;
+      }).join('');
+      const message = document.getElementById('serviceMessage');
+      if (message && local.log_path) message.dataset.logPath = local.log_path;
+    }
+    async function refreshServices() {
+      const payload = await api('/api/services');
+      renderServices(payload);
+      return payload;
+    }
+    async function controlLocalBridge(action) {
+      const res = await api('/api/local-bridge-control', 'POST', { action });
+      renderServices(res);
+      document.getElementById('serviceMessage').textContent = res.message || 'Local Bridge 操作完成';
+      log(`Local Bridge ${action}: ${res.message || 'done'}`);
+      await refreshQuotas();
+      return res;
+    }
+    async function repairQuotaQuery() {
+      const res = await api('/api/repair-quota-query', 'POST', {});
+      if (res.services) renderServices({ services: res.services });
+      renderQuotaBoard(res);
+      renderMissingBridgeStatus(res);
+      const actions = (res.actions || []).filter(Boolean).join('，');
+      const okCount = (res.quotas || []).filter((q) => ['ok', 'near_limit', 'limit_reached'].includes(q.quota_status)).length;
+      document.getElementById('serviceMessage').textContent = actions || `额度查询已刷新，正常账号 ${okCount} 个`;
+      log(`额度修复: ${document.getElementById('serviceMessage').textContent}`);
+      await refreshData();
+      return res;
+    }
     function setSimpleResult(message, level='') {
       const box = document.getElementById('simpleResult');
       const cls = level === 'ok' ? 'ok' : (level === 'warn' ? 'warnText' : (level === 'bad' ? 'bad' : ''));
@@ -2614,6 +2902,10 @@ INDEX_HTML = """<!doctype html>
       renderActualClaude(data);
       renderActualCurrentAccounts(data);
       renderAutoSwitchConfig(data);
+      refreshServices().catch((e) => {
+        const box = document.getElementById('serviceStatus');
+        if (box) box.textContent = `服务状态失败: ${e.message}`;
+      });
       refreshQuotas();
       if (data.auto_switch && data.auto_switch.enabled) {
         runAutoSwitch(false, false).catch((e) => log(`自动切换失败: ${e.message}`));
@@ -2728,6 +3020,11 @@ INDEX_HTML = """<!doctype html>
           if (action === 'save-auto-switch') return saveAutoSwitch();
           if (action === 'run-auto-switch') return runAutoSwitch(true, true);
           if (action === 'create-missing-bridges') return createMissingBridges();
+          if (action === 'refresh-services') return refreshServices();
+          if (action === 'repair-quota-query') return repairQuotaQuery();
+          if (action === 'start-local-bridge') return controlLocalBridge('start');
+          if (action === 'stop-local-bridge') return controlLocalBridge('stop');
+          if (action === 'restart-local-bridge') return controlLocalBridge('restart');
           if (action === 'select-cli-account') return selectCliAccount(button.dataset.accountId || '');
         };
         Promise.resolve(run()).catch((e) => log(`操作失败: ${e.message}`));
@@ -2828,6 +3125,18 @@ def build_handler(
                     if not allow_sensitive:
                         payload = redact_snapshot(payload)
                     json_response(self, 200, payload)
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
+            if parsed.path == "/api/services":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    json_response(self, 200, manager.services(server_port=int(self.server.server_port)))
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
@@ -2936,6 +3245,14 @@ def build_handler(
                 if self.path == "/api/create-missing-bridges":
                     result = manager.create_missing_bridge_providers()
                     json_response(self, 200, result)
+                    return
+                if self.path == "/api/local-bridge-control":
+                    result = manager.control_local_bridge(str(payload.get("action") or ""))
+                    json_response(self, 200 if result.get("ok") else 400, result)
+                    return
+                if self.path == "/api/repair-quota-query":
+                    result = manager.repair_quota_query()
+                    json_response(self, 200 if result.get("ok", True) else 400, result)
                     return
                 json_response(self, 404, {"ok": False, "error": "Not Found"})
             except Exception as exc:  # noqa: BLE001

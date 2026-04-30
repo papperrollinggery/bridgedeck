@@ -49,6 +49,8 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <string>BridgeDeck</string>
   <key>CFBundleDisplayName</key>
   <string>BridgeDeck</string>
+  <key>LSUIElement</key>
+  <true/>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.6
+
+- Forced local quota requests to bypass system proxies.
+- Added Local Codex Bridge service status, start, stop, restart, and quota repair controls.
+- Made the macOS app a background helper so it does not stay bouncing in the Dock.
+
 ## 0.2.5
 
 - Split the daily UI into Claude Code, standalone Codex CLI, and global Codex CLI account selectors.

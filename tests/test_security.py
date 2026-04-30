@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import http.client
+import io
 import tempfile
 import threading
 import unittest
@@ -138,6 +139,25 @@ class FakeManager:
 
     def create_missing_bridge_providers(self) -> dict[str, Any]:
         return {"ok": True, "created": [], "skipped": [], "missing": []}
+
+    def services(self, *, server_port: int = 8899) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "services": {
+                "bridgedeck": {"name": "BridgeDeck", "running": True, "port": server_port},
+                "local_bridge": {"name": "Local Codex Bridge", "running": True, "port": 8876},
+                "cc_switch_proxy": {"name": "CC Switch Proxy", "running": True, "port": 15721},
+            },
+        }
+
+    def control_local_bridge(self, action: str) -> dict[str, Any]:
+        return {"ok": True, "message": f"local bridge {action}", **self.services()}
+
+    def repair_quota_query(self) -> dict[str, Any]:
+        payload = self.quotas()
+        payload["actions"] = []
+        payload["services"] = self.services()["services"]
+        return payload
 
 
 class ServerCase(unittest.TestCase):
@@ -287,6 +307,36 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(result["additional_limits"][0]["quota_status"], "ok")
         self.assertEqual(result["additional_limits"][0]["windows"][1]["used_percent"], 28)
 
+    def test_read_local_url_disables_proxy_lookup(self) -> None:
+        class FakeResponse:
+            def __enter__(self) -> io.BytesIO:
+                return io.BytesIO(b'{"ok": true}')
+
+            def __exit__(self, *_: Any) -> None:
+                return None
+
+        class FakeOpener:
+            def open(self, request: urllib.request.Request, *, timeout: float) -> FakeResponse:
+                self.request = request
+                self.timeout = timeout
+                return FakeResponse()
+
+        fake_opener = FakeOpener()
+        seen: dict[str, Any] = {}
+
+        def fake_build_opener(handler: Any) -> FakeOpener:
+            seen["handler"] = handler
+            return fake_opener
+
+        with mock.patch.object(urllib.request, "build_opener", side_effect=fake_build_opener):
+            body = bridgedeck.read_local_url("http://127.0.0.1:8876/quota", timeout=3, max_bytes=100)
+
+        self.assertEqual(body, b'{"ok": true}')
+        self.assertIsInstance(seen["handler"], urllib.request.ProxyHandler)
+        self.assertEqual(getattr(seen["handler"], "proxies", None), {})
+        self.assertEqual(fake_opener.timeout, 3)
+        self.assertEqual(fake_opener.request.headers["Connection"], "close")
+
     def test_remote_mode_blocks_secret_reveal(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
 
@@ -398,6 +448,28 @@ class ServerCase(unittest.TestCase):
 
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "Invalid CSRF token")
+
+    def test_services_reports_local_bridge_state(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(server, "/api/services", headers={"X-CCSBT-Token": "test-token"})
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["services"]["local_bridge"]["running"])
+
+    def test_local_bridge_control_requires_local_write_mode(self) -> None:
+        server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
+
+        status, payload = self.request(
+            server,
+            "/api/local-bridge-control",
+            method="POST",
+            body={"action": "restart"},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "Write APIs are disabled for remote mode")
 
 
 class LauncherCase(unittest.TestCase):
