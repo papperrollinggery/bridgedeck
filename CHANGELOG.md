@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.11
+
+- Distinguished transport stream closure from actual Responses API terminal events.
+- Logged SSE terminal event, last event, response status, delta count, and reasoning item count for Claude Code GPT streams.
+
 ## 0.2.10
 
 - Added Local Codex Bridge stream completion diagnostics for completed, client-disconnected, and upstream-error streams.

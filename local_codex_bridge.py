@@ -46,6 +46,19 @@ class CachedToken:
         return (self.expires_at - time.time()) < TOKEN_REFRESH_BUFFER_SECS
 
 
+@dataclass
+class StreamDiagnostics:
+    buffer: str = ""
+    event_count: int = 0
+    output_delta_events: int = 0
+    reasoning_items: int = 0
+    last_event: str | None = None
+    terminal_event: str | None = None
+    response_id: str | None = None
+    response_status: str | None = None
+    error_detail: str | None = None
+
+
 def mask_proxy_url(proxy_url: str | None) -> str:
     if not proxy_url:
         return "direct"
@@ -119,17 +132,77 @@ def log_stream_result(
     bytes_sent: int,
     chunks_sent: int,
     started_at: float,
+    diagnostics: StreamDiagnostics,
     detail: str | None = None,
 ) -> None:
     duration_ms = int((time.monotonic() - started_at) * 1000)
     summary = (
         f"[bridge-stream] account_id={account_id} model={model or 'unknown'} "
         f"effort={effort or 'unknown'} status={status} bytes={bytes_sent} "
-        f"chunks={chunks_sent} duration_ms={duration_ms}"
+        f"chunks={chunks_sent} duration_ms={duration_ms} events={diagnostics.event_count} "
+        f"deltas={diagnostics.output_delta_events} reasoning_items={diagnostics.reasoning_items} "
+        f"last_event={diagnostics.last_event or 'none'} "
+        f"terminal_event={diagnostics.terminal_event or 'none'} "
+        f"response_status={diagnostics.response_status or 'unknown'}"
     )
+    if diagnostics.response_id:
+        summary += f" response_id={diagnostics.response_id}"
+    if diagnostics.error_detail:
+        summary += f" api_error={truncate_log_text(diagnostics.error_detail)}"
     if detail:
         summary += f" detail={truncate_log_text(detail)}"
     print(summary, file=sys.stderr)
+
+
+def observe_sse_chunk(diagnostics: StreamDiagnostics, chunk: bytes) -> None:
+    diagnostics.buffer += chunk.decode("utf-8", "replace").replace("\r\n", "\n")
+    while "\n\n" in diagnostics.buffer:
+        raw_block, diagnostics.buffer = diagnostics.buffer.split("\n\n", 1)
+        observe_sse_block(diagnostics, raw_block)
+
+
+def observe_sse_block(diagnostics: StreamDiagnostics, raw_block: str) -> None:
+    event_name: str | None = None
+    data_lines: list[str] = []
+    for line in raw_block.splitlines():
+        if line.startswith("event:"):
+            event_name = line[len("event:") :].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:") :].lstrip())
+
+    if event_name:
+        diagnostics.event_count += 1
+        diagnostics.last_event = event_name
+        if event_name == "response.output_text.delta":
+            diagnostics.output_delta_events += 1
+        elif event_name in {"response.completed", "response.failed", "response.incomplete"}:
+            diagnostics.terminal_event = event_name
+
+    payload_text = "\n".join(data_lines).strip()
+    if not payload_text or payload_text == "[DONE]":
+        return
+    try:
+        decoded = json.loads(payload_text)
+    except Exception:  # noqa: BLE001
+        return
+    if not isinstance(decoded, dict):
+        return
+
+    response = decoded.get("response")
+    if isinstance(response, dict):
+        response_id = response.get("id")
+        if isinstance(response_id, str):
+            diagnostics.response_id = response_id
+        response_status = response.get("status")
+        if isinstance(response_status, str):
+            diagnostics.response_status = response_status
+        error = response.get("error")
+        if error:
+            diagnostics.error_detail = json.dumps(error, ensure_ascii=False)
+
+    item = decoded.get("item")
+    if isinstance(item, dict) and item.get("type") == "reasoning":
+        diagnostics.reasoning_items += 1
 
 
 def summarize_request_shape(body: dict[str, Any]) -> dict[str, Any]:
@@ -698,20 +771,31 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     stream_started_at = time.monotonic()
                     bytes_sent = 0
                     chunks_sent = 0
-                    stream_status = "completed"
+                    stream_status = "stream_open"
                     stream_detail: str | None = None
+                    stream_diagnostics = StreamDiagnostics()
                     try:
                         for chunk in response.iter_bytes():
                             if not chunk:
                                 continue
                             bytes_sent += len(chunk)
                             chunks_sent += 1
+                            observe_sse_chunk(stream_diagnostics, chunk)
                             if not self._write_bytes(chunk, flush=True):
                                 stream_status = "client_disconnected"
                                 break
                     except Exception as exc:  # noqa: BLE001
                         stream_status = "upstream_error"
                         stream_detail = f"{type(exc).__name__}: {exc}"
+                    if stream_status == "stream_open":
+                        if stream_diagnostics.terminal_event == "response.completed":
+                            stream_status = "api_completed"
+                        elif stream_diagnostics.terminal_event == "response.failed":
+                            stream_status = "api_failed"
+                        elif stream_diagnostics.terminal_event == "response.incomplete":
+                            stream_status = "api_incomplete"
+                        else:
+                            stream_status = "stream_closed_without_terminal"
                     log_stream_result(
                         account_id,
                         model=requested_model,
@@ -720,6 +804,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         bytes_sent=bytes_sent,
                         chunks_sent=chunks_sent,
                         started_at=stream_started_at,
+                        diagnostics=stream_diagnostics,
                         detail=stream_detail,
                     )
                 else:
