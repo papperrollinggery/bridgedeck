@@ -6,6 +6,7 @@ import io
 import sqlite3
 import tempfile
 import threading
+import types
 import unittest
 import urllib.error
 import urllib.request
@@ -21,6 +22,49 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import bridgedeck
+try:
+    import httpx as _httpx  # noqa: F401
+except ModuleNotFoundError:
+    httpx_stub = types.ModuleType("httpx")
+
+    class _HttpxError(Exception):
+        pass
+
+    class _RemoteProtocolError(_HttpxError):
+        pass
+
+    class _ReadTimeout(_HttpxError):
+        pass
+
+    class _ReadError(_HttpxError):
+        pass
+
+    class _WriteError(_HttpxError):
+        pass
+
+    class _HTTPStatusError(_HttpxError):
+        def __init__(self, response: Any) -> None:
+            self.response = response
+            super().__init__(str(response))
+
+    class _URL:
+        def __init__(self, value: str) -> None:
+            self.scheme = value.split(":", 1)[0]
+
+    class _Client:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    httpx_stub.RemoteProtocolError = _RemoteProtocolError
+    httpx_stub.ReadTimeout = _ReadTimeout
+    httpx_stub.ReadError = _ReadError
+    httpx_stub.WriteError = _WriteError
+    httpx_stub.HTTPStatusError = _HTTPStatusError
+    httpx_stub.URL = _URL
+    httpx_stub.Client = _Client
+    sys.modules["httpx"] = httpx_stub
+
+import local_codex_bridge
 
 
 class FakeManager:
@@ -86,6 +130,17 @@ class FakeManager:
                 "managed_by": "cc_switch",
                 "risk_flags": [],
             },
+            "current_codex_launcher": {
+                "path": f"{home}/.cc-switch/codex-cli-launchers/codex-current.command",
+                "exists": False,
+                "account_id": "",
+                "risk_flags": ["missing_current_launcher"],
+            },
+            "omc_codex_shim": {
+                "active": False,
+                "shims": [],
+                "risk_flags": ["omc_codex_shim_missing"],
+            },
             "account_matrix": [],
             "current_provider_from_settings": "",
         }
@@ -122,6 +177,28 @@ class FakeManager:
             "env_keys": ["ANTHROPIC_MODEL", "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "HUB_CLAUDE_MEM"],
             "updated": [{"id": "provider-1", "name": "Provider"}],
             "skipped": [],
+        }
+
+    def sync_claude_enabled_plugins(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "changed": False,
+            "installed_count": 7,
+            "enabled_count": 7,
+            "added": [],
+            "backups": [],
+        }
+
+    def claude_plugin_sync_status(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "installed_count": 7,
+            "common_enabled_count": 7,
+            "settings_enabled_count": 7,
+            "missing_from_common": [],
+            "missing_from_settings": [],
+            "disabled": [],
+            "needs_sync": False,
         }
 
     def dedupe_bridge_providers(self, *, apply: bool = False) -> dict[str, Any]:
@@ -198,6 +275,14 @@ class FakeManager:
                     "script": "/Users/person/local_codex_bridge.py",
                     "log_path": "/Users/person/.cc-switch/bridgedeck-local-bridge.log",
                     "upstream_proxy": "http://user:pass@127.0.0.1:1087",
+                    "last_stream_error": {
+                        "account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                        "model": "gpt-5.5",
+                        "request_id": "bridge-test",
+                        "duration_ms": 100,
+                        "error_type": "RemoteProtocolError",
+                        "error": "incomplete chunked read",
+                    },
                 },
                 "cc_switch_proxy": {"name": "CC Switch Proxy", "running": True, "port": 15721},
             },
@@ -211,6 +296,243 @@ class FakeManager:
         payload["actions"] = []
         payload["services"] = self.services()["services"]
         return payload
+
+
+class FakeSseResponse:
+    def __init__(self, lines: list[str], exc: BaseException | None = None) -> None:
+        self.lines = lines
+        self.exc = exc
+        self.headers = {"x-request-id": "upstream-test"}
+
+    def iter_lines(self):
+        for line in self.lines:
+            yield line
+        if self.exc is not None:
+            raise self.exc
+
+
+class BrokenWriter:
+    def write(self, payload: bytes) -> int:
+        raise BrokenPipeError("client closed")
+
+    def flush(self) -> None:
+        raise AssertionError("flush should not run after write failure")
+
+
+class OSErrorWriter:
+    def write(self, payload: bytes) -> int:
+        raise OSError("socket write failed")
+
+    def flush(self) -> None:
+        raise AssertionError("flush should not run after write failure")
+
+
+class LocalCodexBridgeCase(unittest.TestCase):
+    def make_handler(self) -> local_codex_bridge.CodexBridgeHandler:
+        return object.__new__(local_codex_bridge.CodexBridgeHandler)
+
+    def test_stream_passthrough_preserves_delta_and_completed(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.output_text.delta",
+                'data: {"type":"response.output_text.delta","delta":"hello"}',
+                "",
+                "event: response.completed",
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}',
+                "",
+            ]
+        )
+
+        chunks = list(
+            self.make_handler()._iter_stream_with_reasoning_placeholder(
+                response,
+                "acct-1",
+                request_id="bridge-test",
+                started_at=local_codex_bridge.time.monotonic(),
+                requested_model="gpt-5.5",
+            )
+        )
+        body = b"".join(chunks).decode("utf-8")
+
+        self.assertIn("event: response.output_text.delta", body)
+        self.assertIn('"delta":"hello"', body)
+        self.assertIn("event: response.completed", body)
+
+    def test_stream_remote_protocol_error_emits_failed_sse(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.output_text.delta",
+                'data: {"type":"response.output_text.delta","delta":"half"}',
+                "",
+            ],
+            exc=local_codex_bridge.httpx.RemoteProtocolError("incomplete chunked read"),
+        )
+
+        with mock.patch.object(local_codex_bridge, "record_bridge_stream_error") as record:
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    response,
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic(),
+                    requested_model="gpt-5.5",
+                    upstream_request_id="upstream-test",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        self.assertIn("event: response.failed", body)
+        self.assertIn("upstream_stream_error", body)
+        self.assertIn("RemoteProtocolError", body)
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args[0]["request_id"], "bridge-test")
+        self.assertEqual(record.call_args.args[0]["model"], "gpt-5.5")
+
+    def test_stream_error_after_completed_does_not_emit_second_terminal(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.completed",
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}',
+                "",
+            ],
+            exc=local_codex_bridge.httpx.RemoteProtocolError("late disconnect"),
+        )
+
+        with mock.patch.object(local_codex_bridge, "record_bridge_stream_error") as record:
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    response,
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic(),
+                    requested_model="gpt-5.5",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        self.assertIn("event: response.completed", body)
+        self.assertNotIn("event: response.failed", body)
+        record.assert_not_called()
+
+    def test_upstream_response_failed_is_logged_as_stream_error(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.failed",
+                'data: {"type":"response.failed","response":{"status":"failed","error":{"message":"overloaded"}}}',
+                "",
+            ]
+        )
+
+        with mock.patch.object(local_codex_bridge, "record_bridge_stream_error") as record:
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    response,
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic(),
+                    requested_model="gpt-5.5",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        self.assertIn("event: response.failed", body)
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args[0]["error_type"], "TerminalStreamError")
+
+    def test_write_bytes_swallow_client_broken_pipe(self) -> None:
+        handler = self.make_handler()
+        handler.wfile = BrokenWriter()
+
+        self.assertFalse(handler._write_bytes(b"payload", flush=True))
+
+    def test_write_bytes_swallow_generic_oserror(self) -> None:
+        handler = self.make_handler()
+        handler.wfile = OSErrorWriter()
+
+        self.assertFalse(handler._write_bytes(b"payload", flush=True))
+
+    def test_non_stream_json_builds_message_from_sse(self) -> None:
+        raw = (
+            b"event: response.output_text.delta\n"
+            b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+            b"event: response.output_text.delta\n"
+            b'data: {"type":"response.output_text.delta","delta":" world"}\n\n'
+        )
+
+        payload = json.loads(local_codex_bridge.build_non_stream_json_from_sse(raw, "gpt-5.5"))
+
+        self.assertEqual(payload["model"], "gpt-5.5")
+        self.assertEqual(payload["output"][0]["content"][0]["text"], "hello world")
+
+    def test_non_stream_json_preserves_failed_sse_status(self) -> None:
+        raw = (
+            b"event: response.failed\n"
+            b'data: {"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"message":"overloaded"}}}\n\n'
+        )
+
+        payload = json.loads(local_codex_bridge.build_non_stream_json_from_sse(raw, "gpt-5.5"))
+
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["model"], "gpt-5.5")
+        self.assertEqual(payload["error"]["message"], "overloaded")
+
+    def test_quota_timeout_is_local_to_quota_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = LauncherCase().make_manager(Path(tmp))
+            with (
+                mock.patch.object(bridgedeck, "tcp_open", return_value=True),
+                mock.patch.object(bridgedeck, "read_local_url", side_effect=TimeoutError("proxy timeout")),
+            ):
+                result = manager._fetch_quota({"account_id": "acct-1", "email": "person@example.com"})
+
+        self.assertEqual(result["quota_status"], "network_error")
+        self.assertIn("TimeoutError", result["error"])
+
+    def test_repair_quota_query_does_not_restart_running_bridge_on_quota_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = LauncherCase().make_manager(Path(tmp))
+            with (
+                mock.patch.object(bridgedeck, "tcp_open", return_value=True),
+                mock.patch.object(
+                    manager,
+                    "quotas",
+                    return_value={
+                        "ok": True,
+                        "quotas": [{"account_id": "acct-1", "quota_status": "network_error"}],
+                    },
+                ),
+                mock.patch.object(manager, "control_local_bridge") as control,
+                mock.patch.object(manager, "services", return_value={"services": {}}),
+            ):
+                result = manager.repair_quota_query()
+
+        control.assert_not_called()
+        self.assertIn("未重启 Local Bridge", result["actions"][0])
+
+    def test_bridge_state_reads_last_stream_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": 123,
+                        "last_stream_error": {
+                            "account_id": "acct-1",
+                            "model": "gpt-5.5",
+                            "request_id": "bridge-test",
+                            "duration_ms": 5,
+                            "error_type": "RemoteProtocolError",
+                            "error": "incomplete chunked read",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = bridgedeck.read_local_bridge_state(state_path)
+
+        self.assertEqual(payload["last_stream_error"]["error_type"], "RemoteProtocolError")
+        self.assertEqual(payload["last_stream_error"]["request_id"], "bridge-test")
 
 
 class ServerCase(unittest.TestCase):
@@ -312,6 +634,8 @@ class ServerCase(unittest.TestCase):
         self.assertIn("refreshData(true)", html)
         self.assertIn("单独 Codex CLI", html)
         self.assertIn("全局 Codex CLI", html)
+        self.assertIn("codex-current.command", html)
+        self.assertIn("OMC/tmux 已接管 codex", html)
         self.assertIn("当前实际", html)
         self.assertIn('id="autoSwitchEnabled"', html)
         self.assertIn("OpenAI 自动切换", html)
@@ -320,14 +644,21 @@ class ServerCase(unittest.TestCase):
         self.assertIn('data-action="compact-preset-1m"', html)
         self.assertIn('data-action="save-compact-selected"', html)
         self.assertIn('data-action="sync-common-env-selected"', html)
+        self.assertIn('id="pluginSyncStatus"', html)
+        self.assertIn('data-action="sync-claude-plugins"', html)
         self.assertIn('data-action="preview-bridge-dedupe"', html)
         self.assertIn('data-action="apply-bridge-dedupe"', html)
         self.assertIn('id="actualCurrentAccounts"', html)
         self.assertIn("const actualGlobalAccount = data.codex_desktop", html)
+        self.assertIn("row.account_id === desktopAccount ? '默认' : '备用'", html)
+        self.assertIn("固定入口/OMC/tmux", html)
+        self.assertIn("~/.codex/auth.json token", html)
         self.assertIn("renderAccounts(data);", html)
         self.assertIn("Spark", html)
         self.assertNotIn('id="simpleAccount"', html)
         self.assertNotIn("今天用哪个账号", html)
+        self.assertNotIn("默认 Codex Desktop/CLI：只检测", html)
+        self.assertNotIn("只检测，不由 BridgeDeck 接管", html)
 
     def test_quota_summary_marks_limit_states(self) -> None:
         payload = {
@@ -473,6 +804,21 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(payload["source_provider_id"], "provider-1")
         self.assertIn("HUB_CLAUDE_MEM", payload["env_keys"])
 
+    def test_sync_claude_plugins_endpoint_returns_status(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/sync-claude-plugins",
+            method="POST",
+            body={},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["installed_count"], 7)
+
     def test_dedupe_bridge_providers_endpoint_defaults_to_preview(self) -> None:
         server, _ = self.start_server()
 
@@ -608,6 +954,7 @@ class ServerCase(unittest.TestCase):
         self.assertNotIn("script", local_bridge)
         self.assertNotIn("log_path", local_bridge)
         self.assertEqual(local_bridge["upstream_proxy"], "<redacted>")
+        self.assertEqual(local_bridge["last_stream_error"]["account_id"], "01234567...cdef")
         self.assertNotIn("/Users/person", json.dumps(payload))
         self.assertNotIn("user:pass", json.dumps(payload))
 
@@ -623,6 +970,8 @@ class LauncherCase(unittest.TestCase):
                         "acct-1": {
                             "email": "person@example.com",
                             "refresh_token": "secret-refresh-token",
+                            "access_token": "secret-access-token",
+                            "id_token": "secret-id-token",
                         }
                     }
                 }
@@ -658,6 +1007,91 @@ class LauncherCase(unittest.TestCase):
             self.assertIn('export OPENAI_API_KEY="local-bridge"', body)
             self.assertIn('base_url="http://127.0.0.1:8876/accounts/acct-1/v1"', body)
             self.assertNotIn("secret-refresh-token", body)
+            self.assertNotIn("secret-access-token", body)
+            self.assertNotIn("secret-id-token", body)
+
+    def test_current_codex_launcher_is_not_dedicated_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            launcher_dir = root / ".cc-switch" / "codex-cli-launchers"
+            launcher_dir.mkdir(parents=True)
+            current = launcher_dir / "codex-current.command"
+            dedicated = launcher_dir / "codex-person.command"
+            current.write_text(
+                '#!/bin/zsh\nexport OPENAI_API_KEY="local-bridge"\n'
+                'exec "/opt/homebrew/bin/codex" -c \'base_url="http://127.0.0.1:8876/accounts/acct-1/v1"\' "$@"\n',
+                encoding="utf-8",
+            )
+            dedicated.write_text(
+                '#!/bin/zsh\nexport CODEX_HOME="/tmp/person"\nexport OPENAI_API_KEY="local-bridge"\n'
+                'exec "/opt/homebrew/bin/codex" -c \'base_url="http://127.0.0.1:8876/accounts/acct-1/v1"\' "$@"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(bridgedeck, "DEFAULT_CLI_LAUNCHER_DIR", launcher_dir):
+                launchers = manager._known_cli_launchers()
+                matrix = manager._account_matrix(
+                    [{"account_id": "acct-1", "email": "person@example.com"}],
+                    [],
+                    [],
+                    [],
+                    [item for item in launchers if item["is_current_launcher"]],
+                    {},
+                )
+
+            by_name = {item["name"]: item for item in launchers}
+            self.assertTrue(by_name["current"]["is_current_launcher"])
+            self.assertEqual(by_name["current"]["launcher_role"], "current")
+            self.assertFalse(by_name["person"]["is_current_launcher"])
+            self.assertEqual(by_name["person"]["launcher_role"], "dedicated")
+            self.assertEqual(matrix[0]["cli_launchers"], [])
+            self.assertIn("missing_cli_launcher", matrix[0]["risk_flags"])
+
+    def test_write_omc_codex_shims_uses_current_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            launcher_dir = root / ".cc-switch" / "codex-cli-launchers"
+            shim_paths = (root / ".codebuddy" / "bin" / "codex", root / ".workbuddy" / "bin" / "codex")
+            zprofile = root / ".zprofile"
+            zprofile.write_text('eval "$(/opt/homebrew/bin/brew shellenv)"\n', encoding="utf-8")
+            with mock.patch.object(bridgedeck, "DEFAULT_CLI_LAUNCHER_DIR", launcher_dir):
+                launcher_dir.mkdir(parents=True)
+                current = launcher_dir / "codex-current.command"
+                current.write_text("#!/bin/zsh\nexit 0\n", encoding="utf-8")
+                with (
+                    mock.patch.object(bridgedeck, "DEFAULT_OMC_CODEX_SHIM_PATHS", shim_paths),
+                    mock.patch.object(bridgedeck, "DEFAULT_ZPROFILE_PATH", zprofile),
+                ):
+                    result = manager.write_omc_codex_shims()
+                    path_result = manager.ensure_omc_codex_path()
+
+            self.assertEqual(result["paths"], [str(path) for path in shim_paths])
+            self.assertTrue(path_result["changed"])
+            self.assertIn(str(launcher_dir / "bin"), zprofile.read_text(encoding="utf-8"))
+            for path in shim_paths:
+                body = path.read_text(encoding="utf-8")
+                self.assertIn(bridgedeck.MANAGED_CODEX_SHIM_MARKER, body)
+                self.assertIn(str(current), body)
+                self.assertNotIn("secret-refresh-token", body)
+
+    def test_write_omc_codex_shims_refuses_unmanaged_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            launcher_dir = root / ".cc-switch" / "codex-cli-launchers"
+            shim_path = root / ".codebuddy" / "bin" / "codex"
+            shim_path.parent.mkdir(parents=True)
+            shim_path.write_text("#!/bin/zsh\nexec /opt/homebrew/bin/codex \"$@\"\n", encoding="utf-8")
+            with mock.patch.object(bridgedeck, "DEFAULT_CLI_LAUNCHER_DIR", launcher_dir):
+                launcher_dir.mkdir(parents=True)
+                (launcher_dir / "codex-current.command").write_text("#!/bin/zsh\nexit 0\n", encoding="utf-8")
+                with mock.patch.object(bridgedeck, "DEFAULT_OMC_CODEX_SHIM_PATHS", (shim_path,)):
+                    with self.assertRaises(ValueError):
+                        manager.write_omc_codex_shims()
+
+            self.assertIn("/opt/homebrew/bin/codex", shim_path.read_text(encoding="utf-8"))
 
     def test_find_local_bridge_python_prefers_managed_venv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -833,6 +1267,73 @@ class LauncherCase(unittest.TestCase):
             self.assertEqual(target_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "220000")
             self.assertEqual(target_env["TARGET_ONLY"], "keep")
             self.assertEqual(external_env["ANTHROPIC_AUTH_TOKEN"], "external-token")
+
+    def test_sync_claude_enabled_plugins_merges_installed_into_common_and_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            common = root / ".ccswitch-common-config.json"
+            settings = root / ".claude" / "settings.json"
+            installed = root / ".claude" / "plugins" / "installed_plugins.json"
+            common.write_text(json.dumps({"enabledPlugins": {"claude-hud@claude-hud": True}}), encoding="utf-8")
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            settings.write_text(json.dumps({"enabledPlugins": {"claude-mem@thedotmack": True}}), encoding="utf-8")
+            installed.parent.mkdir(parents=True, exist_ok=True)
+            installed.write_text(
+                json.dumps(
+                    {
+                        "plugins": {
+                            "claude-hud@claude-hud": [{"scope": "user"}],
+                            "claude-mem@thedotmack": [{"scope": "user"}],
+                            "caveman@caveman": [{"scope": "user"}],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CCSWITCH_COMMON_CONFIG_PATH", common),
+                mock.patch.object(bridgedeck, "DEFAULT_CLAUDE_SETTINGS_PATH", settings),
+                mock.patch.object(bridgedeck, "DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH", installed),
+            ):
+                result = manager.sync_claude_enabled_plugins()
+
+            self.assertTrue(result["changed"])
+            self.assertEqual(result["added"], ["caveman@caveman"])
+            common_enabled = json.loads(common.read_text(encoding="utf-8"))["enabledPlugins"]
+            settings_enabled = json.loads(settings.read_text(encoding="utf-8"))["enabledPlugins"]
+            self.assertEqual(common_enabled, settings_enabled)
+            self.assertTrue(common_enabled["caveman@caveman"])
+            self.assertTrue(result["backups"])
+
+    def test_sync_claude_enabled_plugins_preserves_explicit_disabled_plugin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            common = root / ".ccswitch-common-config.json"
+            settings = root / ".claude" / "settings.json"
+            installed = root / ".claude" / "plugins" / "installed_plugins.json"
+            common.write_text(json.dumps({"enabledPlugins": {"caveman@caveman": False}}), encoding="utf-8")
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            settings.write_text(json.dumps({"enabledPlugins": {}}), encoding="utf-8")
+            installed.parent.mkdir(parents=True, exist_ok=True)
+            installed.write_text(
+                json.dumps({"plugins": {"caveman@caveman": [{"scope": "user"}]}}),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CCSWITCH_COMMON_CONFIG_PATH", common),
+                mock.patch.object(bridgedeck, "DEFAULT_CLAUDE_SETTINGS_PATH", settings),
+                mock.patch.object(bridgedeck, "DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH", installed),
+            ):
+                result = manager.sync_claude_enabled_plugins()
+
+            self.assertTrue(result["changed"])
+            self.assertEqual(result["added"], [])
+            self.assertFalse(json.loads(common.read_text(encoding="utf-8"))["enabledPlugins"]["caveman@caveman"])
+            self.assertFalse(json.loads(settings.read_text(encoding="utf-8"))["enabledPlugins"]["caveman@caveman"])
 
     def test_create_provider_reuses_existing_bridge_account(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1210,22 +1711,67 @@ class LauncherCase(unittest.TestCase):
             manager = self.make_manager(root)
             codex_home = root / ".codex"
             codex_home.mkdir()
+            launcher_dir = root / ".cc-switch" / "codex-cli-launchers"
+            shim_paths = (root / ".codebuddy" / "bin" / "codex", root / ".workbuddy" / "bin" / "codex")
+            zprofile = root / ".zprofile"
+            zprofile.write_text('eval "$(/opt/homebrew/bin/brew shellenv)"\n', encoding="utf-8")
             config = codex_home / "config.toml"
             config.write_text(
                 'model = "gpt-5.5"\nbase_url = "http://127.0.0.1:15721/v1"\n',
                 encoding="utf-8",
             )
 
-            with mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home):
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(bridgedeck, "DEFAULT_CLI_LAUNCHER_DIR", launcher_dir),
+                mock.patch.object(bridgedeck, "DEFAULT_OMC_CODEX_SHIM_PATHS", shim_paths),
+                mock.patch.object(bridgedeck, "DEFAULT_ZPROFILE_PATH", zprofile),
+                mock.patch.object(bridgedeck, "codex_binary_path", return_value="/opt/homebrew/bin/codex"),
+            ):
                 result = manager.set_default_codex_account("acct-1")
 
             body = config.read_text(encoding="utf-8")
+            launcher = launcher_dir / "codex-current.command"
+            launcher_body = launcher.read_text(encoding="utf-8")
             self.assertTrue(result["ok"])
             self.assertIn('base_url = "http://127.0.0.1:8876/accounts/acct-1/v1"', body)
             self.assertIn('model = "gpt-5.5"', body)
             self.assertNotIn("secret-refresh-token", body)
             self.assertNotIn("access_token", body)
             self.assertTrue(result["backups"])
+            self.assertEqual(result["current_launcher"], str(launcher))
+            self.assertIn('export OPENAI_API_KEY="local-bridge"', launcher_body)
+            self.assertIn('base_url="http://127.0.0.1:8876/accounts/acct-1/v1"', launcher_body)
+            self.assertIn('exec "/opt/homebrew/bin/codex"', launcher_body)
+            self.assertNotIn("CODEX_HOME", launcher_body)
+            self.assertNotIn("secret-refresh-token", launcher_body)
+            self.assertNotIn("secret-access-token", launcher_body)
+            self.assertNotIn("secret-id-token", launcher_body)
+            self.assertEqual(result["omc_codex_shims"], [str(path) for path in shim_paths])
+            self.assertIn(str(launcher_dir / "bin"), zprofile.read_text(encoding="utf-8"))
+            for path in shim_paths:
+                shim_body = path.read_text(encoding="utf-8")
+                self.assertIn(bridgedeck.MANAGED_CODEX_SHIM_MARKER, shim_body)
+                self.assertIn(str(launcher), shim_body)
+
+    def test_set_default_codex_account_does_not_change_config_if_launcher_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            original = 'model = "gpt-5.5"\nbase_url = "http://127.0.0.1:15721/v1"\n'
+            config.write_text(original, encoding="utf-8")
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(manager, "write_current_codex_launcher", side_effect=ValueError("blocked")),
+            ):
+                with self.assertRaises(ValueError):
+                    manager.set_default_codex_account("acct-1")
+
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
 
     def test_error_classifier(self) -> None:
         self.assertEqual(

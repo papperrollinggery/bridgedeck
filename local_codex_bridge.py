@@ -9,7 +9,9 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,13 @@ TOKEN_REFRESH_BUFFER_SECS = 60
 ACCOUNT_ROUTE_RE = re.compile(r"^/accounts/([^/]+)(/.*)?$")
 UPSTREAM_PROXY_ENV = "CODEX_BRIDGE_UPSTREAM_PROXY"
 REASONING_PLACEHOLDER_HEARTBEAT_SECS = 8.0
+REASONING_PLACEHOLDER_MODE_ENV = "CODEX_BRIDGE_REASONING_PLACEHOLDER_MODE"
+BRIDGE_STATE_PATH = Path(
+    os.environ.get(
+        "CODEX_BRIDGE_STATE_PATH",
+        str(Path.home() / ".cc-switch" / "bridgedeck-local-bridge-state.json"),
+    )
+)
 
 
 @dataclass
@@ -57,6 +66,11 @@ class ReasoningPlaceholderState:
     output_index: int | None = None
     emitted_count: int = 0
     last_emitted_at: float = 0.0
+    logged_terminal_error: bool = False
+
+
+class TerminalStreamError(Exception):
+    pass
 
 
 def mask_proxy_url(proxy_url: str | None) -> str:
@@ -101,6 +115,19 @@ def truncate_log_text(value: str | None, *, limit: int = 240) -> str | None:
     return safe_value
 
 
+def log_timestamp() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def bridge_request_id() -> str:
+    return f"bridge-{uuid.uuid4().hex[:12]}"
+
+
+def reasoning_placeholder_mode() -> str:
+    value = os.environ.get(REASONING_PLACEHOLDER_MODE_ENV, "visible").strip().lower()
+    return value if value in {"visible", "comment", "off"} else "visible"
+
+
 def log_upstream_result(
     request_type: str,
     account_id: str | None,
@@ -120,7 +147,7 @@ def log_upstream_result(
     if detail:
         safe_detail = truncate_log_text(detail)
         summary += f" detail={safe_detail}"
-    print(summary, file=sys.stderr)
+    print(f"{log_timestamp()} {summary}", file=sys.stderr)
 
 
 def summarize_request_shape(body: dict[str, Any]) -> dict[str, Any]:
@@ -269,7 +296,100 @@ def log_upstream_diagnostic(
     if safe_error_detail:
         payload["error_detail"] = safe_error_detail
     print(
-        f"[upstream-diagnostic] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}",
+        f"{log_timestamp()} [upstream-diagnostic] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}",
+        file=sys.stderr,
+    )
+
+
+def response_failed_sse(
+    *,
+    request_id: str,
+    requested_model: str | None,
+    exc: BaseException,
+) -> bytes:
+    error_type = type(exc).__name__
+    message = truncate_log_text(str(exc), limit=500) or error_type
+    payload = {
+        "type": "response.failed",
+        "response": {
+            "id": f"resp_{request_id}",
+            "object": "response",
+            "status": "failed",
+            "model": requested_model or "unknown",
+            "error": {
+                "code": "upstream_stream_error",
+                "message": message,
+                "type": error_type,
+            },
+        },
+    }
+    return (
+        "event: response.failed\n"
+        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    ).encode("utf-8")
+
+
+def terminal_stream_error_from_payload(event_name: str | None, payload: dict[str, Any] | None) -> TerminalStreamError | None:
+    if event_name not in {"response.failed", "error"} or not isinstance(payload, dict):
+        return None
+    response_obj = payload.get("response")
+    error_obj = response_obj.get("error") if isinstance(response_obj, dict) else payload.get("error")
+    if isinstance(error_obj, dict):
+        message = error_obj.get("message") or error_obj.get("code") or event_name
+    else:
+        message = payload.get("message") or str(error_obj or event_name)
+    return TerminalStreamError(str(message))
+
+
+def record_bridge_stream_error(payload: dict[str, Any]) -> None:
+    state = {
+        "updated_at": int(time.time()),
+        "last_stream_error": payload,
+    }
+    try:
+        BRIDGE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BRIDGE_STATE_PATH.with_name(
+            f".{BRIDGE_STATE_PATH.name}.tmp-{os.getpid()}-{time.time_ns()}"
+        )
+        try:
+            with tmp.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, BRIDGE_STATE_PATH)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"{log_timestamp()} [bridge-state-error] type={type(exc).__name__} detail={truncate_log_text(str(exc))}",
+            file=sys.stderr,
+        )
+
+
+def log_bridge_stream_error(
+    *,
+    account_id: str,
+    requested_model: str | None,
+    request_id: str,
+    started_at: float,
+    exc: BaseException,
+    upstream_request_id: str | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "account_id": account_id,
+        "model": requested_model or "",
+        "request_id": request_id,
+        "duration_ms": int((time.monotonic() - started_at) * 1000),
+        "error_type": type(exc).__name__,
+        "error": truncate_log_text(str(exc), limit=500) or type(exc).__name__,
+    }
+    if upstream_request_id:
+        payload["upstream_request_id"] = upstream_request_id
+    record_bridge_stream_error(payload)
+    print(
+        f"{log_timestamp()} [bridge-stream-error] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}",
         file=sys.stderr,
     )
 
@@ -468,6 +588,8 @@ def parse_sse_blocks(raw_bytes: bytes) -> list[tuple[str | None, dict[str, Any] 
 def build_non_stream_json_from_sse(raw_bytes: bytes, fallback_model: str | None = None) -> bytes:
     blocks = parse_sse_blocks(raw_bytes)
     completed_response: dict[str, Any] | None = None
+    failed_response: dict[str, Any] | None = None
+    error_payload: dict[str, Any] | None = None
     message_text_parts: list[str] = []
     final_text: str | None = None
 
@@ -486,8 +608,31 @@ def build_non_stream_json_from_sse(raw_bytes: bytes, fallback_model: str | None 
             response_obj = payload.get("response")
             if isinstance(response_obj, dict):
                 completed_response = response_obj
+        elif event_name == "response.failed":
+            response_obj = payload.get("response")
+            if isinstance(response_obj, dict):
+                failed_response = dict(response_obj)
+        elif event_name == "error":
+            error_payload = dict(payload)
 
     text = final_text if isinstance(final_text, str) else "".join(message_text_parts)
+
+    if failed_response is not None:
+        failed_response.setdefault("id", "resp_bridge_non_stream_failed")
+        failed_response.setdefault("object", "response")
+        failed_response.setdefault("status", "failed")
+        failed_response.setdefault("model", fallback_model or "gpt-5.3-codex")
+        return json.dumps(failed_response, ensure_ascii=False).encode("utf-8")
+
+    if error_payload is not None:
+        failed = {
+            "id": "resp_bridge_non_stream_failed",
+            "object": "response",
+            "status": "failed",
+            "model": fallback_model or "gpt-5.3-codex",
+            "error": error_payload.get("error") if isinstance(error_payload.get("error"), dict) else error_payload,
+        }
+        return json.dumps(failed, ensure_ascii=False).encode("utf-8")
 
     if completed_response is None:
         completed_response = {
@@ -614,12 +759,43 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             return
         self.send_error(404, "Not Found")
 
+    def _send_upstream_headers(
+        self,
+        response: httpx.Response,
+        *,
+        is_stream: bool,
+        content_length: int | None = None,
+    ) -> None:
+        self.send_response(response.status_code)
+        passthrough_headers = [
+            "content-type",
+            "cache-control",
+            "x-request-id",
+            "openai-processing-ms",
+        ]
+        for key in passthrough_headers:
+            value = response.headers.get(key)
+            if value:
+                if key == "content-type" and not is_stream:
+                    continue
+                self.send_header(key, value)
+        if not is_stream:
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+        if content_length is not None:
+            self.send_header("Content-Length", str(content_length))
+        self.send_header("Connection", "close")
+        self.end_headers()
+
     def do_POST(self) -> None:
         route_account_id, route_path = self._resolve_account_route()
         if route_path != "/v1/responses":
             self.send_error(404, "Not Found")
             return
 
+        request_id = bridge_request_id()
+        started_at = time.monotonic()
+        requested_model: str | None = None
+        account_id_for_log = route_account_id or "default"
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
             raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
@@ -628,8 +804,15 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
 
             requested_account_id = route_account_id or self.headers.get("chatgpt-account-id")
             account_id, access_token = self.server.auth_store.get_access_token(requested_account_id)
+            account_id_for_log = account_id
             normalized_body = normalize_request_body(request_body)
             is_stream = requested_stream
+            requested_model = (
+                normalized_body.get("model")
+                if isinstance(normalized_body.get("model"), str)
+                else None
+            )
+            requested_effort = extract_reasoning_effort(normalized_body)
 
             upstream_headers = {
                 "Authorization": f"Bearer {access_token}",
@@ -654,7 +837,6 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 error_body = None
                 if not response.is_success:
                     error_body = response.read()
-                self.send_response(response.status_code)
                 log_upstream_result(
                     "responses",
                     account_id,
@@ -676,51 +858,60 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         error_detail=error_body.decode("utf-8", "replace") if error_body is not None else None,
                     )
 
-                passthrough_headers = [
-                    "content-type",
-                    "cache-control",
-                    "x-request-id",
-                    "openai-processing-ms",
-                ]
-                for key in passthrough_headers:
-                    value = response.headers.get(key)
-                    if value:
-                        if key == "content-type" and not is_stream:
-                            continue
-                        self.send_header(key, value)
-                if not is_stream:
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Connection", "close")
-                self.end_headers()
-
-                if is_stream:
-                    requested_effort = extract_reasoning_effort(normalized_body)
-                    requested_model = (
-                        normalized_body.get("model")
-                        if isinstance(normalized_body.get("model"), str)
-                        else None
+                if not response.is_success:
+                    body = error_body if error_body is not None else b""
+                    self._send_upstream_headers(
+                        response,
+                        is_stream=True,
+                        content_length=len(body),
                     )
+                    self._write_bytes(body, flush=True)
+                    return
+
+                upstream_request_id = response.headers.get("x-request-id")
+
+                if not is_stream:
+                    body = response.read()
+                    body = build_non_stream_json_from_sse(
+                        body,
+                        requested_model,
+                    )
+                    self._send_upstream_headers(
+                        response,
+                        is_stream=False,
+                        content_length=len(body),
+                    )
+                    self._write_bytes(body, flush=True)
+                    return
+
+                self._send_upstream_headers(response, is_stream=True)
+                try:
                     for chunk in self._iter_stream_with_reasoning_placeholder(
                         response,
                         account_id,
+                        request_id=request_id,
+                        started_at=started_at,
                         requested_effort=requested_effort,
                         requested_model=requested_model,
+                        upstream_request_id=upstream_request_id,
                     ):
-                        if chunk:
-                            self._write_bytes(chunk, flush=True)
-                else:
-                    body = error_body if error_body is not None else response.read()
-                    if response.is_success:
-                        body = build_non_stream_json_from_sse(
-                            body,
-                            normalized_body.get("model")
-                            if isinstance(normalized_body.get("model"), str)
-                            else None,
-                        )
-                    self._write_bytes(body, flush=True)
+                        if chunk and not self._write_bytes(chunk, flush=True):
+                            break
+                except OSError as exc:
+                    print(
+                        f"{log_timestamp()} [bridge-client-disconnect] request_id={request_id} type={type(exc).__name__} detail={truncate_log_text(str(exc))}",
+                        file=sys.stderr,
+                    )
+                    return
         except httpx.HTTPStatusError as exc:
             self._write_json_error(exc.response.status_code, exc.response.text)
         except Exception as exc:  # noqa: BLE001
+            log_upstream_result(
+                "responses",
+                account_id_for_log,
+                False,
+                detail=f"request_id={request_id} model={requested_model or ''} {type(exc).__name__}: {exc}",
+            )
             self._write_json_error(500, f"{type(exc).__name__}: {exc}")
 
     def _iter_stream_with_reasoning_placeholder(
@@ -728,71 +919,111 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         response: httpx.Response,
         account_id: str,
         *,
+        request_id: str | None = None,
+        started_at: float | None = None,
         requested_effort: str | None = None,
         requested_model: str | None = None,
+        upstream_request_id: str | None = None,
     ):
-        block_queue: queue.Queue[list[str] | BaseException | object] = queue.Queue()
+        block_queue: queue.Queue[list[str] | BaseException | object] = queue.Queue(maxsize=16)
         done_marker = object()
+        stream_request_id = request_id or bridge_request_id()
+        stream_started_at = started_at if started_at is not None else time.monotonic()
+        stop_reader = threading.Event()
+
+        def put_queued(item: list[str] | BaseException | object) -> None:
+            while not stop_reader.is_set():
+                try:
+                    block_queue.put(item, timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
 
         def read_blocks() -> None:
             block_lines: list[str] = []
             try:
                 for raw_line in response.iter_lines():
+                    if stop_reader.is_set():
+                        break
                     if isinstance(raw_line, bytes):
                         line = raw_line.decode("utf-8", "replace")
                     else:
                         line = raw_line
                     if line == "":
                         if block_lines:
-                            block_queue.put(block_lines)
+                            put_queued(block_lines)
                             block_lines = []
                         continue
                     block_lines.append(line)
                 if block_lines:
-                    block_queue.put(block_lines)
+                    put_queued(block_lines)
             except BaseException as exc:  # noqa: BLE001
-                block_queue.put(exc)
+                put_queued(exc)
             finally:
-                block_queue.put(done_marker)
+                put_queued(done_marker)
 
         reader = threading.Thread(target=read_blocks, daemon=True)
         reader.start()
         state = ReasoningPlaceholderState()
 
-        while True:
-            timeout = self._reasoning_placeholder_timeout(state)
-            try:
-                if timeout is None:
-                    queued = block_queue.get()
-                else:
-                    queued = block_queue.get(timeout=timeout)
-            except queue.Empty:
-                heartbeat = self._build_reasoning_placeholder_sse(
+        try:
+            while True:
+                timeout = self._reasoning_placeholder_timeout(state)
+                try:
+                    if timeout is None:
+                        queued = block_queue.get()
+                    else:
+                        queued = block_queue.get(timeout=timeout)
+                except queue.Empty:
+                    heartbeat = self._build_reasoning_placeholder_sse(
+                        account_id,
+                        state,
+                        requested_effort=requested_effort,
+                        requested_model=requested_model,
+                        source="heartbeat",
+                    )
+                    if heartbeat:
+                        yield heartbeat
+                    continue
+
+                if queued is done_marker:
+                    break
+                if isinstance(queued, BaseException):
+                    if state.completed:
+                        break
+                    log_bridge_stream_error(
+                        account_id=account_id,
+                        requested_model=requested_model,
+                        request_id=stream_request_id,
+                        started_at=stream_started_at,
+                        exc=queued,
+                        upstream_request_id=upstream_request_id,
+                    )
+                    yield response_failed_sse(
+                        request_id=stream_request_id,
+                        requested_model=requested_model,
+                        exc=queued,
+                    )
+                    break
+
+                for chunk in self._emit_sse_block_with_reasoning_placeholder(
+                    queued,
                     account_id,
-                    state,
+                    state=state,
+                    request_id=stream_request_id,
+                    started_at=stream_started_at,
                     requested_effort=requested_effort,
                     requested_model=requested_model,
-                    source="heartbeat",
-                )
-                if heartbeat:
-                    yield heartbeat
-                continue
-
-            if queued is done_marker:
-                break
-            if isinstance(queued, BaseException):
-                raise queued
-
-            for chunk in self._emit_sse_block_with_reasoning_placeholder(
-                queued,
-                account_id,
-                state=state,
-                requested_effort=requested_effort,
-                requested_model=requested_model,
-            ):
-                yield chunk
-
-        reader.join(timeout=0.1)
+                    upstream_request_id=upstream_request_id,
+                ):
+                    yield chunk
+        finally:
+            stop_reader.set()
+            try:
+                response.close()
+            except Exception:
+                pass
+            reader.join(timeout=0.5)
 
     def _reasoning_placeholder_timeout(self, state: ReasoningPlaceholderState) -> float | None:
         if state.completed or state.saw_text_delta or not state.active or state.emitted_count == 0:
@@ -896,6 +1127,16 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         if state.completed or state.saw_text_delta:
             return None
 
+        mode = reasoning_placeholder_mode()
+        if mode == "off":
+            return None
+        if mode == "comment":
+            state.emitted_count += 1
+            state.last_emitted_at = time.monotonic()
+            return (
+                f": bridge reasoning active source={source} effort={requested_effort or 'unknown'}\n\n"
+            ).encode("utf-8")
+
         placeholder: dict[str, Any] = {
             "type": "response.output_text.delta",
             "delta": build_visible_model_hint(None, requested_model, None, requested_effort),
@@ -909,7 +1150,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         state.emitted_count += 1
         state.last_emitted_at = time.monotonic()
         print(
-            f"[bridge-thinking-visible] account_id={account_id} item_id={state.item_id or 'unknown'} source={source} effort={requested_effort or 'unknown'} count={state.emitted_count}",
+            f"{log_timestamp()} [bridge-thinking-visible] account_id={account_id} item_id={state.item_id or 'unknown'} source={source} effort={requested_effort or 'unknown'} count={state.emitted_count}",
             file=sys.stderr,
         )
         sse = (
@@ -924,14 +1165,28 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         account_id: str,
         *,
         state: ReasoningPlaceholderState,
+        request_id: str,
+        started_at: float,
         requested_effort: str | None = None,
         requested_model: str | None = None,
+        upstream_request_id: str | None = None,
     ):
         raw_block = "\n".join(block_lines) + "\n\n"
         yield raw_block.encode("utf-8")
 
         event_name, payload, data_lines = self._parse_sse_block(block_lines)
         self._update_reasoning_placeholder_state(state, event_name, payload)
+        terminal_error = terminal_stream_error_from_payload(event_name, payload)
+        if terminal_error is not None and not state.logged_terminal_error:
+            state.logged_terminal_error = True
+            log_bridge_stream_error(
+                account_id=account_id,
+                requested_model=requested_model,
+                request_id=request_id,
+                started_at=started_at,
+                exc=terminal_error,
+                upstream_request_id=upstream_request_id,
+            )
 
         if not data_lines or payload is None:
             return
@@ -954,7 +1209,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             yield placeholder
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        sys.stderr.write(f"[codex-bridge] {self.address_string()} - {fmt % args}\n")
+        sys.stderr.write(f"{log_timestamp()} [codex-bridge] {self.address_string()} - {fmt % args}\n")
 
     def _write_json_error(self, status: int, message: str) -> None:
         payload = json.dumps({"error": message}, ensure_ascii=False).encode("utf-8")
@@ -965,13 +1220,14 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self._write_bytes(payload)
 
-    def _write_bytes(self, payload: bytes, *, flush: bool = False) -> None:
+    def _write_bytes(self, payload: bytes, *, flush: bool = False) -> bool:
         try:
             self.wfile.write(payload)
             if flush:
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            return
+            return True
+        except OSError:
+            return False
 
 
 class CodexBridgeServer(ThreadingHTTPServer):
@@ -992,13 +1248,13 @@ def main() -> int:
     try:
         proxy_url = get_upstream_proxy_url()
     except Exception as exc:  # noqa: BLE001
-        print(f"invalid upstream proxy config: {exc}", file=sys.stderr)
+        print(f"{log_timestamp()} invalid upstream proxy config: {exc}", file=sys.stderr)
         return 1
 
     auth_store = AuthStore(auth_store_path)
     server = CodexBridgeServer((host, port), CodexBridgeHandler, auth_store)
     print(
-        f"codex bridge listening on http://{host}:{port} (upstream_proxy={mask_proxy_url(proxy_url)})",
+        f"{log_timestamp()} codex bridge listening on http://{host}:{port} (upstream_proxy={mask_proxy_url(proxy_url)})",
         file=sys.stderr,
     )
     try:

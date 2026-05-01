@@ -31,8 +31,18 @@ from typing import Any
 DEFAULT_DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
 DEFAULT_SETTINGS_PATH = Path.home() / ".cc-switch" / "settings.json"
 DEFAULT_AUTH_PATH = Path.home() / ".cc-switch" / "codex_oauth_auth.json"
+DEFAULT_CCSWITCH_COMMON_CONFIG_PATH = Path.home() / ".ccswitch-common-config.json"
+DEFAULT_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
+DEFAULT_LOCAL_BRIDGE_STATE_PATH = Path.home() / ".cc-switch" / "bridgedeck-local-bridge-state.json"
+DEFAULT_OMC_CODEX_SHIM_PATHS = (
+    DEFAULT_CLI_LAUNCHER_DIR / "bin" / "codex",
+    Path.home() / ".codebuddy" / "bin" / "codex",
+    Path.home() / ".workbuddy" / "bin" / "codex",
+)
+DEFAULT_ZPROFILE_PATH = Path.home() / ".zprofile"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
@@ -61,6 +71,9 @@ CANONICAL_BRIDGE_NAMES = (
     "Local Codex Bridge - Pro",
     "Local Codex Bridge - Pro 20x",
 )
+MANAGED_CODEX_SHIM_MARKER = "BridgeDeck managed codex-current shim"
+MANAGED_CODEX_PATH_START = "# >>> BridgeDeck codex shim >>>"
+MANAGED_CODEX_PATH_END = "# <<< BridgeDeck codex shim <<<"
 
 
 def now_ts() -> str:
@@ -211,6 +224,52 @@ def safe_slug(value: str) -> str:
     return value or "account"
 
 
+def codex_binary_path() -> str:
+    homebrew_codex = Path("/opt/homebrew/bin/codex")
+    if homebrew_codex.exists():
+        return str(homebrew_codex)
+    return which("codex") or "codex"
+
+
+def current_codex_launcher_path() -> Path:
+    return DEFAULT_CLI_LAUNCHER_DIR / "codex-current.command"
+
+
+def write_executable_file(path: Path, body: str) -> None:
+    if path.is_symlink():
+        raise ValueError(f"{path} 不能是符号链接")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def write_private_text_file(path: Path, body: str) -> None:
+    if path.is_symlink():
+        raise ValueError(f"{path} 不能是符号链接")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def decode_jwt_payload(token: str | None) -> dict[str, Any]:
     if not token or "." not in token:
         return {}
@@ -263,6 +322,32 @@ def read_local_url(url: str, *, timeout: float, max_bytes: int) -> bytes:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(request, timeout=timeout) as response:
         return response.read(max_bytes)
+
+
+def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dict[str, Any]:
+    if not path.exists() or path.is_symlink():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    error = payload.get("last_stream_error")
+    if not isinstance(error, dict):
+        return {}
+    return {
+        "updated_at": payload.get("updated_at"),
+        "last_stream_error": {
+            "account_id": str(error.get("account_id") or ""),
+            "model": str(error.get("model") or ""),
+            "request_id": str(error.get("request_id") or ""),
+            "duration_ms": error.get("duration_ms"),
+            "error_type": str(error.get("error_type") or ""),
+            "error": str(error.get("error") or ""),
+            "upstream_request_id": str(error.get("upstream_request_id") or ""),
+        },
+    }
 
 
 def mask_url_credentials(value: str) -> str:
@@ -442,6 +527,106 @@ class BridgeManager:
         settings["currentProviderClaude"] = provider_id
         self._save_settings(settings)
 
+    def _installed_claude_plugins(self) -> dict[str, bool]:
+        raw = load_json(DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH, {})
+        if not isinstance(raw, dict):
+            return {}
+        plugins = raw.get("plugins")
+        if not isinstance(plugins, dict):
+            return {}
+        result: dict[str, bool] = {}
+        for plugin_id, entries in plugins.items():
+            if not isinstance(plugin_id, str) or "@" not in plugin_id:
+                continue
+            if isinstance(entries, list) and len(entries) > 0:
+                result[plugin_id] = True
+        return result
+
+    def _enabled_plugins_from(self, payload: dict[str, Any]) -> dict[str, bool]:
+        raw = payload.get("enabledPlugins")
+        if not isinstance(raw, dict):
+            return {}
+        return {str(key): bool(value) for key, value in raw.items() if isinstance(key, str)}
+
+    def sync_claude_enabled_plugins(self) -> dict[str, Any]:
+        installed = self._installed_claude_plugins()
+        if not installed:
+            return {
+                "ok": True,
+                "changed": False,
+                "installed_count": 0,
+                "enabled_count": 0,
+                "added": [],
+                "backups": [],
+            }
+
+        common = load_json(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, {})
+        settings = load_json(DEFAULT_CLAUDE_SETTINGS_PATH, {})
+        common = common if isinstance(common, dict) else {}
+        settings = settings if isinstance(settings, dict) else {}
+        common_enabled = self._enabled_plugins_from(common)
+        settings_enabled = self._enabled_plugins_from(settings)
+
+        merged = dict(common_enabled)
+        merged.update(settings_enabled)
+        added: list[str] = []
+        for plugin_id in sorted(installed):
+            explicitly_disabled = common_enabled.get(plugin_id) is False or settings_enabled.get(plugin_id) is False
+            if plugin_id not in merged and not explicitly_disabled:
+                merged[plugin_id] = True
+                added.append(plugin_id)
+
+        common_changed = common_enabled != merged
+        settings_changed = settings_enabled != merged
+        backups: list[str] = []
+        if common_changed:
+            backup = self._backup_file(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, "sync-enabled-plugins")
+            if backup:
+                backups.append(backup)
+            common["enabledPlugins"] = merged
+            dump_json(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, common)
+        if settings_changed:
+            backup = self._backup_file(DEFAULT_CLAUDE_SETTINGS_PATH, "sync-enabled-plugins")
+            if backup:
+                backups.append(backup)
+            settings["enabledPlugins"] = merged
+            dump_json(DEFAULT_CLAUDE_SETTINGS_PATH, settings)
+
+        return {
+            "ok": True,
+            "changed": common_changed or settings_changed,
+            "installed_count": len(installed),
+            "enabled_count": len([value for value in merged.values() if value]),
+            "added": added,
+            "backups": backups,
+        }
+
+    def claude_plugin_sync_status(self) -> dict[str, Any]:
+        installed = self._installed_claude_plugins()
+        common = load_json(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, {})
+        settings = load_json(DEFAULT_CLAUDE_SETTINGS_PATH, {})
+        common = common if isinstance(common, dict) else {}
+        settings = settings if isinstance(settings, dict) else {}
+        common_enabled = self._enabled_plugins_from(common)
+        settings_enabled = self._enabled_plugins_from(settings)
+        missing_from_common = sorted(plugin_id for plugin_id in installed if plugin_id not in common_enabled)
+        missing_from_settings = sorted(plugin_id for plugin_id in installed if plugin_id not in settings_enabled)
+        disabled = sorted(
+            plugin_id
+            for plugin_id in installed
+            if common_enabled.get(plugin_id) is False or settings_enabled.get(plugin_id) is False
+        )
+        return {
+            "ok": True,
+            "installed_count": len(installed),
+            "common_enabled_count": len(common_enabled),
+            "settings_enabled_count": len(settings_enabled),
+            "missing_from_common": missing_from_common,
+            "missing_from_settings": missing_from_settings,
+            "disabled": disabled,
+            "needs_sync": bool(missing_from_common or missing_from_settings),
+        }
+
     def _load_auto_switch_config(self) -> dict[str, Any]:
         raw = load_json(DEFAULT_AUTO_SWITCH_PATH, {})
         config = raw if isinstance(raw, dict) else {}
@@ -555,6 +740,7 @@ class BridgeManager:
                 body = ""
             account_match = re.search(r"/accounts/([^/'\" ]+)/v1", body)
             home_match = re.search(r"CODEX_HOME=(?:'([^']+)'|\"([^\"]+)\"|([^ \n]+))", body)
+            is_current_launcher = item == current_codex_launcher_path()
             launchers.append(
                 {
                     "path": str(item),
@@ -562,9 +748,82 @@ class BridgeManager:
                     "account_id": account_match.group(1) if account_match else "",
                     "codex_home": next((v for v in (home_match.groups() if home_match else ()) if v), ""),
                     "launcher_only": "OPENAI_API_KEY" in body and "/accounts/" in body and "/v1" in body,
+                    "is_current_launcher": is_current_launcher,
+                    "launcher_role": "current" if is_current_launcher else "dedicated",
                 }
             )
         return launchers
+
+    def _current_codex_launcher_status(self) -> dict[str, Any]:
+        launcher_path = current_codex_launcher_path()
+        data = {
+            "path": str(launcher_path),
+            "exists": launcher_path.exists(),
+            "account_id": "",
+            "base_url": "",
+            "launcher_only": False,
+            "codex_home": "",
+            "risk_flags": [],
+        }
+        if not launcher_path.exists():
+            data["risk_flags"].append("missing_current_launcher")
+            return data
+        if launcher_path.is_symlink():
+            data["risk_flags"].append("current_launcher_symlink")
+            return data
+        try:
+            body = launcher_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            data["risk_flags"].append(f"current_launcher_read_error:{exc}")
+            return data
+        base_match = re.search(r'base_url="([^"]+)"', body)
+        if base_match:
+            data["base_url"] = base_match.group(1)
+        account_match = re.search(r"/accounts/([^/'\" ]+)/v1", body)
+        if account_match:
+            data["account_id"] = account_match.group(1)
+        home_match = re.search(r"CODEX_HOME=(?:'([^']+)'|\"([^\"]+)\"|([^ \n]+))", body)
+        data["codex_home"] = next((v for v in (home_match.groups() if home_match else ()) if v), "")
+        data["launcher_only"] = "OPENAI_API_KEY" in body and bool(data["base_url"])
+        if data["codex_home"]:
+            data["risk_flags"].append("current_launcher_sets_codex_home")
+        if not data["launcher_only"]:
+            data["risk_flags"].append("current_launcher_not_local_bridge")
+        return data
+
+    def _omc_codex_shim_status(self) -> dict[str, Any]:
+        shims: list[dict[str, Any]] = []
+        active = False
+        risk_flags: list[str] = []
+        for path in DEFAULT_OMC_CODEX_SHIM_PATHS:
+            exists = path.exists()
+            managed = False
+            target_current = False
+            body = ""
+            if exists and not path.is_symlink():
+                try:
+                    body = path.read_text(encoding="utf-8")
+                except Exception:
+                    body = ""
+                managed = MANAGED_CODEX_SHIM_MARKER in body
+                target_current = str(current_codex_launcher_path()) in body
+            elif path.is_symlink():
+                risk_flags.append("omc_codex_shim_symlink")
+            if exists and not managed:
+                risk_flags.append("omc_codex_shim_unmanaged")
+            if managed and target_current:
+                active = True
+            shims.append(
+                {
+                    "path": str(path),
+                    "exists": exists,
+                    "managed": managed,
+                    "target_current": target_current,
+                }
+            )
+        if not active:
+            risk_flags.append("omc_codex_shim_missing")
+        return {"active": active, "shims": shims, "risk_flags": sorted(set(risk_flags))}
 
     def _codex_desktop_status(self) -> dict[str, Any]:
         config_path = DEFAULT_CODEX_HOME / "config.toml"
@@ -661,6 +920,8 @@ class BridgeManager:
                 homes_by_account.setdefault(account_id, []).append(home)
         launchers_by_account: dict[str, list[dict[str, Any]]] = {}
         for launcher in cli_launchers:
+            if launcher.get("is_current_launcher"):
+                continue
             account_id = str(launcher.get("account_id") or "")
             if account_id:
                 launchers_by_account.setdefault(account_id, []).append(launcher)
@@ -756,6 +1017,7 @@ class BridgeManager:
         bridge_processes = port_processes(LOCAL_BRIDGE_PORT)
         bridge_script = find_local_bridge_script(bridge_processes)
         upstream_proxy = detect_upstream_proxy(bridge_processes)
+        bridge_state = read_local_bridge_state()
         return {
             "ok": True,
             "services": {
@@ -773,6 +1035,7 @@ class BridgeManager:
                     "can_start": bool(bridge_script),
                     "upstream_proxy": mask_url_credentials(upstream_proxy),
                     "log_path": str(self.paths.db.parent / "bridgedeck-local-bridge.log"),
+                    "last_stream_error": bridge_state.get("last_stream_error") or {},
                 },
                 "cc_switch_proxy": {
                     "name": "CC Switch Proxy",
@@ -881,10 +1144,7 @@ class BridgeManager:
         rows = quota_rows if isinstance(quota_rows, list) else []
         statuses = {str(item.get("quota_status") or "") for item in rows if isinstance(item, dict)}
         if rows and statuses and statuses <= {"network_error", "bridge_down", "unknown"}:
-            restarted = self.control_local_bridge("restart")
-            actions.append(str(restarted.get("message") or restarted.get("error") or "restart_local_bridge"))
-            if restarted.get("ok"):
-                payload = self.quotas()
+            actions.append("额度查询失败，未重启 Local Bridge")
 
         payload["actions"] = actions
         payload["services"] = self.services().get("services", {})
@@ -1355,6 +1615,14 @@ class BridgeManager:
         return self._extract_json(row["settings_config"]), self._extract_json(row["meta"])
 
     def snapshot(self, include_secrets: bool = False) -> dict[str, Any]:
+        try:
+            plugin_sync = self.sync_claude_enabled_plugins()
+        except Exception as exc:  # noqa: BLE001
+            plugin_sync = {"ok": False, "changed": False, "error": str(exc)}
+        try:
+            plugin_status = self.claude_plugin_sync_status()
+        except Exception as exc:  # noqa: BLE001
+            plugin_status = {"ok": False, "error": str(exc)}
         data: dict[str, Any] = {
             "version": APP_VERSION,
             "paths": {
@@ -1362,6 +1630,9 @@ class BridgeManager:
                 "settings": str(self.paths.settings),
                 "auth_store": str(self.paths.auth_store),
                 "auto_switch": str(DEFAULT_AUTO_SWITCH_PATH),
+                "ccswitch_common_config": str(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH),
+                "claude_settings": str(DEFAULT_CLAUDE_SETTINGS_PATH),
+                "claude_installed_plugins": str(DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH),
             },
             "exists": {
                 "db": self.paths.db.exists(),
@@ -1374,9 +1645,13 @@ class BridgeManager:
             "cli_homes": self._known_cli_homes(),
             "cli_launchers": self._known_cli_launchers(),
             "codex_desktop": self._codex_desktop_status(),
+            "current_codex_launcher": self._current_codex_launcher_status(),
+            "omc_codex_shim": self._omc_codex_shim_status(),
             "account_matrix": [],
             "current_provider_from_settings": self._current_provider_from_settings(),
             "auto_switch": self._load_auto_switch_config(),
+            "plugin_sync": plugin_sync,
+            "plugin_status": plugin_status,
         }
 
         if not self.paths.db.exists():
@@ -2037,17 +2312,16 @@ class BridgeManager:
             os.chmod(launcher_dir, 0o700)
             launcher_name = safe_slug(profile_name or account_payload.get("email") or account_id[:8])
             launcher_path = launcher_dir / f"codex-{launcher_name}.command"
-            codex_bin = which("codex") or "codex"
+            codex_bin = codex_binary_path()
             base_url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1"
             config_arg = f'base_url="{base_url}"'
-            launcher_path.write_text(
+            write_executable_file(
+                launcher_path,
                 "#!/bin/zsh\n"
                 f"export CODEX_HOME={json.dumps(str(target))}\n"
                 'export OPENAI_API_KEY="local-bridge"\n'
                 f"exec {json.dumps(codex_bin)} -c '{config_arg}' \"$@\"\n",
-                encoding="utf-8",
             )
-            launcher_path.chmod(0o755)
 
             return {
                 "ok": True,
@@ -2062,6 +2336,90 @@ class BridgeManager:
                 "warning": "不再复制或刷新 OpenAI token；旧 auth.json 如存在会在状态页标记为 stale_launcher。",
                 "backups": [],
             }
+
+    def write_current_codex_launcher(self, account_id: str) -> dict[str, Any]:
+        account_id = account_id.strip()
+        if not account_id:
+            raise ValueError("account_id 不能为空")
+        store = self._load_auth_store_raw()
+        accounts = store.get("accounts")
+        if not isinstance(accounts, dict):
+            raise ValueError("auth store 缺少 accounts")
+        account_payload = accounts.get(account_id)
+        if not isinstance(account_payload, dict):
+            raise ValueError(f"未找到账号: {account_id}")
+
+        launcher_path = current_codex_launcher_path()
+        base_url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1"
+        config_arg = f'base_url="{base_url}"'
+        write_executable_file(
+            launcher_path,
+            "#!/bin/zsh\n"
+            'export OPENAI_API_KEY="local-bridge"\n'
+            f"exec {json.dumps(codex_binary_path())} -c '{config_arg}' \"$@\"\n",
+        )
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "email": account_payload.get("email", ""),
+            "launcher": str(launcher_path),
+            "run_command": str(launcher_path),
+            "base_url": base_url,
+            "launcher_only": True,
+        }
+
+    def write_omc_codex_shims(self) -> dict[str, Any]:
+        current_launcher = current_codex_launcher_path()
+        if not current_launcher.exists():
+            raise ValueError("codex-current.command 不存在")
+        body = (
+            "#!/bin/zsh\n"
+            f"# {MANAGED_CODEX_SHIM_MARKER}\n"
+            f"exec {json.dumps(str(current_launcher))} \"$@\"\n"
+        )
+        written: list[str] = []
+        for shim_path in DEFAULT_OMC_CODEX_SHIM_PATHS:
+            if shim_path.exists() or shim_path.is_symlink():
+                try:
+                    existing = shim_path.read_text(encoding="utf-8") if shim_path.is_file() and not shim_path.is_symlink() else ""
+                except Exception:
+                    existing = ""
+                if MANAGED_CODEX_SHIM_MARKER not in existing:
+                    raise ValueError(f"OMC/tmux codex 包装器已存在且不是 BridgeDeck 管理: {shim_path}")
+            write_executable_file(shim_path, body)
+            written.append(str(shim_path))
+        return {"ok": True, "paths": written, "target": str(current_launcher)}
+
+    def ensure_omc_codex_path(self) -> dict[str, Any]:
+        profile = DEFAULT_ZPROFILE_PATH
+        if profile.is_symlink():
+            raise ValueError("~/.zprofile 不能是符号链接")
+        shim_dir = DEFAULT_CLI_LAUNCHER_DIR / "bin"
+        block = (
+            f"{MANAGED_CODEX_PATH_START}\n"
+            f'export PATH="{shim_dir}:$PATH"\n'
+            f"{MANAGED_CODEX_PATH_END}"
+        )
+        original = profile.read_text(encoding="utf-8") if profile.exists() else ""
+        pattern = re.compile(
+            rf"{re.escape(MANAGED_CODEX_PATH_START)}.*?{re.escape(MANAGED_CODEX_PATH_END)}",
+            re.DOTALL,
+        )
+        if pattern.search(original):
+            updated = pattern.sub(block, original, count=1)
+        else:
+            updated = f"{original.rstrip()}\n\n{block}\n" if original.strip() else f"{block}\n"
+        backup = None
+        if updated != original:
+            backup = self._backup_file(profile, "codex-shim-path") if profile.exists() else None
+            write_private_text_file(profile, updated)
+        return {
+            "ok": True,
+            "profile": str(profile),
+            "shim_dir": str(shim_dir),
+            "changed": updated != original,
+            "backup": backup,
+        }
 
     def set_default_codex_account(self, account_id: str) -> dict[str, Any]:
         account_id = account_id.strip()
@@ -2090,20 +2448,22 @@ class BridgeManager:
                 updated = pattern.sub(line, original, count=1)
             else:
                 updated = f"{line}\n{original}" if original else f"{line}\n"
-            config_path.write_text(updated, encoding="utf-8")
-            try:
-                os.chmod(config_path, 0o600)
-            except OSError:
-                pass
+            current_launcher = self.write_current_codex_launcher(account_id)
+            omc_shims = self.write_omc_codex_shims()
+            omc_path = self.ensure_omc_codex_path()
+            write_private_text_file(config_path, updated)
             return {
                 "ok": True,
                 "message": "默认 Codex 账号已设置",
                 "account_id": account_id,
                 "email": account_payload.get("email", ""),
                 "config_path": str(config_path),
+                "current_launcher": current_launcher["launcher"],
+                "omc_codex_shims": omc_shims["paths"],
+                "omc_codex_path": omc_path,
                 "base_url": base_url,
-                "affected": ["Paperclip", "Codex Desktop", "default codex"],
-                "backups": [backup] if backup else [],
+                "affected": ["Paperclip", "Codex Desktop", "default codex", "codex-current.command", "OMC/tmux codex"],
+                "backups": [item for item in (backup, omc_path.get("backup")) if item],
             }
 
     def migrate_cli_launcher(self, account_id: str, target_dir: str, profile_name: str) -> dict[str, Any]:
@@ -2318,6 +2678,26 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(desktop, dict):
         desktop["config_path"] = redact_path_value(desktop.get("config_path"))
         desktop["base_url"] = re.sub(r"/accounts/[^/?#]+", "/accounts/<redacted>", str(desktop.get("base_url") or ""))
+    current_launcher = redacted.get("current_codex_launcher")
+    if isinstance(current_launcher, dict):
+        current_launcher["path"] = redact_path_value(current_launcher.get("path"))
+        current_launcher["base_url"] = re.sub(
+            r"/accounts/[^/?#]+",
+            "/accounts/<redacted>",
+            str(current_launcher.get("base_url") or ""),
+        )
+        current_launcher["account_id"] = mask_id_value(current_launcher.get("account_id"))
+        current_launcher["codex_home"] = redact_path_value(current_launcher.get("codex_home"))
+    omc_shim = redacted.get("omc_codex_shim")
+    if isinstance(omc_shim, dict):
+        for shim in omc_shim.get("shims", []):
+            if isinstance(shim, dict):
+                shim["path"] = redact_path_value(shim.get("path"))
+    plugin_sync = redacted.get("plugin_sync")
+    if isinstance(plugin_sync, dict):
+        plugin_sync["backups"] = [
+            redact_path_value(item) for item in plugin_sync.get("backups", []) if isinstance(item, str)
+        ]
     for row in redacted.get("account_matrix", []):
         if isinstance(row, dict):
             row["account_id"] = mask_id_value(row.get("account_id"))
@@ -2347,6 +2727,9 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             service.pop("log_path", None)
             if service.get("upstream_proxy"):
                 service["upstream_proxy"] = "<redacted>"
+            stream_error = service.get("last_stream_error")
+            if isinstance(stream_error, dict):
+                stream_error["account_id"] = mask_id_value(stream_error.get("account_id"))
     return redacted
 
 
@@ -2507,6 +2890,13 @@ INDEX_HTML = """<!doctype html>
       </div>
       <div id="recommendation" class="recommend">加载中...</div>
       <div class="recommend">
+        <b>Claude 插件启用态</b>
+        <div id="pluginSyncStatus" class="sectionHint">插件同步检测中...</div>
+        <div class="toggleLine">
+          <button class="miniBtn" data-action="sync-claude-plugins">一键同步插件启用态</button>
+        </div>
+      </div>
+      <div class="recommend">
         <b>OpenAI 额度与自动切换</b>
         <div class="sectionHint">只接管 Local Codex Bridge。你切到 MiniMax、Nvidia、SSSAiCode 等第三方供应商时不会自动改回 OpenAI。</div>
         <div id="actualCurrentAccounts" class="actualLine">实际当前使用：检测中...</div>
@@ -2595,7 +2985,7 @@ INDEX_HTML = """<!doctype html>
         <div class="toolCard">
           <div>
             <div class="toolName">全局 Codex CLI</div>
-            <div class="toolText">给 Paperclip、Codex Desktop、直接运行 codex 用。会把全局默认账号改成这里选的账号。</div>
+            <div class="toolText">给 Paperclip、Codex Desktop、OMC/tmux 用。会一起写全局配置、固定入口和 codex 包装器。</div>
             <div class="toolSelect">
               <label for="simpleDefaultAccount">全局 Codex CLI 用哪个账号</label>
               <select id="simpleDefaultAccount"></select>
@@ -2830,7 +3220,7 @@ INDEX_HTML = """<!doctype html>
           '账号矩阵看 Claude、CLI、Desktop 三端状态。',
           'stale_launcher 表示旧 CLI 目录里还有 token。',
           'Codex Provider mismatch 表示绑定账号和实际 token 不一致。',
-          '~/.codex 只检测，不由 BridgeDeck 接管。',
+          '~/.codex/auth.json 只代表本机 token；Desktop/全局入口看实际状态。',
           '~/.codex-cli-* 用 launcher-only 方式启动。'
         ]
       },
@@ -2912,13 +3302,53 @@ INDEX_HTML = """<!doctype html>
       const mode = statusText(desktop.managed_by || 'unknown');
       return desktop.base_url ? `${mode} / ${humanPath(desktop.config_path || '')}` : mode;
     }
+    function currentLauncherAccountText(data) {
+      const launcher = data.current_codex_launcher || {};
+      if (launcher.account_id) return accountDisplay(launcher.account_id);
+      return launcher.exists ? '未识别' : '未生成';
+    }
+    function currentLauncherModeText(data) {
+      const launcher = data.current_codex_launcher || {};
+      if (!launcher.exists) return 'codex-current.command 未生成';
+      const desktop = data.codex_desktop || {};
+      const mismatch = desktop.account_id && launcher.account_id && desktop.account_id !== launcher.account_id;
+      const state = mismatch ? '账号不一致' : '固定入口';
+      return `${state} / ${humanPath(launcher.path || '')}`;
+    }
+    function omcShimText(data) {
+      const shim = data.omc_codex_shim || {};
+      return shim.active ? 'OMC/tmux 已接管 codex' : 'OMC/tmux 未接管 codex';
+    }
     function renderActualCurrentAccounts(data) {
       const box = document.getElementById('actualCurrentAccounts');
       if (!box) return;
       const provider = currentClaudeProvider(data);
       const claudeAccount = provider && provider.account_id ? accountDisplay(provider.account_id) : '外部供应商/未检测到';
       const codexAccount = desktopAccountText(data);
-      box.innerHTML = `实际当前使用：Claude Code <strong>${esc(claudeAccount)}</strong>；全局 Codex CLI <strong>${esc(codexAccount)}</strong>`;
+      const launcherAccount = currentLauncherAccountText(data);
+      box.innerHTML = `实际当前使用：Claude Code <strong>${esc(claudeAccount)}</strong>；全局 Codex CLI <strong>${esc(codexAccount)}</strong>；OMC/tmux <strong>${esc(launcherAccount)}</strong>`;
+    }
+    function renderPluginSync(data) {
+      const box = document.getElementById('pluginSyncStatus');
+      if (!box) return;
+      const status = data.plugin_status || {};
+      const sync = data.plugin_sync || {};
+      if (status.ok === false || sync.ok === false) {
+        box.innerHTML = `<span class="bad">插件同步检查失败：${esc(status.error || sync.error || 'unknown')}</span>`;
+        return;
+      }
+      const missing = [...(status.missing_from_common || []), ...(status.missing_from_settings || [])];
+      const added = sync.added || [];
+      const changed = Boolean(sync.changed);
+      if (changed && added.length) {
+        box.innerHTML = `<span class="ok">已自动同步 ${esc(added.length)} 个插件</span>：${esc(added.join(', '))}`;
+        return;
+      }
+      if (missing.length) {
+        box.innerHTML = `<span class="warnText">发现 ${esc(missing.length)} 个插件未写入通用配置，点击一键同步。</span>`;
+        return;
+      }
+      box.innerHTML = `<span class="ok">已同步</span>：已安装 ${esc(status.installed_count || 0)} 个；common ${esc(status.common_enabled_count || 0)} 个；当前 settings ${esc(status.settings_enabled_count || 0)} 个`;
     }
     function renderSimpleActuals(data) {
       const box = document.getElementById('simpleClaudeActual');
@@ -2935,7 +3365,7 @@ INDEX_HTML = """<!doctype html>
       const cliBox = document.getElementById('simpleCliActual');
       if (cliBox) {
         const selected = selectedAccount('simpleCliAccount');
-        const launcher = selected ? (data.cli_launchers || []).find((item) => item.account_id === selected.account_id) : null;
+        const launcher = selected ? (data.cli_launchers || []).find((item) => item.account_id === selected.account_id && !item.is_current_launcher) : null;
         const launcherText = launcher ? `launcher 已生成：${humanPath(launcher.path || '')}` : 'launcher 未生成';
         cliBox.innerHTML = selected
           ? `当前实际：<strong>${esc(accountLabel(selected))}</strong><br><span class="${launcher ? 'ok' : 'warnText'}">${esc(launcherText)}</span>`
@@ -2943,7 +3373,11 @@ INDEX_HTML = """<!doctype html>
       }
       const defaultBox = document.getElementById('simpleDefaultActual');
       if (defaultBox) {
-        defaultBox.innerHTML = `当前实际：<strong>${esc(desktopAccountText(data))}</strong><br><span class="ok">${esc(desktopModeText(data))}</span>`;
+        const launcher = data.current_codex_launcher || {};
+        const desktop = data.codex_desktop || {};
+        const mismatch = desktop.account_id && launcher.account_id && desktop.account_id !== launcher.account_id;
+        const shimOk = Boolean((data.omc_codex_shim || {}).active);
+        defaultBox.innerHTML = `当前实际：<strong>${esc(desktopAccountText(data))}</strong><br><span class="${mismatch ? 'bad' : 'ok'}">${esc(desktopModeText(data))}</span><br><span class="${mismatch ? 'bad' : 'ok'}">固定入口：${esc(currentLauncherAccountText(data))} / ${esc(currentLauncherModeText(data))}</span><br><span class="${shimOk ? 'ok' : 'warnText'}">${esc(omcShimText(data))}</span>`;
       }
       const desktopBox = document.getElementById('simpleDesktopActual');
       if (desktopBox) {
@@ -2970,6 +3404,7 @@ INDEX_HTML = """<!doctype html>
         refresh_token_reused: '需重新授权',
         unsupported_region: '地区受限',
         bridge_down: 'bridge 断开',
+        proxy_down: '代理失败',
         network_error: '查询失败'
       };
       return map[value] || value || '未知';
@@ -3078,9 +3513,13 @@ INDEX_HTML = """<!doctype html>
         const cls = running ? 'ok' : 'bad';
         const script = item.script ? `<br>${esc(humanPath(item.script))}` : '';
         const proxy = item.upstream_proxy ? `<br>proxy: ${esc(item.upstream_proxy)}` : '';
+        const err = item.last_stream_error || {};
+        const streamError = err.error_type
+          ? `<br><span class="warnText">stream error: ${esc(err.error_type)}${err.model ? ' / ' + esc(err.model) : ''}</span>`
+          : '';
         return `<div class="serviceItem">
           <div class="serviceName">${esc(item.name || '')}</div>
-          <div class="serviceMeta"><span class="${cls}">${running ? '运行中' : '未运行'}</span> · ${esc(item.port || '')}${script}${proxy}</div>
+          <div class="serviceMeta"><span class="${cls}">${running ? '运行中' : '未运行'}</span> · ${esc(item.port || '')}${script}${proxy}${streamError}</div>
         </div>`;
       }).join('');
       const message = document.getElementById('serviceMessage');
@@ -3387,12 +3826,14 @@ INDEX_HTML = """<!doctype html>
     function renderAccountMatrix(data) {
       const body = document.querySelector('#accountMatrixTable tbody');
       body.innerHTML = '';
-      const desktopAccount = data.codex_desktop ? data.codex_desktop.account_id : '';
+      const desktop = data.codex_desktop || {};
+      const desktopAccount = desktop.account_id || '';
+      const desktopUnknown = desktop.detected ? '未识别' : '未检测';
       (data.account_matrix || []).forEach((row) => {
         const status = row.account_status || 'ok';
         const cls = status === 'ok' ? 'ok' : (status === 'stale_launcher' ? 'warnText' : 'bad');
         const tr = document.createElement('tr');
-        const desktopLabel = row.account_id && desktopAccount && row.account_id === desktopAccount ? '默认' : statusText(row.codex_desktop || '');
+        const desktopLabel = row.account_id && desktopAccount ? (row.account_id === desktopAccount ? '默认' : '备用') : desktopUnknown;
         tr.innerHTML = `
           <td>${esc(maskEmail(row.email || row.label || maskId(row.account_id || '')))}</td>
           <td>${row.claude_current ? '<span class="ok">当前</span>' : '<span class="muted">备用</span>'}</td>
@@ -3460,6 +3901,8 @@ INDEX_HTML = """<!doctype html>
       const currentCodex = data.codex_providers.filter((p) => p.is_current);
       const mismatches = data.codex_providers.filter((p) => p.token_mismatch);
       const defaultCli = data.cli_homes.find((h) => humanPath(h.path) === '~/.codex');
+      const desktop = data.codex_desktop || {};
+      const launcher = data.current_codex_launcher || {};
       const staleHomes = data.cli_homes.filter((h) => (h.risk_flags || []).includes('stale_cli_token_profile'));
       const advice = [];
       let state = 'okState';
@@ -3483,11 +3926,20 @@ INDEX_HTML = """<!doctype html>
         state = state === 'badState' ? state : 'warnState';
         advice.push(`发现 ${staleHomes.length} 个旧 CLI tokenful profile：建议迁移为 launcher-only。`);
       }
-      if (defaultCli) {
-        advice.push(`默认 Codex Desktop/CLI：只检测，不由 BridgeDeck 接管，${maskEmail(defaultCli.email || '') || '无邮箱信息'}。`);
+      if (desktop.account_id || desktop.managed_by) {
+        advice.push(`默认 Codex Desktop/CLI：${desktopAccountText(data)}，${desktopModeText(data)}。`);
       } else {
         state = state === 'badState' ? state : 'warnState';
-        advice.push('未检测到默认 ~/.codex/auth.json：Codex Desktop/默认 CLI 可能还没登录。');
+        advice.push('未检测到 Codex Desktop/默认 CLI 接管状态。');
+      }
+      if (launcher.exists || launcher.account_id) {
+        advice.push(`固定入口/OMC/tmux：${currentLauncherAccountText(data)}，${currentLauncherModeText(data)}；${omcShimText(data)}。`);
+      }
+      if (defaultCli) {
+        const defaultToken = maskEmail(defaultCli.email || '') || maskId(defaultCli.token_account_id || defaultCli.access_account_id || '');
+        advice.push(`~/.codex/auth.json token：${defaultToken || '无账号信息'}。`);
+      } else {
+        advice.push('未检测到 ~/.codex/auth.json token；全局入口以 Desktop/固定入口实际状态为准。');
       }
       const box = document.getElementById('diagnosis');
       box.className = `recommend ${state}`;
@@ -3512,6 +3964,7 @@ INDEX_HTML = """<!doctype html>
       renderCliHomes(data);
       renderDiagnosis(data);
       renderActualCurrentAccounts(data);
+      renderPluginSync(data);
       renderSimpleActuals(data);
       renderAutoSwitchConfig(data);
       refreshServices().catch((e) => {
@@ -3585,8 +4038,10 @@ INDEX_HTML = """<!doctype html>
       setSimpleResult(`正在把全局 Codex CLI 设为 ${accountLabel(item)}...`);
       const res = await api('/api/set-default-codex', 'POST', { account_id: item.account_id });
       await refreshData();
-      setSimpleResult(`完成：Paperclip、Codex Desktop、直接运行 codex 默认都会用 ${accountLabel(item)}。`, 'ok');
-      log(`${res.message}: ${humanPath(res.config_path)}`);
+      const currentLauncher = res.current_launcher ? `；固定入口：${humanPath(res.current_launcher)}` : '';
+      const omcText = (res.omc_codex_shims || []).length ? '；OMC/tmux 已接管 codex' : '';
+      setSimpleResult(`完成：全局 Codex 已设为 ${accountLabel(item)}${currentLauncher}${omcText}。`, 'ok');
+      log(`${res.message}: ${humanPath(res.config_path)}${currentLauncher}`);
     }
     async function migrateCliHome() {
       const accountId = document.getElementById('cliAccount').value;
@@ -3625,6 +4080,12 @@ INDEX_HTML = """<!doctype html>
       if (!id) return log('请先选中一个 provider');
       const res = await api('/api/sync-common-env', 'POST', { provider_id: id });
       log(`${res.message}: 更新 ${res.updated.length} 个，跳过 ${res.skipped.length} 个；keys: ${res.env_keys.join(', ')}`);
+      await refreshData();
+    }
+    async function syncClaudePlugins() {
+      const res = await api('/api/sync-claude-plugins', 'POST', {});
+      const added = res.added && res.added.length ? `新增：${res.added.join(', ')}` : '没有新增';
+      log(`插件启用态已同步：${added}`);
       await refreshData();
     }
     function dedupePlanText(plan) {
@@ -3669,6 +4130,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'compact-off') return applyCompactPreset('');
           if (action === 'save-compact-selected') return saveCompactSelected();
           if (action === 'sync-common-env-selected') return syncCommonEnvSelected();
+          if (action === 'sync-claude-plugins') return syncClaudePlugins();
           if (action === 'save-auto-switch') return saveAutoSwitch();
           if (action === 'run-auto-switch') return runAutoSwitch(true, true);
           if (action === 'create-missing-bridges') return createMissingBridges();
@@ -3894,6 +4356,10 @@ def build_handler(
                 if self.path == "/api/sync-common-env":
                     provider_id = str(payload.get("provider_id") or "")
                     result = manager.sync_common_env_to_bridge_providers(provider_id)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/sync-claude-plugins":
+                    result = manager.sync_claude_enabled_plugins()
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/dedupe-bridge-providers":
