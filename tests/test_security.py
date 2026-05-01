@@ -653,6 +653,8 @@ class ServerCase(unittest.TestCase):
         self.assertIn("row.account_id === desktopAccount ? '默认' : '备用'", html)
         self.assertIn("固定入口/OMC/tmux", html)
         self.assertIn("~/.codex/auth.json token", html)
+        self.assertIn("CC Switch Codex OAuth Provider", html)
+        self.assertIn("CC Switch 当前", html)
         self.assertIn("renderAccounts(data);", html)
         self.assertIn("Spark", html)
         self.assertNotIn('id="simpleAccount"', html)
@@ -1047,6 +1049,29 @@ class LauncherCase(unittest.TestCase):
             self.assertEqual(by_name["person"]["launcher_role"], "dedicated")
             self.assertEqual(matrix[0]["cli_launchers"], [])
             self.assertIn("missing_cli_launcher", matrix[0]["risk_flags"])
+
+    def test_account_matrix_uses_bridge_url_account_when_provider_binding_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+            with mock.patch.object(bridgedeck, "tcp_open", return_value=True):
+                matrix = manager._account_matrix(
+                    [{"account_id": "acct-1", "email": "person@example.com"}],
+                    [
+                        {
+                            "name": "Local Codex Bridge - Pro",
+                            "is_current": True,
+                            "account_id": "",
+                            "base_url": "http://127.0.0.1:8876/accounts/acct-1",
+                        }
+                    ],
+                    [],
+                    [],
+                    [{"account_id": "acct-1", "is_current_launcher": False}],
+                    {},
+                )
+
+        self.assertTrue(matrix[0]["claude_current"])
+        self.assertEqual(matrix[0]["claude_providers"], ["Local Codex Bridge - Pro"])
 
     def test_write_omc_codex_shims_uses_current_launcher(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

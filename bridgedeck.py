@@ -206,14 +206,18 @@ def common_provider_env(env: dict[str, Any]) -> dict[str, Any]:
     return common
 
 
-def bridge_account_id_from_env(env: dict[str, Any]) -> str:
-    base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
+def bridge_account_id_from_base_url(base_url: str) -> str:
     marker = f"{LOCAL_BRIDGE_BASE_URL}/accounts/"
     if not base_url.startswith(marker):
         return ""
     rest = base_url[len(marker):]
     account_id = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
     return urllib.parse.unquote(account_id).strip()
+
+
+def bridge_account_id_from_env(env: dict[str, Any]) -> str:
+    base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
+    return bridge_account_id_from_base_url(base_url)
 
 
 def safe_slug(value: str) -> str:
@@ -905,7 +909,7 @@ class BridgeManager:
     ) -> list[dict[str, Any]]:
         provider_by_account: dict[str, list[dict[str, Any]]] = {}
         for provider in providers:
-            account_id = str(provider.get("account_id") or "")
+            account_id = str(provider.get("account_id") or bridge_account_id_from_base_url(str(provider.get("base_url") or "")) or "")
             if account_id:
                 provider_by_account.setdefault(account_id, []).append(provider)
         codex_by_account: dict[str, list[dict[str, Any]]] = {}
@@ -1685,6 +1689,8 @@ class BridgeManager:
                     value = auth_binding.get("accountId")
                     if isinstance(value, str):
                         account_id = value
+                if not account_id:
+                    account_id = bridge_account_id_from_env(env)
                 auth_token = (
                     env.get("ANTHROPIC_AUTH_TOKEN")
                     if isinstance(env.get("ANTHROPIC_AUTH_TOKEN"), str)
@@ -3123,6 +3129,7 @@ INDEX_HTML = """<!doctype html>
             </table>
           </div>
           <br />
+          <div class="muted">CC Switch Codex OAuth Provider：用于授权和额度检查；BridgeDeck 全局入口以上面 Desktop 列为准。</div>
           <div class="tableWrap">
             <table id="codexProvidersTable">
               <thead>
@@ -3802,7 +3809,7 @@ INDEX_HTML = """<!doctype html>
         const status = p.token_mismatch ? '<span class="bad">账号不一致</span>' : '<span class="ok">正常</span>';
         tr.innerHTML = `
           <td>${esc(p.name)}</td>
-          <td>${p.is_current ? '<span class="ok">当前使用</span>' : '<span class="muted">备用</span>'}</td>
+          <td>${p.is_current ? '<span class="ok">CC Switch 当前</span>' : '<span class="muted">备用</span>'}</td>
           <td>${esc(maskId(p.meta_account_id || ''))}</td>
           <td>${esc(maskId(p.token_account_id || ''))}</td>
           <td>${status}</td>
