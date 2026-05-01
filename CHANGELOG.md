@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.15
+
+- Stabilized Local Codex Bridge streaming failures so started SSE responses close with stream terminal events instead of JSON 500 responses.
+- Kept Claude Code compatibility placeholder deltas while adding bridge stream error diagnostics.
+- Added automatic Claude plugin enablement sync between installed plugins, `~/.claude/settings.json`, and `~/.ccswitch-common-config.json`.
+- Added global Codex CLI fixed launcher and OMC/tmux shim status so provider switches do not change the managed Codex entry point.
+- Fixed account status tables to use actual Desktop, launcher, and provider-route accounts instead of stale `~/.codex/auth.json` or empty provider binding fields.
+
 ## 0.2.14
 
 - Added provider-level Claude Code auto-compact controls, including 220k and 1m context window presets.
