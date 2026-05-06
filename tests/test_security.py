@@ -6,6 +6,7 @@ import io
 import sqlite3
 import tempfile
 import threading
+import time
 import types
 import unittest
 import urllib.error
@@ -349,6 +350,32 @@ class FakeSseResponse:
             raise self.exc
 
 
+class SlowReasoningResponse:
+    headers = {"x-request-id": "upstream-test"}
+
+    def iter_lines(self):
+        yield "event: response.output_item.added"
+        yield 'data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"},"output_index":0}'
+        yield ""
+        time.sleep(0.05)
+        yield "event: response.output_text.delta"
+        yield 'data: {"type":"response.output_text.delta","delta":"done"}'
+        yield ""
+
+
+class SilentReasoningResponse:
+    headers = {"x-request-id": "upstream-test"}
+
+    def iter_lines(self):
+        yield "event: response.output_item.added"
+        yield 'data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"},"output_index":0}'
+        yield ""
+        time.sleep(0.05)
+        yield "event: response.completed"
+        yield 'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}'
+        yield ""
+
+
 class BrokenWriter:
     def write(self, payload: bytes) -> int:
         raise BrokenPipeError("client closed")
@@ -500,6 +527,126 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn("event: response.output_text.delta", body)
         self.assertIn("思考等级：high", body)
         self.assertNotIn("思考等级：xhigh", body)
+
+    def test_stream_idle_logs_when_upstream_is_silent(self) -> None:
+        with (
+            mock.patch.object(local_codex_bridge, "STREAM_IDLE_LOG_SECS", 0.01),
+            mock.patch.object(local_codex_bridge, "REASONING_PLACEHOLDER_HEARTBEAT_SECS", 0.01),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    SlowReasoningResponse(),
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic(),
+                    requested_model="gpt-5.4",
+                    requested_effort="high",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        self.assertIn("done", body)
+        self.assertIn("[bridge-stream-idle]", stderr.getvalue())
+
+    def test_stream_idle_timeout_emits_failed_sse_without_fake_output_text(self) -> None:
+        with (
+            mock.patch.object(local_codex_bridge, "STREAM_IDLE_LOG_SECS", 0.005),
+            mock.patch.object(local_codex_bridge, "STREAM_IDLE_FAIL_SECS", 0.02),
+            mock.patch.object(local_codex_bridge, "REASONING_PLACEHOLDER_HEARTBEAT_SECS", 0.005),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    SilentReasoningResponse(),
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic(),
+                    requested_model="gpt-5.4",
+                    requested_effort="high",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        logs = stderr.getvalue()
+        self.assertIn("event: response.failed", body)
+        self.assertIn("bridge_stream_idle_timeout", body)
+        self.assertIn("bridge-test", body)
+        self.assertNotIn("event: response.output_text.delta", body)
+        self.assertIn("[bridge-stream-idle]", logs)
+        self.assertIn("[bridge-stream-end]", logs)
+        self.assertIn('"idle_timeout_seen": true', logs)
+
+    def test_stream_final_summary_logs_terminal_event(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.output_text.delta",
+                'data: {"type":"response.output_text.delta","delta":"hello"}',
+                "",
+                "event: response.completed",
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}',
+                "",
+            ]
+        )
+
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    response,
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic(),
+                    requested_model="gpt-5.5",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        logs = stderr.getvalue()
+        self.assertIn("event: response.completed", body)
+        self.assertIn("[bridge-stream-end]", logs)
+        self.assertIn('"terminal_event_seen": true', logs)
+        self.assertIn('"upstream_events": 2', logs)
+
+    def test_stream_final_summary_records_client_disconnect(self) -> None:
+        metrics = local_codex_bridge.BridgeStreamMetrics()
+        iterator = self.make_handler()._iter_stream_with_reasoning_placeholder(
+            FakeSseResponse(
+                [
+                    "event: response.output_text.delta",
+                    'data: {"type":"response.output_text.delta","delta":"hello"}',
+                    "",
+                ]
+            ),
+            "acct-1",
+            request_id="bridge-test",
+            started_at=local_codex_bridge.time.monotonic(),
+            requested_model="gpt-5.4",
+            metrics=metrics,
+        )
+
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            next(iterator)
+            metrics.client_disconnected = True
+            iterator.close()
+
+        self.assertIn("[bridge-stream-end]", stderr.getvalue())
+        self.assertIn('"client_disconnected": true', stderr.getvalue())
+
+    def test_stream_write_failure_logs_client_disconnect(self) -> None:
+        handler = self.make_handler()
+        chunks = [b"payload"]
+        handler._write_bytes = mock.Mock(return_value=False)
+
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            for chunk in chunks:
+                if chunk and not handler._write_bytes(chunk, flush=True):
+                    print(
+                        f"{local_codex_bridge.log_timestamp()} [bridge-client-disconnect] request_id=bridge-test model=gpt-5.4 detail=write_failed",
+                        file=sys.stderr,
+                    )
+                    break
+
+        self.assertIn("[bridge-client-disconnect]", stderr.getvalue())
 
     def test_stream_remote_protocol_error_emits_failed_sse(self) -> None:
         response = FakeSseResponse(

@@ -32,6 +32,8 @@ ACCOUNT_ROUTE_RE = re.compile(r"^/accounts/([^/]+)(/.*)?$")
 UPSTREAM_PROXY_ENV = "CODEX_BRIDGE_UPSTREAM_PROXY"
 REASONING_PLACEHOLDER_HEARTBEAT_SECS = 8.0
 REASONING_PLACEHOLDER_MODE_ENV = "CODEX_BRIDGE_REASONING_PLACEHOLDER_MODE"
+STREAM_IDLE_LOG_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_LOG_SECS", "20"))
+STREAM_IDLE_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_FAIL_SECS", "300"))
 BRIDGE_STATE_PATH = Path(
     os.environ.get(
         "CODEX_BRIDGE_STATE_PATH",
@@ -66,10 +68,25 @@ class ReasoningPlaceholderState:
     output_index: int | None = None
     emitted_count: int = 0
     last_emitted_at: float = 0.0
+    last_upstream_at: float = 0.0
+    last_idle_logged_at: float = 0.0
     logged_terminal_error: bool = False
 
 
+@dataclass
+class BridgeStreamMetrics:
+    upstream_events: int = 0
+    downstream_writes: int = 0
+    client_disconnected: bool = False
+    terminal_event_seen: bool = False
+    idle_timeout_seen: bool = False
+
+
 class TerminalStreamError(Exception):
+    pass
+
+
+class BridgeStreamIdleTimeout(Exception):
     pass
 
 
@@ -314,8 +331,10 @@ def response_failed_sse(
     request_id: str,
     requested_model: str | None,
     exc: BaseException,
+    error_code: str = "upstream_stream_error",
+    error_type: str | None = None,
 ) -> bytes:
-    error_type = type(exc).__name__
+    error_type = error_type or type(exc).__name__
     message = truncate_log_text(str(exc), limit=500) or error_type
     payload = {
         "type": "response.failed",
@@ -325,7 +344,7 @@ def response_failed_sse(
             "status": "failed",
             "model": requested_model or "unknown",
             "error": {
-                "code": "upstream_stream_error",
+                "code": error_code,
                 "message": message,
                 "type": error_type,
             },
@@ -335,6 +354,38 @@ def response_failed_sse(
         "event: response.failed\n"
         f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
     ).encode("utf-8")
+
+
+def log_bridge_stream_summary(
+    *,
+    account_id: str,
+    requested_model: str | None,
+    requested_effort: str | None,
+    request_id: str,
+    started_at: float,
+    upstream_request_id: str | None,
+    state: ReasoningPlaceholderState,
+    metrics: BridgeStreamMetrics,
+) -> None:
+    payload = {
+        "account_id": account_id,
+        "client_disconnected": metrics.client_disconnected,
+        "downstream_writes": metrics.downstream_writes,
+        "duration_s": round(time.monotonic() - started_at, 3),
+        "effort": requested_effort or "unknown",
+        "heartbeats": state.emitted_count,
+        "idle_timeout_seen": metrics.idle_timeout_seen,
+        "model": requested_model or "unknown",
+        "request_id": request_id,
+        "terminal_event_seen": metrics.terminal_event_seen,
+        "upstream_events": metrics.upstream_events,
+    }
+    if upstream_request_id:
+        payload["upstream_request_id"] = upstream_request_id
+    print(
+        f"{log_timestamp()} [bridge-stream-end] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}",
+        file=sys.stderr,
+    )
 
 
 def terminal_stream_error_from_payload(event_name: str | None, payload: dict[str, Any] | None) -> TerminalStreamError | None:
@@ -913,6 +964,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     return
 
                 self._send_upstream_headers(response, is_stream=True)
+                metrics = BridgeStreamMetrics()
                 try:
                     for chunk in self._iter_stream_with_reasoning_placeholder(
                         response,
@@ -922,10 +974,19 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         requested_effort=requested_effort,
                         requested_model=requested_model,
                         upstream_request_id=upstream_request_id,
+                        metrics=metrics,
                     ):
                         if chunk and not self._write_bytes(chunk, flush=True):
+                            metrics.client_disconnected = True
+                            print(
+                                f"{log_timestamp()} [bridge-client-disconnect] request_id={request_id} model={requested_model or 'unknown'} detail=write_failed",
+                                file=sys.stderr,
+                            )
                             break
+                        if chunk:
+                            metrics.downstream_writes += 1
                 except OSError as exc:
+                    metrics.client_disconnected = True
                     print(
                         f"{log_timestamp()} [bridge-client-disconnect] request_id={request_id} type={type(exc).__name__} detail={truncate_log_text(str(exc))}",
                         file=sys.stderr,
@@ -952,6 +1013,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         requested_effort: str | None = None,
         requested_model: str | None = None,
         upstream_request_id: str | None = None,
+        metrics: BridgeStreamMetrics | None = None,
     ):
         block_queue: queue.Queue[list[str] | BaseException | object] = queue.Queue(maxsize=16)
         done_marker = object()
@@ -993,16 +1055,51 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         reader = threading.Thread(target=read_blocks, daemon=True)
         reader.start()
         state = ReasoningPlaceholderState()
+        metrics = metrics or BridgeStreamMetrics()
 
         try:
             while True:
                 timeout = self._reasoning_placeholder_timeout(state)
+                poll_timeout = timeout if timeout is not None else STREAM_IDLE_LOG_SECS
+                if STREAM_IDLE_FAIL_SECS > 0:
+                    now = time.monotonic()
+                    idle_for = now - (state.last_upstream_at or stream_started_at)
+                    idle_fail_remaining = max(STREAM_IDLE_FAIL_SECS - idle_for, 0.001)
+                    poll_timeout = min(poll_timeout, idle_fail_remaining)
                 try:
-                    if timeout is None:
-                        queued = block_queue.get()
-                    else:
-                        queued = block_queue.get(timeout=timeout)
+                    queued = block_queue.get(timeout=poll_timeout)
                 except queue.Empty:
+                    now = time.monotonic()
+                    idle_for = now - (state.last_upstream_at or stream_started_at)
+                    if STREAM_IDLE_FAIL_SECS > 0 and idle_for >= STREAM_IDLE_FAIL_SECS:
+                        metrics.idle_timeout_seen = True
+                        state.completed = True
+                        state.active = False
+                        exc = BridgeStreamIdleTimeout(
+                            f"bridge stream idle timeout request_id={stream_request_id} idle_s={idle_for:.1f} model={requested_model or 'unknown'}"
+                        )
+                        log_bridge_stream_error(
+                            account_id=account_id,
+                            requested_model=requested_model,
+                            request_id=stream_request_id,
+                            started_at=stream_started_at,
+                            exc=exc,
+                            upstream_request_id=upstream_request_id,
+                        )
+                        yield response_failed_sse(
+                            request_id=stream_request_id,
+                            requested_model=requested_model,
+                            exc=exc,
+                            error_code="bridge_stream_idle_timeout",
+                            error_type="bridge_stream_idle_timeout",
+                        )
+                        break
+                    if idle_for >= STREAM_IDLE_LOG_SECS and now - state.last_idle_logged_at >= STREAM_IDLE_LOG_SECS:
+                        state.last_idle_logged_at = now
+                        print(
+                            f"{log_timestamp()} [bridge-stream-idle] request_id={stream_request_id} account_id={account_id} model={requested_model or 'unknown'} effort={requested_effort or 'unknown'} idle_s={idle_for:.1f} active_reasoning={str(state.active).lower()} heartbeats={state.emitted_count}",
+                            file=sys.stderr,
+                        )
                     heartbeat = self._build_reasoning_placeholder_sse(
                         account_id,
                         state,
@@ -1034,6 +1131,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     )
                     break
 
+                state.last_upstream_at = time.monotonic()
                 for chunk in self._emit_sse_block_with_reasoning_placeholder(
                     queued,
                     account_id,
@@ -1043,9 +1141,20 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     requested_effort=requested_effort,
                     requested_model=requested_model,
                     upstream_request_id=upstream_request_id,
+                    metrics=metrics,
                 ):
                     yield chunk
         finally:
+            log_bridge_stream_summary(
+                account_id=account_id,
+                requested_model=requested_model,
+                requested_effort=requested_effort,
+                request_id=stream_request_id,
+                started_at=stream_started_at,
+                upstream_request_id=upstream_request_id,
+                state=state,
+                metrics=metrics,
+            )
             stop_reader.set()
             try:
                 response.close()
@@ -1198,11 +1307,22 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         requested_effort: str | None = None,
         requested_model: str | None = None,
         upstream_request_id: str | None = None,
+        metrics: BridgeStreamMetrics | None = None,
     ):
         raw_block = "\n".join(block_lines) + "\n\n"
         yield raw_block.encode("utf-8")
 
         event_name, payload, data_lines = self._parse_sse_block(block_lines)
+        if metrics is not None:
+            metrics.upstream_events += 1
+            if event_name in {
+                "response.completed",
+                "response.failed",
+                "response.cancelled",
+                "response.incomplete",
+                "error",
+            }:
+                metrics.terminal_event_seen = True
         self._update_reasoning_placeholder_state(state, event_name, payload)
         terminal_error = terminal_stream_error_from_payload(event_name, payload)
         if terminal_error is not None and not state.logged_terminal_error:

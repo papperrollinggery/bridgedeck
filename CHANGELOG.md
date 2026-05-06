@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.17
+
+- Added Local Codex Bridge silent stream idle timeout handling: long upstream silence now ends with a `response.failed` event instead of hanging forever.
+- Added per-stream end diagnostics with request id, model, effort, upstream events, downstream writes, heartbeat count, client disconnect state, terminal event state, and idle timeout state.
+- Kept reasoning heartbeats non-polluting by default; no fake `response.output_text.delta` is emitted unless legacy visible mode is explicitly enabled.
+
 ## 0.2.16
 
 - Fixed Local Codex Bridge reasoning visibility so encrypted reasoning heartbeats no longer pollute assistant output text.
