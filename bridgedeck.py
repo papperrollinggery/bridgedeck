@@ -35,6 +35,7 @@ DEFAULT_CCSWITCH_COMMON_CONFIG_PATH = Path.home() / ".ccswitch-common-config.jso
 DEFAULT_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
+DEFAULT_CODEX_AUTH_PATH = DEFAULT_CODEX_HOME / "auth.json"
 DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
 DEFAULT_LOCAL_BRIDGE_STATE_PATH = Path.home() / ".cc-switch" / "bridgedeck-local-bridge-state.json"
 DEFAULT_OMC_CODEX_SHIM_PATHS = (
@@ -46,7 +47,7 @@ DEFAULT_ZPROFILE_PATH = Path.home() / ".zprofile"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.15"
+APP_VERSION = "0.2.16"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -54,6 +55,7 @@ LOCAL_BRIDGE_PORT = 8876
 COMMON_UPSTREAM_PROXY_PORTS = (1087, 7890, 6152, 8080)
 COMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 COMPACT_THRESHOLD_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+MAX_CONTEXT_TOKENS_ENV = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
 DEFAULT_COMPACT_WINDOW_TOKENS = 220_000
 DEFAULT_COMPACT_THRESHOLD_PERCENT = 80
 MODEL_ENV_KEYS = (
@@ -62,9 +64,27 @@ MODEL_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
 )
+SAFE_COMMON_CONFIG_KEYS = (
+    "hooks",
+    "permissions",
+    "statusLine",
+    "cleanupPeriodDays",
+    "enableAllProjectMcpServers",
+    "enabledMcpjsonServers",
+    "enabledPlugins",
+)
+SAFE_COMMON_ENV_KEYS = (
+    "ENABLE_TOOL_SEARCH",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+)
 PROVIDER_SCOPED_ENV_KEYS = {
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_AUTH_TOKEN",
+    *MODEL_ENV_KEYS,
+    COMPACT_WINDOW_ENV,
+    COMPACT_THRESHOLD_ENV,
+    MAX_CONTEXT_TOKENS_ENV,
 }
 CANONICAL_BRIDGE_NAMES = (
     "Local Codex Bridge - Plus",
@@ -74,6 +94,8 @@ CANONICAL_BRIDGE_NAMES = (
 MANAGED_CODEX_SHIM_MARKER = "BridgeDeck managed codex-current shim"
 MANAGED_CODEX_PATH_START = "# >>> BridgeDeck codex shim >>>"
 MANAGED_CODEX_PATH_END = "# <<< BridgeDeck codex shim <<<"
+PROXY_DIAG_OPENAI_URL = "https://api.openai.com/v1/models"
+PROXY_DIAG_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 
 
 def now_ts() -> str:
@@ -110,6 +132,15 @@ def mask_token(token: str | None) -> str:
     if len(token) <= 10:
         return token
     return f"{token[:6]}...{token[-4:]}"
+
+
+def truncate_log_text(value: str | None, *, limit: int = 240) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("\n", " ").strip()
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
 
 
 def sha12(value: str | None) -> str:
@@ -326,6 +357,120 @@ def read_local_url(url: str, *, timeout: float, max_bytes: int) -> bytes:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(request, timeout=timeout) as response:
         return response.read(max_bytes)
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    if not path.exists() or path.is_symlink():
+        return {}
+    values: dict[str, str] = {}
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            if key:
+                values[key] = value
+    except Exception:
+        return {}
+    return values
+
+
+def detect_codex_proxy_url() -> tuple[str, str]:
+    env_file = load_env_file(DEFAULT_CODEX_HOME / ".env")
+    for key in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"):
+        value = str(env_file.get(key) or "").strip()
+        if value:
+            return value, str(DEFAULT_CODEX_HOME / ".env")
+    for key in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"):
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value, f"env:{key}"
+    return "", ""
+
+
+def parse_proxy_target(proxy_url: str) -> tuple[str, int]:
+    if not proxy_url:
+        return "", 0
+    try:
+        parsed = urllib.parse.urlsplit(proxy_url)
+    except Exception:
+        return "", 0
+    host = parsed.hostname or ""
+    port = int(parsed.port or (443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else 0))
+    return host, port
+
+
+def read_codex_auth_state(path: Path = DEFAULT_CODEX_AUTH_PATH) -> dict[str, Any]:
+    if not path.exists() or path.is_symlink():
+        return {"present": False, "authenticated": False, "path": str(path)}
+    raw = load_json(path, {})
+    raw = raw if isinstance(raw, dict) else {}
+    tokens = raw.get("tokens") if isinstance(raw.get("tokens"), dict) else {}
+    access_token = str(tokens.get("access_token") or "")
+    account_id = str(tokens.get("account_id") or "")
+    identity = jwt_identity(access_token)
+    return {
+        "present": True,
+        "authenticated": bool(access_token and account_id),
+        "path": str(path),
+        "account_id": identity.get("account_id") or account_id,
+        "email": identity.get("email") or "",
+        "plan": identity.get("plan") or "",
+        "access_token": access_token,
+    }
+
+
+def probe_remote_url(
+    url: str,
+    *,
+    proxy_url: str,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    body: bytes | None = None,
+    timeout: float = 15.0,
+    max_bytes: int = 1200,
+) -> dict[str, Any]:
+    request_headers = {"Connection": "close", **(headers or {})}
+    request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            sample = response.read(max_bytes).decode("utf-8", "replace")
+            return {
+                "ok": True,
+                "reached": True,
+                "status_code": int(response.getcode() or 0),
+                "content_type": response.headers.get("Content-Type", ""),
+                "body_excerpt": truncate_log_text(sample, limit=max_bytes),
+            }
+    except urllib.error.HTTPError as exc:
+        sample = exc.read(max_bytes).decode("utf-8", "replace")
+        return {
+            "ok": False,
+            "reached": True,
+            "status_code": int(exc.code or 0),
+            "content_type": exc.headers.get("Content-Type", ""),
+            "body_excerpt": truncate_log_text(sample, limit=max_bytes),
+        }
+    except urllib.error.URLError as exc:
+        detail = getattr(exc, "reason", exc)
+        return {
+            "ok": False,
+            "reached": False,
+            "status_code": 0,
+            "error": f"{type(detail).__name__}: {detail}",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "reached": False,
+            "status_code": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dict[str, Any]:
@@ -551,6 +696,97 @@ class BridgeManager:
         if not isinstance(raw, dict):
             return {}
         return {str(key): bool(value) for key, value in raw.items() if isinstance(key, str)}
+
+    def extract_safe_claude_common_config(self) -> dict[str, Any]:
+        settings = load_json(DEFAULT_CLAUDE_SETTINGS_PATH, {})
+        settings = settings if isinstance(settings, dict) else {}
+
+        extracted_keys: list[str] = [key for key in SAFE_COMMON_CONFIG_KEYS if key in settings]
+        settings_env = settings.get("env")
+        safe_env: dict[str, Any] = {
+            key: copy.deepcopy(settings_env[key])
+            for key in SAFE_COMMON_ENV_KEYS
+            if isinstance(settings_env, dict) and key in settings_env
+        }
+
+        def build_next_common(existing: dict[str, Any]) -> tuple[dict[str, Any], list[str], list[str]]:
+            next_common = copy.deepcopy(existing)
+            removed_keys: list[str] = []
+            for key in SAFE_COMMON_CONFIG_KEYS:
+                if key in settings:
+                    next_common[key] = copy.deepcopy(settings[key])
+                elif key in next_common:
+                    next_common.pop(key, None)
+                    removed_keys.append(key)
+
+            existing_env = next_common.get("env")
+            existing_env_keys = set(existing_env.keys()) if isinstance(existing_env, dict) else set()
+            unsafe_removed = sorted(str(key) for key in existing_env_keys if key not in SAFE_COMMON_ENV_KEYS)
+            if safe_env:
+                next_common["env"] = safe_env
+            else:
+                next_common.pop("env", None)
+            return next_common, removed_keys, unsafe_removed
+
+        common = load_json(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, {})
+        common = common if isinstance(common, dict) else {}
+        next_common, removed_keys, unsafe_removed = build_next_common(common)
+
+        before = json.dumps(common, ensure_ascii=False, sort_keys=True)
+        after = json.dumps(next_common, ensure_ascii=False, sort_keys=True)
+        backups: list[str] = []
+        changed = before != after
+        if changed:
+            backup = self._backup_file(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, "safe-common-extract")
+            if backup:
+                backups.append(backup)
+            dump_json(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, next_common)
+
+        db_changed = False
+        if self.paths.db.exists():
+            with self._lock:
+                conn = self._connect()
+                try:
+                    has_settings = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
+                    ).fetchone()
+                    if has_settings:
+                        row = conn.execute(
+                            "SELECT value FROM settings WHERE key = 'common_config_claude'"
+                        ).fetchone()
+                        db_common = self._extract_json(row["value"]) if row else {}
+                        next_db_common, db_removed_keys, db_unsafe_removed = build_next_common(db_common)
+                        removed_keys = sorted(set(removed_keys + db_removed_keys))
+                        unsafe_removed = sorted(set(unsafe_removed + db_unsafe_removed))
+                        db_before = json.dumps(db_common, ensure_ascii=False, sort_keys=True)
+                        db_after = json.dumps(next_db_common, ensure_ascii=False, sort_keys=True)
+                        if db_before != db_after:
+                            db_backup = self._backup_file(self.paths.db, "safe-common-extract")
+                            if db_backup:
+                                backups.append(db_backup)
+                            conn.execute(
+                                """
+                                INSERT INTO settings (key, value)
+                                VALUES ('common_config_claude', ?)
+                                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                                """,
+                                (json.dumps(next_db_common, ensure_ascii=False),),
+                            )
+                            conn.commit()
+                            db_changed = True
+                finally:
+                    conn.close()
+
+        return {
+            "ok": True,
+            "changed": changed or db_changed,
+            "message": "安全通用配置已提取",
+            "keys": extracted_keys,
+            "env_keys": sorted(safe_env.keys()),
+            "removed_keys": removed_keys,
+            "removed_env_keys": unsafe_removed,
+            "backups": backups,
+        }
 
     def sync_claude_enabled_plugins(self) -> dict[str, Any]:
         installed = self._installed_claude_plugins()
@@ -1048,6 +1284,160 @@ class BridgeManager:
                     "processes": port_processes(15721),
                 },
             },
+        }
+
+    def proxy_diagnosis(self) -> dict[str, Any]:
+        proxy_url, proxy_source = detect_codex_proxy_url()
+        proxy_host, proxy_port = parse_proxy_target(proxy_url)
+        proxy_running = bool(proxy_host and proxy_port and tcp_open(proxy_host, proxy_port))
+
+        checks: list[dict[str, Any]] = [
+            {
+                "id": "proxy_config",
+                "label": "Codex 代理配置",
+                "status": "ok" if proxy_url else "missing",
+                "detail": mask_url_credentials(proxy_url) if proxy_url else "未检测到 .codex 代理配置",
+                "source": proxy_source,
+            },
+            {
+                "id": "proxy_tcp",
+                "label": "本地代理监听",
+                "status": "ok" if proxy_running else "failed",
+                "detail": f"{proxy_host}:{proxy_port}" if proxy_running else (f"{proxy_host}:{proxy_port} 不可达" if proxy_host and proxy_port else "未解析到代理地址"),
+            },
+        ]
+
+        openai_probe: dict[str, Any] | None = None
+        if proxy_url and proxy_running:
+            openai_probe = probe_remote_url(
+                PROXY_DIAG_OPENAI_URL,
+                proxy_url=proxy_url,
+                headers={"Accept": "application/json"},
+            )
+            checks.append(
+                {
+                    "id": "openai_api",
+                    "label": "api.openai.com 基础探测",
+                    "status": "ok" if openai_probe.get("status_code") == 401 else ("forbidden" if openai_probe.get("status_code") == 403 else "failed"),
+                    "detail": openai_probe.get("error") or f"HTTP {openai_probe.get('status_code')}",
+                    "body_excerpt": openai_probe.get("body_excerpt", ""),
+                }
+            )
+
+        auth_state = read_codex_auth_state()
+        codex_probe: dict[str, Any] | None = None
+        if proxy_url and proxy_running and auth_state.get("authenticated"):
+            payload = json.dumps(
+                {
+                    "model": "gpt-5.5",
+                    "stream": True,
+                    "store": False,
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": False,
+                    "instructions": "You are Codex.",
+                    "tools": [],
+                    "include": ["reasoning.encrypted_content"],
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Reply with ok."}],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            codex_probe = probe_remote_url(
+                PROXY_DIAG_CODEX_URL,
+                proxy_url=proxy_url,
+                method="POST",
+                headers={
+                    "Accept": "text/event-stream",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {auth_state['access_token']}",
+                    "ChatGPT-Account-Id": str(auth_state.get("account_id") or ""),
+                    "User-Agent": "bridgedeck-proxy-diagnose",
+                    "Originator": "bridgedeck-proxy-diagnose",
+                },
+                body=payload,
+                timeout=25.0,
+            )
+            codex_status = int(codex_probe.get("status_code") or 0)
+            checks.append(
+                {
+                    "id": "codex_backend",
+                    "label": "chatgpt.com Codex 流式探测",
+                    "status": "ok" if codex_status == 200 else ("forbidden" if codex_status == 403 else "failed"),
+                    "detail": codex_probe.get("error") or f"HTTP {codex_status}",
+                    "body_excerpt": codex_probe.get("body_excerpt", ""),
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "id": "codex_backend",
+                    "label": "chatgpt.com Codex 流式探测",
+                    "status": "skipped",
+                    "detail": "缺少 ~/.codex/auth.json 登录态" if not auth_state.get("authenticated") else "代理未就绪",
+                }
+            )
+
+        status = "healthy"
+        message = "代理链路可用，问题更像 Codex.app 事件会话层重连"
+        recommendations = [
+            "完全退出并重启 Codex.app 后重测",
+            "如果只在 App 内重连，优先排查旧会话状态或事件流请求头差异",
+        ]
+        if not proxy_url:
+            status = "missing_proxy"
+            message = "未检测到 Codex 代理配置"
+            recommendations = ["检查 ~/.codex/.env 的 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY"]
+        elif not proxy_running:
+            status = "proxy_down"
+            message = "本地代理端口不可达"
+            recommendations = ["先启动本地代理，再重测"]
+        elif any(check.get("status") == "forbidden" for check in checks):
+            status = "upstream_forbidden"
+            message = "代理链路对 OpenAI/Codex 请求返回 403"
+            recommendations = [
+                "更换代理节点后重测",
+                "检查分流规则，确认 OpenAI/Codex 实时流量未被特殊处理",
+                "确认节点支持 websocket / SSE / 长连接",
+            ]
+        elif openai_probe and openai_probe.get("status_code") != 401:
+            status = "api_unhealthy"
+            message = "api.openai.com 基础探测异常"
+            recommendations = [
+                "优先更换节点",
+                "检查是否存在 TLS 拦截或中间层返回非预期状态码",
+            ]
+        elif codex_probe and int(codex_probe.get("status_code") or 0) != 200:
+            status = "codex_backend_unhealthy"
+            message = "Codex 上游接口异常，问题不在本地 env"
+            recommendations = [
+                "更换节点后重测 chatgpt.com/backend-api/codex",
+                "检查该节点是否只允许基础 API，不兼容 Codex 后端事件流",
+            ]
+
+        return {
+            "ok": True,
+            "status": status,
+            "message": message,
+            "proxy": {
+                "source": proxy_source,
+                "url": mask_url_credentials(proxy_url),
+                "host": proxy_host,
+                "port": proxy_port,
+                "running": proxy_running,
+            },
+            "codex_auth": {
+                "present": bool(auth_state.get("present")),
+                "authenticated": bool(auth_state.get("authenticated")),
+                "plan": str(auth_state.get("plan") or ""),
+                "email_masked": mask_email_value(auth_state.get("email")),
+            },
+            "checks": checks,
+            "recommendations": recommendations,
         }
 
     def _start_local_bridge(self) -> dict[str, Any]:
@@ -1795,15 +2185,11 @@ class BridgeManager:
                     current_settings = template_settings
                     current_meta = template_meta
 
-                effective_compact_config = compact_config
-                if effective_compact_config is None and not existing:
-                    effective_compact_config = default_compact_config()
-
                 new_settings, new_meta = self._build_provider_payload(
                     account_id,
                     settings_config=current_settings,
                     meta=current_meta,
-                    compact_config=effective_compact_config,
+                    compact_config=compact_config,
                 )
                 settings_text = json.dumps(new_settings, ensure_ascii=False)
                 meta_text = json.dumps(new_meta, ensure_ascii=False)
@@ -2158,6 +2544,14 @@ class BridgeManager:
                     for duplicate in to_delete:
                         if duplicate["id"] == self._current_provider_from_settings() or duplicate["is_current"]:
                             merged_common.update(common_provider_env(duplicate["env"]))
+                            for key in (
+                                *MODEL_ENV_KEYS,
+                                COMPACT_WINDOW_ENV,
+                                COMPACT_THRESHOLD_ENV,
+                                MAX_CONTEXT_TOKENS_ENV,
+                            ):
+                                if key in duplicate["env"]:
+                                    merged_common[key] = copy.deepcopy(duplicate["env"][key])
 
                     merged_env = copy.deepcopy(keep_env)
                     merged_env.update(merged_common)
@@ -2736,6 +3130,13 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             stream_error = service.get("last_stream_error")
             if isinstance(stream_error, dict):
                 stream_error["account_id"] = mask_id_value(stream_error.get("account_id"))
+    codex_auth = redacted.get("codex_auth")
+    if isinstance(codex_auth, dict):
+        codex_auth.pop("path", None)
+        codex_auth["email_masked"] = mask_email_value(codex_auth.get("email_masked"))
+    proxy = redacted.get("proxy")
+    if isinstance(proxy, dict) and proxy.get("url"):
+        proxy["url"] = "<redacted>"
     return redacted
 
 
@@ -2899,6 +3300,7 @@ INDEX_HTML = """<!doctype html>
         <b>Claude 插件启用态</b>
         <div id="pluginSyncStatus" class="sectionHint">插件同步检测中...</div>
         <div class="toggleLine">
+          <button class="miniBtn" data-action="extract-safe-common-config">安全提取通用配置</button>
           <button class="miniBtn" data-action="sync-claude-plugins">一键同步插件启用态</button>
         </div>
       </div>
@@ -2924,12 +3326,14 @@ INDEX_HTML = """<!doctype html>
           <div id="serviceStatus" class="serviceGrid">服务状态加载中...</div>
           <div class="toggleLine">
             <button class="miniBtn" data-action="refresh-services">刷新服务</button>
+            <button class="miniBtn" data-action="proxy-diagnosis">诊断代理链路</button>
             <button class="miniBtn" data-action="repair-quota-query">一键修复额度查询</button>
             <button class="miniBtn" data-action="start-local-bridge">启动 Local Bridge</button>
             <button class="miniBtn" data-action="restart-local-bridge">重启 Local Bridge</button>
             <button class="miniBtn warn" data-action="stop-local-bridge">停止 Local Bridge</button>
           </div>
           <div id="serviceMessage" class="muted mt10">未操作</div>
+          <div id="proxyDiagnosis" class="sectionHint">未诊断</div>
         </div>
       </div>
       <details>
@@ -3532,9 +3936,28 @@ INDEX_HTML = """<!doctype html>
       const message = document.getElementById('serviceMessage');
       if (message && local.log_path) message.dataset.logPath = local.log_path;
     }
+    function renderProxyDiagnosis(payload) {
+      const box = document.getElementById('proxyDiagnosis');
+      if (!box) return;
+      const checks = Array.isArray(payload.checks) ? payload.checks : [];
+      const lines = checks.map((item) => {
+        const parts = [`${item.label}: ${item.status}`];
+        if (item.detail) parts.push(item.detail);
+        if (item.body_excerpt) parts.push(item.body_excerpt);
+        return parts.join(' · ');
+      });
+      box.innerHTML = `<b>${esc(payload.message || '代理诊断完成')}</b>${lines.length ? `<br>${lines.map((line) => esc(line)).join('<br>')}` : ''}`;
+    }
     async function refreshServices() {
       const payload = await api('/api/services');
       renderServices(payload);
+      return payload;
+    }
+    async function runProxyDiagnosis() {
+      const payload = await api('/api/proxy-diagnosis');
+      renderProxyDiagnosis(payload);
+      document.getElementById('serviceMessage').textContent = payload.message || '代理诊断完成';
+      log(`代理诊断: ${payload.status || 'unknown'} / ${payload.message || ''}`);
       return payload;
     }
     async function controlLocalBridge(action) {
@@ -4095,6 +4518,12 @@ INDEX_HTML = """<!doctype html>
       log(`插件启用态已同步：${added}`);
       await refreshData();
     }
+    async function extractSafeCommonConfig() {
+      const res = await api('/api/extract-safe-common-config', 'POST', {});
+      const keys = [...(res.keys || []), ...(res.env_keys || []).map((key) => `env.${key}`)];
+      log(`${res.message}: ${keys.length ? keys.join(', ') : '没有可提取项'}；移除 env ${res.removed_env_keys.length} 项`);
+      await refreshData();
+    }
     function dedupePlanText(plan) {
       if (!plan || !plan.length) return '没有重复 Local Bridge provider';
       return plan.map((item) => {
@@ -4137,6 +4566,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'compact-off') return applyCompactPreset('');
           if (action === 'save-compact-selected') return saveCompactSelected();
           if (action === 'sync-common-env-selected') return syncCommonEnvSelected();
+          if (action === 'extract-safe-common-config') return extractSafeCommonConfig();
           if (action === 'sync-claude-plugins') return syncClaudePlugins();
           if (action === 'save-auto-switch') return saveAutoSwitch();
           if (action === 'run-auto-switch') return runAutoSwitch(true, true);
@@ -4144,6 +4574,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'preview-bridge-dedupe') return dedupeBridgeProviders(false);
           if (action === 'apply-bridge-dedupe') return dedupeBridgeProviders(true);
           if (action === 'refresh-services') return refreshServices();
+          if (action === 'proxy-diagnosis') return runProxyDiagnosis();
           if (action === 'repair-quota-query') return repairQuotaQuery();
           if (action === 'start-local-bridge') return controlLocalBridge('start');
           if (action === 'stop-local-bridge') return controlLocalBridge('stop');
@@ -4285,6 +4716,21 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
+            if parsed.path == "/api/proxy-diagnosis":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    payload = manager.proxy_diagnosis()
+                    if not allow_sensitive:
+                        payload = redact_snapshot(payload)
+                    json_response(self, 200, payload)
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
             if parsed.path == "/api/quotas":
                 try:
                     if not self._valid_fetch_metadata():
@@ -4367,6 +4813,10 @@ def build_handler(
                     return
                 if self.path == "/api/sync-claude-plugins":
                     result = manager.sync_claude_enabled_plugins()
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/extract-safe-common-config":
+                    result = manager.extract_safe_claude_common_config()
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/dedupe-bridge-providers":

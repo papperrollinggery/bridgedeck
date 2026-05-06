@@ -124,8 +124,13 @@ def bridge_request_id() -> str:
 
 
 def reasoning_placeholder_mode() -> str:
-    value = os.environ.get(REASONING_PLACEHOLDER_MODE_ENV, "visible").strip().lower()
-    return value if value in {"visible", "comment", "off"} else "visible"
+    value = os.environ.get(REASONING_PLACEHOLDER_MODE_ENV, "comment").strip().lower()
+    return value if value in {"visible", "comment", "off"} else "comment"
+
+
+def reasoning_summary_mode() -> str:
+    value = os.environ.get("BRIDGE_REASONING_SUMMARY", "concise").strip().lower()
+    return value if value in {"auto", "concise", "detailed", "off"} else "concise"
 
 
 def log_upstream_result(
@@ -235,7 +240,10 @@ def build_visible_model_hint(
     actual_effort: str | None,
     requested_effort: str | None,
 ) -> str:
-    return "【思考等级：xhigh｜上游加密，无法展示明文】\n"
+    effort = requested_effort or actual_effort or "unknown"
+    model = requested_model or actual_model
+    model_suffix = f"｜模型：{model}" if model else ""
+    return f"【思考等级：{effort}{model_suffix}｜上游加密，无法展示明文】\n"
 
 
 def lookup_bridge_provider_names(account_id: str | None) -> list[str]:
@@ -516,6 +524,26 @@ def normalize_request_body(body: dict[str, Any]) -> dict[str, Any]:
                 f"[bridge-normalize] reasoning.effort -> {default_effort} (model={normalized['model']})",
                 file=sys.stderr,
             )
+
+    reasoning = normalized.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        model_name = str(normalized.get("model") or "").strip().lower()
+        if isinstance(effort, str) and effort.strip().lower() == "minimal" and model_name == "gpt-5.4":
+            reasoning["effort"] = "low"
+            effort = "low"
+            print(
+                "[bridge-normalize] reasoning.effort minimal -> low (model=gpt-5.4)",
+                file=sys.stderr,
+            )
+        summary_mode = reasoning_summary_mode()
+        if (
+            summary_mode != "off"
+            and isinstance(effort, str)
+            and effort.strip().lower() not in {"", "none"}
+            and not isinstance(reasoning.get("summary"), str)
+        ):
+            reasoning["summary"] = summary_mode
 
     include = normalized.get("include")
     includes = [item for item in include if isinstance(item, str)] if isinstance(include, list) else []

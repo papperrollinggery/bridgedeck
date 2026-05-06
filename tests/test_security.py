@@ -174,9 +174,47 @@ class FakeManager:
             "ok": True,
             "message": "通用 env 已同步",
             "source_provider_id": provider_id,
-            "env_keys": ["ANTHROPIC_MODEL", "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "HUB_CLAUDE_MEM"],
+            "env_keys": ["ANTHROPIC_MODEL", "HUB_CLAUDE_MEM"],
             "updated": [{"id": "provider-1", "name": "Provider"}],
             "skipped": [],
+        }
+
+    def extract_safe_claude_common_config(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "changed": True,
+            "message": "安全通用配置已提取",
+            "keys": ["hooks", "permissions", "enabledPlugins"],
+            "env_keys": ["ENABLE_TOOL_SEARCH"],
+            "removed_keys": [],
+            "removed_env_keys": ["ANTHROPIC_BASE_URL"],
+            "backups": [],
+        }
+
+    def proxy_diagnosis(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "status": "healthy",
+            "message": "代理链路可用，问题更像 Codex.app 事件会话层重连",
+            "proxy": {
+                "source": f"{Path.home()}/.codex/.env",
+                "url": "http://127.0.0.1:1087",
+                "host": "127.0.0.1",
+                "port": 1087,
+                "running": True,
+            },
+            "codex_auth": {
+                "present": True,
+                "authenticated": True,
+                "plan": "pro",
+                "email_masked": "pe***n@example.com",
+            },
+            "checks": [
+                {"label": "Codex 代理配置", "status": "ok", "detail": "http://127.0.0.1:1087"},
+                {"label": "api.openai.com 基础探测", "status": "ok", "detail": "HTTP 401"},
+                {"label": "chatgpt.com Codex 流式探测", "status": "ok", "detail": "HTTP 200"},
+            ],
+            "recommendations": ["完全退出并重启 Codex.app 后重测"],
         }
 
     def sync_claude_enabled_plugins(self) -> dict[str, Any]:
@@ -357,6 +395,111 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn("event: response.output_text.delta", body)
         self.assertIn('"delta":"hello"', body)
         self.assertIn("event: response.completed", body)
+
+    def test_normalize_preserves_reasoning_summary_and_adds_encrypted_content(self) -> None:
+        body = {
+            "model": "gpt-5.4",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "stream": True,
+            "reasoning": {"effort": "low"},
+            "include": ["reasoning.summary"],
+        }
+
+        normalized = local_codex_bridge.normalize_request_body(body)
+
+        self.assertEqual(normalized["reasoning"]["summary"], "concise")
+        self.assertNotIn("reasoning.summary", normalized["include"])
+        self.assertIn("reasoning.encrypted_content", normalized["include"])
+
+    def test_normalize_maps_gpt_54_minimal_reasoning_to_low(self) -> None:
+        body = {
+            "model": "gpt-5.4",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "stream": True,
+            "reasoning": {"effort": "minimal"},
+        }
+
+        normalized = local_codex_bridge.normalize_request_body(body)
+
+        self.assertEqual(normalized["reasoning"]["effort"], "low")
+        self.assertEqual(normalized["reasoning"]["summary"], "concise")
+
+    def test_reasoning_heartbeat_defaults_to_comment_not_output_text(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.output_item.added",
+                'data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"},"output_index":0}',
+                "",
+            ]
+        )
+
+        chunks = list(
+            self.make_handler()._iter_stream_with_reasoning_placeholder(
+                response,
+                "acct-1",
+                request_id="bridge-test",
+                started_at=local_codex_bridge.time.monotonic(),
+                requested_model="gpt-5.4",
+                requested_effort="high",
+            )
+        )
+        body = b"".join(chunks).decode("utf-8")
+
+        self.assertIn(": bridge reasoning active", body)
+        self.assertNotIn("event: response.output_text.delta", body)
+        self.assertNotIn("思考等级", body)
+
+    def test_reasoning_summary_delta_passthrough_does_not_emit_fake_output_text(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.reasoning_summary_text.delta",
+                'data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"thinking summary"}',
+                "",
+            ]
+        )
+
+        chunks = list(
+            self.make_handler()._iter_stream_with_reasoning_placeholder(
+                response,
+                "acct-1",
+                request_id="bridge-test",
+                started_at=local_codex_bridge.time.monotonic(),
+                requested_model="gpt-5.4",
+                requested_effort="high",
+            )
+        )
+        body = b"".join(chunks).decode("utf-8")
+
+        self.assertIn("event: response.reasoning_summary_text.delta", body)
+        self.assertIn("thinking summary", body)
+        self.assertNotIn("event: response.output_text.delta", body)
+        self.assertNotIn("思考等级", body)
+
+    def test_legacy_visible_reasoning_placeholder_uses_requested_effort(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.output_item.added",
+                'data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"},"output_index":0}',
+                "",
+            ]
+        )
+
+        with mock.patch.dict(local_codex_bridge.os.environ, {local_codex_bridge.REASONING_PLACEHOLDER_MODE_ENV: "visible"}):
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    response,
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic(),
+                    requested_model="gpt-5.4",
+                    requested_effort="high",
+                )
+            )
+        body = b"".join(chunks).decode("utf-8")
+
+        self.assertIn("event: response.output_text.delta", body)
+        self.assertIn("思考等级：high", body)
+        self.assertNotIn("思考等级：xhigh", body)
 
     def test_stream_remote_protocol_error_emits_failed_sse(self) -> None:
         response = FakeSseResponse(
@@ -645,9 +788,12 @@ class ServerCase(unittest.TestCase):
         self.assertIn('data-action="save-compact-selected"', html)
         self.assertIn('data-action="sync-common-env-selected"', html)
         self.assertIn('id="pluginSyncStatus"', html)
+        self.assertIn('data-action="extract-safe-common-config"', html)
         self.assertIn('data-action="sync-claude-plugins"', html)
         self.assertIn('data-action="preview-bridge-dedupe"', html)
         self.assertIn('data-action="apply-bridge-dedupe"', html)
+        self.assertIn('data-action="proxy-diagnosis"', html)
+        self.assertIn('id="proxyDiagnosis"', html)
         self.assertIn('id="actualCurrentAccounts"', html)
         self.assertIn("const actualGlobalAccount = data.codex_desktop", html)
         self.assertIn("row.account_id === desktopAccount ? '默认' : '备用'", html)
@@ -821,6 +967,35 @@ class ServerCase(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["installed_count"], 7)
 
+    def test_extract_safe_common_config_endpoint_returns_status(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/extract-safe-common-config",
+            method="POST",
+            body={},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertIn("ENABLE_TOOL_SEARCH", payload["env_keys"])
+
+    def test_proxy_diagnosis_endpoint_returns_status(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/proxy-diagnosis",
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "healthy")
+        self.assertEqual(payload["proxy"]["port"], 1087)
+
     def test_dedupe_bridge_providers_endpoint_defaults_to_preview(self) -> None:
         server, _ = self.start_server()
 
@@ -959,6 +1134,72 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(local_bridge["last_stream_error"]["account_id"], "01234567...cdef")
         self.assertNotIn("/Users/person", json.dumps(payload))
         self.assertNotIn("user:pass", json.dumps(payload))
+
+    def test_remote_proxy_diagnosis_redacts_proxy_url(self) -> None:
+        server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
+
+        status, payload = self.request(server, "/api/proxy-diagnosis", headers={"X-CCSBT-Token": "test-token"})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["proxy"]["url"], "<redacted>")
+
+    def test_detect_codex_proxy_url_prefers_codex_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir(parents=True)
+            (codex_home / ".env").write_text('HTTPS_PROXY="http://127.0.0.1:1087"\n', encoding="utf-8")
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.dict(bridgedeck.os.environ, {"HTTPS_PROXY": "http://127.0.0.1:9999"}, clear=False),
+            ):
+                value, source = bridgedeck.detect_codex_proxy_url()
+
+        self.assertEqual(value, "http://127.0.0.1:1087")
+        self.assertEqual(source, str(codex_home / ".env"))
+
+    def test_probe_remote_url_uses_explicit_proxy_handler(self) -> None:
+        class FakeResponse:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *_: Any) -> None:
+                return None
+
+            def read(self, _max_bytes: int) -> bytes:
+                return b'{"ok":true}'
+
+            def getcode(self) -> int:
+                return 401
+
+        class FakeOpener:
+            def open(self, request: urllib.request.Request, *, timeout: float) -> FakeResponse:
+                self.request = request
+                self.timeout = timeout
+                return FakeResponse()
+
+        fake_opener = FakeOpener()
+        seen: dict[str, Any] = {}
+
+        def fake_build_opener(handler: Any) -> FakeOpener:
+            seen["handler"] = handler
+            return fake_opener
+
+        with mock.patch.object(urllib.request, "build_opener", side_effect=fake_build_opener):
+            result = bridgedeck.probe_remote_url(
+                "https://api.openai.com/v1/models",
+                proxy_url="http://127.0.0.1:1087",
+                headers={"Accept": "application/json"},
+            )
+
+        self.assertTrue(result["reached"])
+        self.assertEqual(result["status_code"], 401)
+        self.assertIsInstance(seen["handler"], urllib.request.ProxyHandler)
+        self.assertEqual(getattr(seen["handler"], "proxies", None), {"http": "http://127.0.0.1:1087", "https": "http://127.0.0.1:1087"})
+        self.assertEqual(fake_opener.request.headers["Connection"], "close")
 
 
 class LauncherCase(unittest.TestCase):
@@ -1230,6 +1471,7 @@ class LauncherCase(unittest.TestCase):
                                 "ANTHROPIC_AUTH_TOKEN": "source-token",
                                 "ANTHROPIC_MODEL": "GPT-5.5",
                                 "HUB_CLAUDE_MEM": "1",
+                                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
                                 "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "220000",
                             }
                         },
@@ -1287,11 +1529,113 @@ class LauncherCase(unittest.TestCase):
             self.assertEqual(source_env["ANTHROPIC_AUTH_TOKEN"], "source-token")
             self.assertEqual(target_env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8876/accounts/acct-target")
             self.assertEqual(target_env["ANTHROPIC_AUTH_TOKEN"], "target-token")
-            self.assertEqual(target_env["ANTHROPIC_MODEL"], "gpt-5.5")
             self.assertEqual(target_env["HUB_CLAUDE_MEM"], "1")
-            self.assertEqual(target_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "220000")
+            self.assertNotIn("ANTHROPIC_MODEL", target_env)
+            self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", target_env)
+            self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", target_env)
             self.assertEqual(target_env["TARGET_ONLY"], "keep")
             self.assertEqual(external_env["ANTHROPIC_AUTH_TOKEN"], "external-token")
+
+    def test_extract_safe_claude_common_config_filters_provider_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            common = root / ".ccswitch-common-config.json"
+            settings = root / ".claude" / "settings.json"
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+                conn.execute(
+                    "INSERT INTO settings VALUES (?, ?)",
+                    (
+                        "common_config_claude",
+                        json.dumps(
+                            {
+                                "env": {
+                                    "ANTHROPIC_AUTH_TOKEN": "old-secret",
+                                    "ANTHROPIC_MODEL": "old-model",
+                                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
+                                    "ENABLE_TOOL_SEARCH": "false",
+                                }
+                            }
+                        ),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            common.write_text(
+                json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_BASE_URL": "https://old.example.com",
+                            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "220000",
+                            "ENABLE_TOOL_SEARCH": "false",
+                        },
+                        "enabledPlugins": {"old@old": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            settings.write_text(
+                json.dumps(
+                    {
+                        "hooks": {"Stop": []},
+                        "permissions": {"allow": ["Bash(ls:*)"]},
+                        "enabledPlugins": {"caveman@caveman": True},
+                        "env": {
+                            "ANTHROPIC_BASE_URL": "https://provider.example.com",
+                            "ANTHROPIC_AUTH_TOKEN": "secret",
+                            "ANTHROPIC_MODEL": "provider-model",
+                            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
+                            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
+                            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80",
+                            "ENABLE_TOOL_SEARCH": "true",
+                            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CCSWITCH_COMMON_CONFIG_PATH", common),
+                mock.patch.object(bridgedeck, "DEFAULT_CLAUDE_SETTINGS_PATH", settings),
+            ):
+                result = manager.extract_safe_claude_common_config()
+
+            self.assertTrue(result["changed"])
+            loaded = json.loads(common.read_text(encoding="utf-8"))
+            self.assertEqual(loaded["hooks"], {"Stop": []})
+            self.assertEqual(loaded["permissions"], {"allow": ["Bash(ls:*)"]})
+            self.assertEqual(loaded["enabledPlugins"], {"caveman@caveman": True})
+            self.assertEqual(
+                loaded["env"],
+                {
+                    "ENABLE_TOOL_SEARCH": "true",
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                },
+            )
+            self.assertNotIn("ANTHROPIC_BASE_URL", loaded["env"])
+            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", loaded["env"])
+            self.assertNotIn("ANTHROPIC_MODEL", loaded["env"])
+            self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", loaded["env"])
+            self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", loaded["env"])
+            self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", loaded["env"])
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                db_common = json.loads(
+                    conn.execute("SELECT value FROM settings WHERE key = 'common_config_claude'").fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertEqual(db_common["env"]["ENABLE_TOOL_SEARCH"], "true")
+            self.assertEqual(db_common["env"]["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1")
+            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", db_common["env"])
+            self.assertNotIn("ANTHROPIC_MODEL", db_common["env"])
+            self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", db_common["env"])
 
     def test_sync_claude_enabled_plugins_merges_installed_into_common_and_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1406,6 +1750,43 @@ class LauncherCase(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(count, 1)
+
+    def test_create_provider_does_not_default_compact_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE providers (
+                        id TEXT,
+                        name TEXT,
+                        app_type TEXT,
+                        settings_config TEXT,
+                        meta TEXT,
+                        provider_type TEXT,
+                        sort_index INTEGER
+                    )
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = manager.create_or_update_provider("acct-1", "Local Codex Bridge - person", False)
+
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                settings = json.loads(
+                    conn.execute("SELECT settings_config FROM providers WHERE id = ?", (result["provider_id"],)).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", settings["env"])
+            self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", settings["env"])
+            self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", settings["env"])
 
     def test_dedupe_bridge_providers_switches_current_before_delete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

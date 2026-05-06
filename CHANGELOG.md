@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.16
+
+- Fixed Local Codex Bridge reasoning visibility so encrypted reasoning heartbeats no longer pollute assistant output text.
+- Preserved OpenAI Responses reasoning summaries while keeping encrypted reasoning content for multi-turn continuity.
+- Added reasoning summary defaults and safe effort normalization for GPT-5.4.
+- Added safe Claude common config extraction so hooks/plugins can sync without leaking provider token, model, or context settings.
+- Scoped Claude context sizing and model env to individual providers instead of common config.
+
 ## 0.2.15
 
 - Stabilized Local Codex Bridge streaming failures so started SSE responses close with stream terminal events instead of JSON 500 responses.
