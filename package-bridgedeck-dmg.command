@@ -8,6 +8,7 @@ APP_DIR="$BUILD_DIR/$APP_NAME.app"
 CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
+ICON_FILE="$ROOT/assets/BridgeDeck.icns"
 DMG="$BUILD_DIR/BridgeDeck.dmg"
 APP_VERSION="$(/usr/bin/env python3 - "$ROOT/bridgedeck.py" <<'PY'
 import ast
@@ -36,6 +37,7 @@ cp "$ROOT/CHANGELOG.md" "$RESOURCES/CHANGELOG.md"
 cp "$ROOT/OPEN_SOURCE_CHECKLIST.md" "$RESOURCES/OPEN_SOURCE_CHECKLIST.md"
 cp "$ROOT/LICENSE" "$RESOURCES/LICENSE"
 cp "$ROOT/COMMERCIAL.md" "$RESOURCES/COMMERCIAL.md"
+cp "$ICON_FILE" "$RESOURCES/BridgeDeck.icns"
 
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -50,6 +52,8 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <string>BridgeDeck</string>
   <key>CFBundleDisplayName</key>
   <string>BridgeDeck</string>
+  <key>CFBundleIconFile</key>
+  <string>BridgeDeck.icns</string>
   <key>LSUIElement</key>
   <true/>
   <key>CFBundlePackageType</key>

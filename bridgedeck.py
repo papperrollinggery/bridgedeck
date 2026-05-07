@@ -3246,6 +3246,11 @@ INDEX_HTML = """<!doctype html>
     .actualLine strong { color:var(--text); }
     .toolCard button { min-height:42px; font-weight:700; }
     .toolCard .actualRow button { min-height:0; padding:4px 8px; font-weight:600; flex:0 0 auto; }
+    .apiEnvBox { margin-top:10px; display:grid; gap:8px; }
+    .apiEnvLine { border:1px solid var(--line); border-radius:8px; padding:8px; background:#0f1320; }
+    .apiEnvLabel { color:var(--muted); font-size:11px; margin-bottom:4px; }
+    .apiEnvValue { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color:#b7d8ff; font-size:12px; overflow-wrap:anywhere; word-break:break-all; }
+    .apiEnvActions { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
     .simpleResult { margin-top:12px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#0f1320; min-height:42px; color:var(--muted); font-size:13px; line-height:1.5; }
     .simpleResult strong { color:var(--text); }
     .quotaBar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:10px 0; }
@@ -3380,6 +3385,32 @@ INDEX_HTML = """<!doctype html>
             </div>
           </div>
           <button class="primary" data-action="simple-cli">准备单独 Codex CLI</button>
+        </div>
+        <div class="toolCard">
+          <div>
+            <div class="toolName">通用 API 接入</div>
+            <div class="toolText">给支持 OpenAI Base URL 的项目复制本地配置。API key 是占位符，不是真实 token。</div>
+            <div class="toolSelect">
+              <label for="simpleApiAccount">API 用哪个账号</label>
+              <select id="simpleApiAccount"></select>
+            </div>
+            <div class="apiEnvBox">
+              <div class="apiEnvLine">
+                <div class="apiEnvLabel">OPENAI_API_KEY</div>
+                <div class="apiEnvValue" id="apiAccessKey">sk-bridgedeck-local-placeholder</div>
+              </div>
+              <div class="apiEnvLine">
+                <div class="apiEnvLabel">OPENAI_BASE_URL</div>
+                <div class="apiEnvValue" id="apiAccessBaseUrl">选择账号后生成</div>
+              </div>
+            </div>
+            <div class="apiEnvActions">
+              <button class="miniBtn" data-action="copy-api-key">复制 API key</button>
+              <button class="miniBtn" data-action="copy-api-base-url">复制 Base URL</button>
+              <button class="miniBtn" data-action="copy-api-env">复制 .env</button>
+            </div>
+            <div class="actualLine mt10" id="simpleApiActual">当前实际：选择账号后可用。</div>
+          </div>
         </div>
         <div class="toolCard">
           <div>
@@ -3577,6 +3608,7 @@ INDEX_HTML = """<!doctype html>
     let lastAccounts = [];
     const DEFAULT_COMPACT_WINDOW = '220000';
     const DEFAULT_COMPACT_PCT = '80';
+    const LOCAL_API_KEY_PLACEHOLDER = 'sk-bridgedeck-local-placeholder';
     const GUIDES = {
       simpleFlow: {
         title: '日常模式',
@@ -3794,6 +3826,7 @@ INDEX_HTML = """<!doctype html>
       if (desktopBox) {
         desktopBox.innerHTML = `当前实际：<strong>${esc(desktopAccountText(data))}</strong><br><span class="ok">${esc(desktopModeText(data))}</span>`;
       }
+      renderApiAccess();
     }
     function renderAutoSwitchConfig(data) {
       const config = data.auto_switch || {};
@@ -4047,6 +4080,56 @@ INDEX_HTML = """<!doctype html>
       const sel = document.getElementById(selectId);
       return sel ? findAccount(sel.value) : null;
     }
+    function apiAccessBaseUrl(item) {
+      return item && item.account_id ? `http://127.0.0.1:8876/accounts/${encodeURIComponent(item.account_id)}/v1` : '';
+    }
+    function apiAccessEnv(item) {
+      return `OPENAI_API_KEY=${LOCAL_API_KEY_PLACEHOLDER}\nOPENAI_BASE_URL=${apiAccessBaseUrl(item)}`;
+    }
+    async function copyText(value, label) {
+      const text = String(value || '');
+      if (!text) {
+        setSimpleResult(`${label} 为空，先选择账号。`, 'warn');
+        return;
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.setAttribute('readonly', '');
+        area.style.position = 'fixed';
+        area.style.left = '-9999px';
+        document.body.appendChild(area);
+        area.select();
+        document.execCommand('copy');
+        area.remove();
+      }
+      setSimpleResult(`已复制 ${label}。`, 'ok');
+    }
+    function renderApiAccess() {
+      const item = selectedAccount('simpleApiAccount');
+      const keyBox = document.getElementById('apiAccessKey');
+      const baseBox = document.getElementById('apiAccessBaseUrl');
+      const actual = document.getElementById('simpleApiActual');
+      if (keyBox) keyBox.textContent = LOCAL_API_KEY_PLACEHOLDER;
+      if (baseBox) baseBox.textContent = apiAccessBaseUrl(item) || '选择账号后生成';
+      if (actual) {
+        actual.innerHTML = item
+          ? `当前实际：<strong>${esc(accountLabel(item))}</strong><br><span class="warnText">只复制本地 fake key，不显示真实 OAuth token。</span>`
+          : '当前实际：<strong class="warnText">未选择</strong>';
+      }
+    }
+    function copyApiKey() {
+      return copyText(LOCAL_API_KEY_PLACEHOLDER, 'OPENAI_API_KEY');
+    }
+    function copyApiBaseUrl() {
+      return copyText(apiAccessBaseUrl(selectedAccount('simpleApiAccount')), 'OPENAI_BASE_URL');
+    }
+    function copyApiEnv() {
+      const item = selectedAccount('simpleApiAccount');
+      return copyText(item ? apiAccessEnv(item) : '', '.env');
+    }
     function setCompactFields(enabled, windowTokens, pct) {
       document.getElementById('compactEnabled').checked = Boolean(enabled);
       document.getElementById('compactWindow').value = windowTokens || '';
@@ -4119,16 +4202,19 @@ INDEX_HTML = """<!doctype html>
       const cliSel = document.getElementById('cliAccount');
       const simpleClaudeSel = document.getElementById('simpleClaudeAccount');
       const simpleCliSel = document.getElementById('simpleCliAccount');
+      const simpleApiSel = document.getElementById('simpleApiAccount');
       const simpleDefaultSel = document.getElementById('simpleDefaultAccount');
       const previous = {
         claude: simpleClaudeSel.value || sel.value,
         cli: simpleCliSel.value || cliSel.value,
+        api: simpleApiSel.value,
         global: actualGlobalAccount || simpleDefaultSel.value
       };
       sel.innerHTML = '';
       cliSel.innerHTML = '';
       simpleClaudeSel.innerHTML = '';
       simpleCliSel.innerHTML = '';
+      simpleApiSel.innerHTML = '';
       simpleDefaultSel.innerHTML = '';
       accounts.forEach((a) => {
         const opt = document.createElement('option');
@@ -4139,6 +4225,7 @@ INDEX_HTML = """<!doctype html>
         cliSel.appendChild(opt.cloneNode(true));
         simpleClaudeSel.appendChild(opt.cloneNode(true));
         simpleCliSel.appendChild(opt.cloneNode(true));
+        simpleApiSel.appendChild(opt.cloneNode(true));
         simpleDefaultSel.appendChild(opt.cloneNode(true));
       });
       if (accounts.length > 0) {
@@ -4155,6 +4242,7 @@ INDEX_HTML = """<!doctype html>
         } else if (!document.getElementById('cliHome').value.trim()) {
           applyCliAccount(a);
         }
+        setSelectValue('simpleApiAccount', previous.api || a.account_id);
         applyGlobalCodexAccount(findAccount(previous.global) || a);
       }
       sel.onchange = () => {
@@ -4184,12 +4272,19 @@ INDEX_HTML = """<!doctype html>
         if (lastData) renderSimpleActuals(lastData);
         setSimpleResult(`单独 Codex CLI 已选择 ${accountLabel(item)}。`);
       };
+      simpleApiSel.onchange = () => {
+        const item = accounts[simpleApiSel.selectedIndex];
+        if (!item) return;
+        renderApiAccess();
+        setSimpleResult(`通用 API 接入已选择 ${accountLabel(item)}。复制 .env 后给支持 OpenAI Base URL 的项目使用。`);
+      };
       simpleDefaultSel.onchange = () => {
         const item = accounts[simpleDefaultSel.selectedIndex];
         if (!item) return;
         applyGlobalCodexAccount(item);
         setSimpleResult(`全局 Codex CLI 已选择 ${accountLabel(item)}。点击按钮后才会写入默认配置。`);
       };
+      renderApiAccess();
       renderCliAccounts(accounts);
     }
     function renderCliAccounts(accounts) {
@@ -4556,6 +4651,9 @@ INDEX_HTML = """<!doctype html>
           if (action === 'simple-claude') return simpleClaude();
           if (action === 'simple-cli') return simpleCli();
           if (action === 'simple-default-codex') return simpleDefaultCodex();
+          if (action === 'copy-api-key') return copyApiKey();
+          if (action === 'copy-api-base-url') return copyApiBaseUrl();
+          if (action === 'copy-api-env') return copyApiEnv();
           if (action === 'migrate-cli-home') return migrateCliHome();
           if (action === 'toggle-tokens') return toggleTokens();
           if (action === 'set-current-selected') return setCurrentFromSelected();

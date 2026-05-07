@@ -577,6 +577,52 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn("[bridge-stream-end]", logs)
         self.assertIn('"idle_timeout_seen": true', logs)
 
+    def test_pre_output_overloaded_terminal_raises_retryable_without_failed_sse(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.failed",
+                'data: {"type":"response.failed","response":{"status":"failed","error":{"message":"Our servers are currently overloaded. Please try again later."}}}',
+                "",
+            ]
+        )
+
+        with self.assertRaises(local_codex_bridge.BridgeStreamRetryableError):
+            list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    response,
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic(),
+                    requested_model="gpt-5.5",
+                )
+            )
+
+    def test_after_output_overloaded_terminal_is_not_retried(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.output_text.delta",
+                'data: {"type":"response.output_text.delta","delta":"half"}',
+                "",
+                "event: response.failed",
+                'data: {"type":"response.failed","response":{"status":"failed","error":{"message":"Our servers are currently overloaded. Please try again later."}}}',
+                "",
+            ]
+        )
+
+        chunks = list(
+            self.make_handler()._iter_stream_with_reasoning_placeholder(
+                response,
+                "acct-1",
+                request_id="bridge-test",
+                started_at=local_codex_bridge.time.monotonic(),
+                requested_model="gpt-5.5",
+            )
+        )
+        body = b"".join(chunks).decode("utf-8")
+
+        self.assertIn('"delta":"half"', body)
+        self.assertIn("event: response.failed", body)
+
     def test_stream_final_summary_logs_terminal_event(self) -> None:
         response = FakeSseResponse(
             [
@@ -632,20 +678,25 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn("[bridge-stream-end]", stderr.getvalue())
         self.assertIn('"client_disconnected": true', stderr.getvalue())
 
-    def test_stream_write_failure_logs_client_disconnect(self) -> None:
-        handler = self.make_handler()
-        chunks = [b"payload"]
-        handler._write_bytes = mock.Mock(return_value=False)
+    def test_stream_write_failure_records_client_disconnect(self) -> None:
+        with (
+            mock.patch.object(local_codex_bridge, "record_bridge_stream_error") as record,
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            local_codex_bridge.log_bridge_client_disconnect(
+                account_id="acct-1",
+                requested_model="gpt-5.4",
+                request_id="bridge-test",
+                started_at=local_codex_bridge.time.monotonic(),
+                detail="write_failed",
+                upstream_request_id="upstream-test",
+            )
 
-        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
-            for chunk in chunks:
-                if chunk and not handler._write_bytes(chunk, flush=True):
-                    print(
-                        f"{local_codex_bridge.log_timestamp()} [bridge-client-disconnect] request_id=bridge-test model=gpt-5.4 detail=write_failed",
-                        file=sys.stderr,
-                    )
-                    break
-
+        record.assert_called_once()
+        payload = record.call_args.args[0]
+        self.assertEqual(payload["error_type"], "BridgeClientDisconnect")
+        self.assertIn("write_failed", payload["error"])
+        self.assertEqual(payload["upstream_request_id"], "upstream-test")
         self.assertIn("[bridge-client-disconnect]", stderr.getvalue())
 
     def test_stream_remote_protocol_error_emits_failed_sse(self) -> None:
@@ -708,7 +759,7 @@ class LocalCodexBridgeCase(unittest.TestCase):
         response = FakeSseResponse(
             [
                 "event: response.failed",
-                'data: {"type":"response.failed","response":{"status":"failed","error":{"message":"overloaded"}}}',
+                'data: {"type":"response.failed","response":{"status":"failed","error":{"message":"permission denied"}}}',
                 "",
             ]
         )

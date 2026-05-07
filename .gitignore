@@ -16,3 +16,4 @@ settings.json
 .codex-cli-*/
 ccswitch-*-handoff-*.md
 private-notes/
+.gstack/

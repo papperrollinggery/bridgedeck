@@ -34,6 +34,7 @@ REASONING_PLACEHOLDER_HEARTBEAT_SECS = 8.0
 REASONING_PLACEHOLDER_MODE_ENV = "CODEX_BRIDGE_REASONING_PLACEHOLDER_MODE"
 STREAM_IDLE_LOG_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_LOG_SECS", "20"))
 STREAM_IDLE_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_FAIL_SECS", "300"))
+STREAM_MAX_RETRIES = int(os.environ.get("CODEX_BRIDGE_STREAM_MAX_RETRIES", "2"))
 BRIDGE_STATE_PATH = Path(
     os.environ.get(
         "CODEX_BRIDGE_STATE_PATH",
@@ -87,6 +88,14 @@ class TerminalStreamError(Exception):
 
 
 class BridgeStreamIdleTimeout(Exception):
+    pass
+
+
+class BridgeClientDisconnect(Exception):
+    pass
+
+
+class BridgeStreamRetryableError(Exception):
     pass
 
 
@@ -148,6 +157,96 @@ def reasoning_placeholder_mode() -> str:
 def reasoning_summary_mode() -> str:
     value = os.environ.get("BRIDGE_REASONING_SUMMARY", "concise").strip().lower()
     return value if value in {"auto", "concise", "detailed", "off"} else "concise"
+
+
+def stream_max_retries() -> int:
+    return max(0, min(STREAM_MAX_RETRIES, 10))
+
+
+def is_retryable_http_status(status_code: int) -> bool:
+    return 500 <= status_code < 600
+
+
+def is_retryable_stream_exception(exc: BaseException) -> bool:
+    retryable_types = (
+        httpx.RemoteProtocolError,
+        httpx.ReadTimeout,
+        httpx.ReadError,
+        httpx.WriteError,
+    )
+    if isinstance(exc, retryable_types):
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "overloaded",
+            "temporarily",
+            "timeout",
+            "timed out",
+            "connection reset",
+            "incomplete chunked read",
+            "server disconnected",
+        )
+    )
+
+
+def is_retryable_terminal_stream_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in ("overloaded", "temporarily", "timeout", "server error"))
+
+
+def sse_block_commits_stream(event_name: str | None, payload: dict[str, Any] | None) -> bool:
+    if event_name in {
+        "response.completed",
+        "response.failed",
+        "response.cancelled",
+        "response.incomplete",
+        "error",
+    }:
+        return True
+    if event_name in {
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done",
+    }:
+        return True
+    if event_name and ("tool" in event_name or "function_call" in event_name):
+        return True
+    if not isinstance(payload, dict):
+        return False
+    payload_type = payload.get("type")
+    if isinstance(payload_type, str):
+        if "tool" in payload_type or "function_call" in payload_type:
+            return True
+        if payload_type in {
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+        }:
+            return True
+    item = payload.get("item")
+    if isinstance(item, dict):
+        item_type = item.get("type")
+        return isinstance(item_type, str) and item_type != "reasoning"
+    return False
+
+
+def log_bridge_stream_retry(
+    *,
+    account_id: str,
+    requested_model: str | None,
+    request_id: str,
+    attempt: int,
+    max_attempts: int,
+    reason: str,
+) -> None:
+    print(
+        f"{log_timestamp()} [bridge-stream-retry] request_id={request_id} account_id={account_id} model={requested_model or 'unknown'} attempt={attempt}/{max_attempts} reason={truncate_log_text(reason)}",
+        file=sys.stderr,
+    )
 
 
 def log_upstream_result(
@@ -449,6 +548,30 @@ def log_bridge_stream_error(
     record_bridge_stream_error(payload)
     print(
         f"{log_timestamp()} [bridge-stream-error] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}",
+        file=sys.stderr,
+    )
+
+
+def log_bridge_client_disconnect(
+    *,
+    account_id: str,
+    requested_model: str | None,
+    request_id: str,
+    started_at: float,
+    detail: str,
+    upstream_request_id: str | None = None,
+) -> None:
+    exc = BridgeClientDisconnect(f"downstream client disconnected before terminal event: {detail}")
+    log_bridge_stream_error(
+        account_id=account_id,
+        requested_model=requested_model,
+        request_id=request_id,
+        started_at=started_at,
+        exc=exc,
+        upstream_request_id=upstream_request_id,
+    )
+    print(
+        f"{log_timestamp()} [bridge-client-disconnect] request_id={request_id} model={requested_model or 'unknown'} detail={detail}",
         file=sys.stderr,
     )
 
@@ -906,92 +1029,161 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 upstream_headers["anthropic-beta"] = self.headers["anthropic-beta"]
 
             upstream_url = f"{UPSTREAM_BASE_URL}/responses"
+            max_attempts = stream_max_retries() + 1 if is_stream else 1
+            attempt = 0
+            headers_sent = False
 
-            with build_upstream_http_client(timeout=600.0) as client, client.stream(
-                "POST",
-                upstream_url,
-                headers=upstream_headers,
-                json=normalized_body,
-            ) as response:
-                error_body = None
-                if not response.is_success:
-                    error_body = response.read()
-                log_upstream_result(
-                    "responses",
-                    account_id,
-                    response.is_success,
-                    status_code=response.status_code,
-                    detail=None
-                    if response.is_success
-                    else error_body.decode("utf-8", "replace") if error_body is not None else None,
-                )
-                if not response.is_success:
-                    log_upstream_diagnostic(
-                        "responses",
-                        account_id,
-                        status_code=response.status_code,
-                        route_path=route_path,
-                        response_headers=response.headers,
-                        request_shape=summarize_request_shape(request_body),
-                        normalized_shape=summarize_request_shape(normalized_body),
-                        error_detail=error_body.decode("utf-8", "replace") if error_body is not None else None,
-                    )
-
-                if not response.is_success:
-                    body = error_body if error_body is not None else b""
-                    self._send_upstream_headers(
-                        response,
-                        is_stream=True,
-                        content_length=len(body),
-                    )
-                    self._write_bytes(body, flush=True)
-                    return
-
-                upstream_request_id = response.headers.get("x-request-id")
-
-                if not is_stream:
-                    body = response.read()
-                    body = build_non_stream_json_from_sse(
-                        body,
-                        requested_model,
-                    )
-                    self._send_upstream_headers(
-                        response,
-                        is_stream=False,
-                        content_length=len(body),
-                    )
-                    self._write_bytes(body, flush=True)
-                    return
-
-                self._send_upstream_headers(response, is_stream=True)
-                metrics = BridgeStreamMetrics()
-                try:
-                    for chunk in self._iter_stream_with_reasoning_placeholder(
-                        response,
-                        account_id,
-                        request_id=request_id,
-                        started_at=started_at,
-                        requested_effort=requested_effort,
-                        requested_model=requested_model,
-                        upstream_request_id=upstream_request_id,
-                        metrics=metrics,
-                    ):
-                        if chunk and not self._write_bytes(chunk, flush=True):
-                            metrics.client_disconnected = True
-                            print(
-                                f"{log_timestamp()} [bridge-client-disconnect] request_id={request_id} model={requested_model or 'unknown'} detail=write_failed",
-                                file=sys.stderr,
+            with build_upstream_http_client(timeout=600.0) as client:
+                while attempt < max_attempts:
+                    attempt += 1
+                    try:
+                        with client.stream(
+                            "POST",
+                            upstream_url,
+                            headers=upstream_headers,
+                            json=normalized_body,
+                        ) as response:
+                            error_body = None
+                            if not response.is_success:
+                                error_body = response.read()
+                            log_upstream_result(
+                                "responses",
+                                account_id,
+                                response.is_success,
+                                status_code=response.status_code,
+                                detail=None
+                                if response.is_success
+                                else error_body.decode("utf-8", "replace") if error_body is not None else None,
                             )
-                            break
-                        if chunk:
-                            metrics.downstream_writes += 1
-                except OSError as exc:
-                    metrics.client_disconnected = True
-                    print(
-                        f"{log_timestamp()} [bridge-client-disconnect] request_id={request_id} type={type(exc).__name__} detail={truncate_log_text(str(exc))}",
-                        file=sys.stderr,
-                    )
-                    return
+                            if not response.is_success:
+                                log_upstream_diagnostic(
+                                    "responses",
+                                    account_id,
+                                    status_code=response.status_code,
+                                    route_path=route_path,
+                                    response_headers=response.headers,
+                                    request_shape=summarize_request_shape(request_body),
+                                    normalized_shape=summarize_request_shape(normalized_body),
+                                    error_detail=error_body.decode("utf-8", "replace") if error_body is not None else None,
+                                )
+
+                            if not response.is_success:
+                                body = error_body if error_body is not None else b""
+                                if is_stream and is_retryable_http_status(response.status_code) and attempt < max_attempts:
+                                    log_bridge_stream_retry(
+                                        account_id=account_id,
+                                        requested_model=requested_model,
+                                        request_id=request_id,
+                                        attempt=attempt,
+                                        max_attempts=max_attempts,
+                                        reason=f"http_status_{response.status_code}",
+                                    )
+                                    continue
+                                self._send_upstream_headers(
+                                    response,
+                                    is_stream=True,
+                                    content_length=len(body),
+                                )
+                                self._write_bytes(body, flush=True)
+                                return
+
+                            upstream_request_id = response.headers.get("x-request-id")
+
+                            if not is_stream:
+                                body = response.read()
+                                body = build_non_stream_json_from_sse(
+                                    body,
+                                    requested_model,
+                                )
+                                self._send_upstream_headers(
+                                    response,
+                                    is_stream=False,
+                                    content_length=len(body),
+                                )
+                                self._write_bytes(body, flush=True)
+                                return
+
+                            if not headers_sent:
+                                self._send_upstream_headers(response, is_stream=True)
+                                headers_sent = True
+
+                            metrics = BridgeStreamMetrics()
+                            try:
+                                for chunk in self._iter_stream_with_reasoning_placeholder(
+                                    response,
+                                    account_id,
+                                    request_id=request_id,
+                                    started_at=started_at,
+                                    requested_effort=requested_effort,
+                                    requested_model=requested_model,
+                                    upstream_request_id=upstream_request_id,
+                                    metrics=metrics,
+                                ):
+                                    if chunk and not self._write_bytes(chunk, flush=True):
+                                        metrics.client_disconnected = True
+                                        log_bridge_client_disconnect(
+                                            account_id=account_id,
+                                            requested_model=requested_model,
+                                            request_id=request_id,
+                                            started_at=started_at,
+                                            detail="write_failed",
+                                            upstream_request_id=upstream_request_id,
+                                        )
+                                        return
+                                    if chunk:
+                                        metrics.downstream_writes += 1
+                                return
+                            except BridgeStreamRetryableError as exc:
+                                if attempt < max_attempts:
+                                    log_bridge_stream_retry(
+                                        account_id=account_id,
+                                        requested_model=requested_model,
+                                        request_id=request_id,
+                                        attempt=attempt,
+                                        max_attempts=max_attempts,
+                                        reason=str(exc),
+                                    )
+                                    continue
+                                log_bridge_stream_error(
+                                    account_id=account_id,
+                                    requested_model=requested_model,
+                                    request_id=request_id,
+                                    started_at=started_at,
+                                    exc=exc.__cause__ or exc,
+                                    upstream_request_id=upstream_request_id,
+                                )
+                                self._write_bytes(
+                                    response_failed_sse(
+                                        request_id=request_id,
+                                        requested_model=requested_model,
+                                        exc=exc.__cause__ or exc,
+                                    ),
+                                    flush=True,
+                                )
+                                return
+                            except OSError as exc:
+                                metrics.client_disconnected = True
+                                log_bridge_client_disconnect(
+                                    account_id=account_id,
+                                    requested_model=requested_model,
+                                    request_id=request_id,
+                                    started_at=started_at,
+                                    detail=f"{type(exc).__name__}: {truncate_log_text(str(exc))}",
+                                    upstream_request_id=upstream_request_id,
+                                )
+                                return
+                    except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ReadError, httpx.WriteError) as exc:
+                        if is_stream and attempt < max_attempts:
+                            log_bridge_stream_retry(
+                                account_id=account_id,
+                                requested_model=requested_model,
+                                request_id=request_id,
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                                reason=f"{type(exc).__name__}: {truncate_log_text(str(exc))}",
+                            )
+                            continue
+                        raise
         except httpx.HTTPStatusError as exc:
             self._write_json_error(exc.response.status_code, exc.response.text)
         except Exception as exc:  # noqa: BLE001
@@ -1056,6 +1248,8 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         reader.start()
         state = ReasoningPlaceholderState()
         metrics = metrics or BridgeStreamMetrics()
+        committed = False
+        pending_chunks: list[bytes] = []
 
         try:
             while True:
@@ -1108,14 +1302,23 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         source="heartbeat",
                     )
                     if heartbeat:
+                        if reasoning_placeholder_mode() == "visible":
+                            committed = True
+                            while pending_chunks:
+                                yield pending_chunks.pop(0)
                         yield heartbeat
                     continue
 
                 if queued is done_marker:
+                    while pending_chunks:
+                        yield pending_chunks.pop(0)
                     break
                 if isinstance(queued, BaseException):
                     if state.completed:
                         break
+                    if not committed and is_retryable_stream_exception(queued):
+                        retryable = BridgeStreamRetryableError(str(queued))
+                        raise retryable from queued
                     log_bridge_stream_error(
                         account_id=account_id,
                         requested_model=requested_model,
@@ -1132,7 +1335,14 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     break
 
                 state.last_upstream_at = time.monotonic()
-                for chunk in self._emit_sse_block_with_reasoning_placeholder(
+                event_name, payload, _data_lines = self._parse_sse_block(queued)
+                terminal_error = terminal_stream_error_from_payload(event_name, payload)
+                if terminal_error is not None and not committed and is_retryable_terminal_stream_error(terminal_error):
+                    metrics.upstream_events += 1
+                    retryable = BridgeStreamRetryableError(str(terminal_error))
+                    raise retryable from terminal_error
+
+                chunks = list(self._emit_sse_block_with_reasoning_placeholder(
                     queued,
                     account_id,
                     state=state,
@@ -1142,8 +1352,16 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     requested_model=requested_model,
                     upstream_request_id=upstream_request_id,
                     metrics=metrics,
-                ):
-                    yield chunk
+                ))
+                if not committed and sse_block_commits_stream(event_name, payload):
+                    committed = True
+                if committed:
+                    while pending_chunks:
+                        yield pending_chunks.pop(0)
+                    for chunk in chunks:
+                        yield chunk
+                else:
+                    pending_chunks.extend(chunks)
         finally:
             log_bridge_stream_summary(
                 account_id=account_id,
