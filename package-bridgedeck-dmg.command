@@ -73,17 +73,23 @@ RESOURCE_DIR="$SCRIPT_DIR/../Resources"
 LOG_DIR="$HOME/Library/Logs"
 LOG_FILE="$LOG_DIR/bridgedeck-app.log"
 APP_URL="http://127.0.0.1:8899"
+mkdir -p "$LOG_DIR"
+
+log_event() {
+  /bin/echo "$(/bin/date '+%Y-%m-%d %H:%M:%S') launcher: $*" >> "$LOG_FILE"
+}
 
 ui_running() {
   /usr/bin/curl -fsS -H "X-CCSBT-Token: probe" "$APP_URL/" >/dev/null 2>&1
 }
 
 open_ui() {
+  log_event "open_ui $APP_URL"
   open "$APP_URL"
 }
 
 start_ui() {
-  mkdir -p "$LOG_DIR"
+  log_event "start_ui"
   /usr/bin/nohup /usr/bin/python3 "$RESOURCE_DIR/bridgedeck.py" --host 127.0.0.1 --port 8899 >> "$LOG_FILE" 2>&1 &
   for _ in {1..20}; do
     if ui_running; then
@@ -96,6 +102,7 @@ start_ui() {
 }
 
 stop_ui_keep_bridge() {
+  log_event "stop_ui_keep_bridge"
   for pid in $(/usr/sbin/lsof -tiTCP:8899 -sTCP:LISTEN 2>/dev/null); do
     cmd="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
     if [[ "$cmd" == *"bridgedeck.py"* ]]; then
@@ -106,33 +113,45 @@ stop_ui_keep_bridge() {
 }
 
 start_bridge_only() {
-  mkdir -p "$LOG_DIR"
+  log_event "start_bridge_only"
   CODEX_BRIDGE_SCRIPT="$RESOURCE_DIR/local_codex_bridge.py" /usr/bin/python3 "$RESOURCE_DIR/bridgedeck.py" --local-bridge start >> "$LOG_FILE" 2>&1 &
   /usr/bin/osascript -e 'display notification "8876 Local Bridge 已启动或已在运行" with title "BridgeDeck"' >/dev/null 2>&1 || true
 }
 
 if ui_running; then
+  log_event "launcher_start ui_running=1"
   choice="$(/usr/bin/osascript <<'APPLESCRIPT' 2>/dev/null || true
 button returned of (display dialog "BridgeDeck UI (8899) 已在运行。" buttons {"取消", "关闭 UI 保留 Bridge", "打开 UI"} default button "打开 UI" cancel button "取消" with title "BridgeDeck")
 APPLESCRIPT
 )"
+  log_event "dialog_choice=${choice:-<empty>}"
   case "$choice" in
     "打开 UI") open_ui ;;
     "关闭 UI 保留 Bridge") stop_ui_keep_bridge ;;
+    "") log_event "dialog_empty_fallback=open_ui"; open_ui ;;
     *) exit 0 ;;
   esac
 else
+  log_event "launcher_start ui_running=0"
   choice="$(/usr/bin/osascript <<'APPLESCRIPT' 2>/dev/null || true
 button returned of (display dialog "BridgeDeck UI 未运行。要打开配置页，还是只启动 8876 Local Bridge？" buttons {"取消", "只启动 Bridge", "打开 UI"} default button "打开 UI" cancel button "取消" with title "BridgeDeck")
 APPLESCRIPT
 )"
+  log_event "dialog_choice=${choice:-<empty>}"
   case "$choice" in
     "打开 UI") start_ui ;;
     "只启动 Bridge") start_bridge_only ;;
+    "") log_event "dialog_empty_fallback=start_ui"; start_ui ;;
     *) exit 0 ;;
   esac
 fi
 LAUNCHER
+if command -v swiftc >/dev/null 2>&1; then
+  TMP_LAUNCHER="$(mktemp /tmp/bridgedeck-launcher.XXXXXX)"
+  swiftc "$ROOT/BridgeDeckLauncher.swift" -o "$TMP_LAUNCHER"
+  cp "$TMP_LAUNCHER" "$MACOS/launcher"
+  rm -f "$TMP_LAUNCHER"
+fi
 chmod +x "$MACOS/launcher"
 
 /usr/bin/hdiutil create -volname "$APP_NAME" -srcfolder "$APP_DIR" -ov -format UDZO "$DMG"
