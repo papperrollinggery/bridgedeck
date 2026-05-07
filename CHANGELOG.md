@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.18
+
+- Added OpenAI-compatible `/v1/messages`, `/v1/chat/completions`, and `/v1/models` bridge endpoints for third-party clients.
+- Added Anthropic bridge access values in the UI, including base URL, model, and `.env` copy support.
+- Improved local bridge payload normalization, model metadata, and compatibility test coverage.
+
 ## 0.2.17
 
 - Added Local Codex Bridge silent stream idle timeout handling: long upstream silence now ends with a `response.failed` event instead of hanging forever.
