@@ -3248,6 +3248,15 @@ INDEX_HTML = """<!doctype html>
     .toolCard .actualRow button { min-height:0; padding:4px 8px; font-weight:600; flex:0 0 auto; }
     .simpleResult { margin-top:12px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#0f1320; min-height:42px; color:var(--muted); font-size:13px; line-height:1.5; }
     .simpleResult strong { color:var(--text); }
+    .apiMatrix { display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin:12px 0; }
+    .apiCard { border:1px solid var(--line); border-radius:8px; background:#101827; padding:10px; min-height:110px; }
+    .apiCardTitle { font-weight:800; font-size:13px; margin-bottom:6px; }
+    .apiCardMeta { color:var(--muted); font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
+    .apiCard.ok { border-color:#265f43; }
+    .apiCard.warn { border-color:#7a5a1c; }
+    .apiExampleGrid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:10px; margin-top:10px; }
+    .apiExample { border:1px solid var(--line); border-radius:8px; background:#0f1320; padding:10px; }
+    .apiExampleTitle { font-weight:800; font-size:12px; margin-bottom:6px; }
     .quotaBar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:10px 0; }
     .quotaPill { border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:#101827; min-width:180px; }
     .quotaPill.current { border-color:#2f6fb2; background:#102033; }
@@ -3409,6 +3418,48 @@ INDEX_HTML = """<!doctype html>
         </div>
       </div>
       <div class="simpleResult" id="simpleResult">三种入口可以选择不同账号。</div>
+    </div>
+
+    <div class="card guideSection" id="apiAccessCard" data-guide="apiAccess">
+      <h2>通用 API 接入</h2>
+      <div class="sectionHint">只展示可复制配置和 endpoint 能力，不写 provider、不改 Claude Desktop。API key 使用占位值，真实 OAuth token 不会显示。</div>
+      <div class="row">
+        <label>账号</label>
+        <select id="simpleApiAccount"></select>
+        <button class="miniBtn" data-action="copy-api-base-url">复制 BASE_URL</button>
+        <button class="miniBtn" data-action="copy-api-env">复制 OpenAI env</button>
+        <button class="miniBtn" data-action="copy-claude-env">复制 Claude Desktop env</button>
+      </div>
+      <div class="paths" id="apiAccessBaseUrl"></div>
+      <div class="apiMatrix">
+        <div class="apiCard ok">
+          <div class="apiCardTitle">OpenAI Responses</div>
+          <div class="apiCardMeta"><span class="mono">POST /v1/responses</span><br />Codex bridge 主路径，支持流式 reasoning keepalive。</div>
+        </div>
+        <div class="apiCard ok">
+          <div class="apiCardTitle">Anthropic Messages</div>
+          <div class="apiCardMeta"><span class="mono">POST /v1/messages</span><br />Claude Desktop 3P gateway 最小兼容路径，映射到 Responses。</div>
+        </div>
+        <div class="apiCard ok">
+          <div class="apiCardTitle">Chat Completions</div>
+          <div class="apiCardMeta"><span class="mono">POST /v1/chat/completions</span><br />OpenAI 旧式工具接入路径，非流式和 SSE 都走 Responses。</div>
+        </div>
+        <div class="apiCard ok">
+          <div class="apiCardTitle">Scoped Models</div>
+          <div class="apiCardMeta"><span class="mono">GET /v1/models</span><br />返回 account-scoped 模型能力；gpt-5.5 为 272k context / 128k max output。</div>
+        </div>
+      </div>
+      <div class="apiExampleGrid">
+        <div class="apiExample">
+          <div class="apiExampleTitle">OpenAI-compatible</div>
+          <div class="paths" id="apiOpenAiExample"></div>
+        </div>
+        <div class="apiExample">
+          <div class="apiExampleTitle">Claude Desktop 3P</div>
+          <div class="paths" id="apiClaudeExample"></div>
+        </div>
+      </div>
+      <div class="muted mt10">gpt-5.5 thinking levels: low / medium / high / xhigh。minimal 不作为可选级别展示。</div>
     </div>
 
     <div class="layout">
@@ -3577,6 +3628,7 @@ INDEX_HTML = """<!doctype html>
     let lastAccounts = [];
     const DEFAULT_COMPACT_WINDOW = '220000';
     const DEFAULT_COMPACT_PCT = '80';
+    const LOCAL_API_KEY_PLACEHOLDER = 'sk-bridgedeck-local-placeholder';
     const GUIDES = {
       simpleFlow: {
         title: '日常模式',
@@ -3589,6 +3641,17 @@ INDEX_HTML = """<!doctype html>
           '全局 Codex CLI 给 Paperclip、Codex Desktop、直接运行 codex 用。',
           '三个入口可以同号，也可以不同号。',
           '下方高级区只在排查时使用。'
+        ]
+      },
+      apiAccess: {
+        title: '通用 API 接入',
+        target: '上方板块：API endpoint 和 copy-safe 配置',
+        steps: [
+          '选择要暴露给工具的 ChatGPT 账号。',
+          'BASE_URL 使用账号级路径，不暴露真实 OAuth token。',
+          'OpenAI-compatible 工具使用 placeholder API key。',
+          'Claude Desktop 3P 使用 ANTHROPIC_BASE_URL 指向同一账号路径。',
+          '这里只复制配置，不写入 provider，也不改变当前运行工具。'
         ]
       },
       providerCreate: {
@@ -4047,6 +4110,35 @@ INDEX_HTML = """<!doctype html>
       const sel = document.getElementById(selectId);
       return sel ? findAccount(sel.value) : null;
     }
+    function apiAccessBaseUrl(item) {
+      return item && item.account_id ? `http://127.0.0.1:8876/accounts/${encodeURIComponent(item.account_id)}/v1` : '';
+    }
+    function renderApiAccess(item) {
+      const baseUrl = apiAccessBaseUrl(item);
+      const openaiExample = baseUrl
+        ? `OPENAI_API_KEY=${LOCAL_API_KEY_PLACEHOLDER}\nOPENAI_BASE_URL=${baseUrl}\nMODEL=gpt-5.5`
+        : '';
+      const claudeExample = baseUrl
+        ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_API_KEY_PLACEHOLDER}\nANTHROPIC_MODEL=gpt-5.5`
+        : '';
+      document.getElementById('apiAccessBaseUrl').textContent = baseUrl ? `BASE_URL: ${baseUrl}` : 'BASE_URL: 选择账号后生成';
+      document.getElementById('apiOpenAiExample').textContent = openaiExample;
+      document.getElementById('apiClaudeExample').textContent = claudeExample;
+    }
+    async function copyText(value, label) {
+      const text = String(value || '');
+      if (!text) throw new Error(`${label} 为空`);
+      await navigator.clipboard.writeText(text);
+      log(`${label} 已复制`);
+    }
+    function apiOpenAiEnv(item) {
+      const baseUrl = apiAccessBaseUrl(item);
+      return baseUrl ? `OPENAI_API_KEY=${LOCAL_API_KEY_PLACEHOLDER}\nOPENAI_BASE_URL=${baseUrl}` : '';
+    }
+    function apiClaudeEnv(item) {
+      const baseUrl = apiAccessBaseUrl(item);
+      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_API_KEY_PLACEHOLDER}\nANTHROPIC_MODEL=gpt-5.5` : '';
+    }
     function setCompactFields(enabled, windowTokens, pct) {
       document.getElementById('compactEnabled').checked = Boolean(enabled);
       document.getElementById('compactWindow').value = windowTokens || '';
@@ -4120,16 +4212,19 @@ INDEX_HTML = """<!doctype html>
       const simpleClaudeSel = document.getElementById('simpleClaudeAccount');
       const simpleCliSel = document.getElementById('simpleCliAccount');
       const simpleDefaultSel = document.getElementById('simpleDefaultAccount');
+      const simpleApiSel = document.getElementById('simpleApiAccount');
       const previous = {
         claude: simpleClaudeSel.value || sel.value,
         cli: simpleCliSel.value || cliSel.value,
-        global: actualGlobalAccount || simpleDefaultSel.value
+        global: actualGlobalAccount || simpleDefaultSel.value,
+        api: simpleApiSel.value
       };
       sel.innerHTML = '';
       cliSel.innerHTML = '';
       simpleClaudeSel.innerHTML = '';
       simpleCliSel.innerHTML = '';
       simpleDefaultSel.innerHTML = '';
+      simpleApiSel.innerHTML = '';
       accounts.forEach((a) => {
         const opt = document.createElement('option');
         opt.value = a.account_id;
@@ -4140,6 +4235,7 @@ INDEX_HTML = """<!doctype html>
         simpleClaudeSel.appendChild(opt.cloneNode(true));
         simpleCliSel.appendChild(opt.cloneNode(true));
         simpleDefaultSel.appendChild(opt.cloneNode(true));
+        simpleApiSel.appendChild(opt.cloneNode(true));
       });
       if (accounts.length > 0) {
         const a = accounts[0];
@@ -4156,6 +4252,7 @@ INDEX_HTML = """<!doctype html>
           applyCliAccount(a);
         }
         applyGlobalCodexAccount(findAccount(previous.global) || a);
+        setSelectValue('simpleApiAccount', previous.api || previous.claude || a.account_id);
       }
       sel.onchange = () => {
         const item = accounts[sel.selectedIndex];
@@ -4190,6 +4287,11 @@ INDEX_HTML = """<!doctype html>
         applyGlobalCodexAccount(item);
         setSimpleResult(`全局 Codex CLI 已选择 ${accountLabel(item)}。点击按钮后才会写入默认配置。`);
       };
+      simpleApiSel.onchange = () => {
+        const item = accounts[simpleApiSel.selectedIndex];
+        renderApiAccess(item || null);
+      };
+      renderApiAccess(selectedAccount('simpleApiAccount'));
       renderCliAccounts(accounts);
     }
     function renderCliAccounts(accounts) {
@@ -4512,6 +4614,15 @@ INDEX_HTML = """<!doctype html>
       log(`${res.message}: 更新 ${res.updated.length} 个，跳过 ${res.skipped.length} 个；keys: ${res.env_keys.join(', ')}`);
       await refreshData();
     }
+    async function copyApiBaseUrl() {
+      return copyText(apiAccessBaseUrl(selectedAccount('simpleApiAccount')), 'BASE_URL');
+    }
+    async function copyApiEnv() {
+      return copyText(apiOpenAiEnv(selectedAccount('simpleApiAccount')), 'OpenAI env');
+    }
+    async function copyClaudeEnv() {
+      return copyText(apiClaudeEnv(selectedAccount('simpleApiAccount')), 'Claude Desktop env');
+    }
     async function syncClaudePlugins() {
       const res = await api('/api/sync-claude-plugins', 'POST', {});
       const added = res.added && res.added.length ? `新增：${res.added.join(', ')}` : '没有新增';
@@ -4566,6 +4677,9 @@ INDEX_HTML = """<!doctype html>
           if (action === 'compact-off') return applyCompactPreset('');
           if (action === 'save-compact-selected') return saveCompactSelected();
           if (action === 'sync-common-env-selected') return syncCommonEnvSelected();
+          if (action === 'copy-api-base-url') return copyApiBaseUrl();
+          if (action === 'copy-api-env') return copyApiEnv();
+          if (action === 'copy-claude-env') return copyClaudeEnv();
           if (action === 'extract-safe-common-config') return extractSafeCommonConfig();
           if (action === 'sync-claude-plugins') return syncClaudePlugins();
           if (action === 'save-auto-switch') return saveAutoSwitch();

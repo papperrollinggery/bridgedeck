@@ -349,6 +349,66 @@ class FakeSseResponse:
         if self.exc is not None:
             raise self.exc
 
+    def close(self) -> None:
+        return None
+
+
+class FakeForwardResponse:
+    def __init__(self, status_code: int, *, body: bytes = b"", headers: dict[str, str] | None = None) -> None:
+        self.status_code = status_code
+        self.content = body
+        self.headers = headers or {"content-type": "text/event-stream"}
+
+    @property
+    def is_success(self) -> bool:
+        return 200 <= self.status_code < 300
+
+    def __enter__(self) -> "FakeForwardResponse":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self.content
+
+    def iter_lines(self):
+        for line in self.content.decode("utf-8").splitlines():
+            yield line
+
+    def close(self) -> None:
+        return None
+
+
+class FakeForwardClient:
+    def __init__(self, responses: list[FakeForwardResponse]) -> None:
+        self.responses = responses
+        self.calls: list[dict[str, Any]] = []
+
+    def __enter__(self) -> "FakeForwardClient":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        return None
+
+    def stream(self, *args: Any, **kwargs: Any) -> FakeForwardResponse:
+        self.calls.append({"args": args, "kwargs": kwargs})
+        return self.responses.pop(0)
+
+
+class PoolAuthStore:
+    def __init__(self) -> None:
+        self.token_requests: list[str | None] = []
+        self.bound: tuple[str | None, str] | None = None
+
+    def get_access_token(self, requested_account_id: str | None) -> tuple[str, str]:
+        self.token_requests.append(requested_account_id)
+        account_id = requested_account_id or "acct-1"
+        return account_id, f"token-{account_id}"
+
+    def bind_session(self, session_key: str | None, account_id: str) -> None:
+        self.bound = (session_key, account_id)
+
 
 class SlowReasoningResponse:
     headers = {"x-request-id": "upstream-test"}
@@ -392,9 +452,51 @@ class OSErrorWriter:
         raise AssertionError("flush should not run after write failure")
 
 
+class NoopAuthStore:
+    def get_access_token(self, requested_account_id: str | None) -> tuple[str, str]:
+        return requested_account_id or "acct-1", "unused-access-token"
+
+    def account_candidates(self, requested_account_id: str | None, session_key: str | None = None) -> list[str]:
+        return [requested_account_id or "acct-1"]
+
+    def bind_session(self, session_key: str | None, account_id: str) -> None:
+        return None
+
+
 class LocalCodexBridgeCase(unittest.TestCase):
     def make_handler(self) -> local_codex_bridge.CodexBridgeHandler:
         return object.__new__(local_codex_bridge.CodexBridgeHandler)
+
+    def start_local_bridge_server(self):
+        server = local_codex_bridge.CodexBridgeServer(
+            ("127.0.0.1", 0),
+            local_codex_bridge.CodexBridgeHandler,
+            NoopAuthStore(),
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def post_local_bridge_json(
+        self,
+        server: local_codex_bridge.CodexBridgeServer,
+        path: str,
+        body: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, str, dict[str, str]]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}{path}",
+            data=json.dumps(body).encode("utf-8"),
+            method="POST",
+        )
+        request.add_header("Content-Type", "application/json")
+        for key, value in (headers or {}).items():
+            request.add_header(key, value)
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, response.read().decode("utf-8"), dict(response.headers.items())
 
     def test_stream_passthrough_preserves_delta_and_completed(self) -> None:
         response = FakeSseResponse(
@@ -678,6 +780,23 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(record.call_args.args[0]["request_id"], "bridge-test")
         self.assertEqual(record.call_args.args[0]["model"], "gpt-5.5")
 
+    def test_stream_bootstrap_protocol_error_is_retryable_before_first_event(self) -> None:
+        response = FakeSseResponse(
+            [],
+            exc=local_codex_bridge.httpx.RemoteProtocolError("incomplete chunked read"),
+        )
+
+        with self.assertRaises(local_codex_bridge.RetryableStreamBootstrapError):
+            list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    response,
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic(),
+                    requested_model="gpt-5.5",
+                )
+            )
+
     def test_stream_error_after_completed_does_not_emit_second_terminal(self) -> None:
         response = FakeSseResponse(
             [
@@ -765,6 +884,429 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(payload["status"], "failed")
         self.assertEqual(payload["model"], "gpt-5.5")
         self.assertEqual(payload["error"]["message"], "overloaded")
+
+    def test_models_registry_includes_scoped_gpt55_limits(self) -> None:
+        payload = local_codex_bridge.build_models_payload()
+        by_id = {item["id"]: item for item in payload["data"]}
+
+        self.assertEqual(payload["object"], "list")
+        self.assertIn("gpt-5.5", by_id)
+        self.assertEqual(by_id["gpt-5.5"]["context_length"], 272000)
+        self.assertEqual(by_id["gpt-5.5"]["max_completion_tokens"], 128000)
+        self.assertEqual(by_id["gpt-5.5"]["thinking"]["levels"], ["low", "medium", "high", "xhigh"])
+        self.assertTrue(by_id["gpt-5.5"]["capabilities"]["messages"])
+        self.assertTrue(by_id["gpt-5.5"]["capabilities"]["responses"])
+
+    def test_models_endpoint_is_account_scoped_and_ignores_sensitive_query(self) -> None:
+        server = self.start_local_bridge_server()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/accounts/acct-1/v1/models?api_key=secret"
+        )
+
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        by_id = {item["id"]: item for item in payload["data"]}
+        self.assertEqual(response.status, 200)
+        self.assertIn("gpt-5.5", by_id)
+        self.assertEqual(by_id["gpt-5.5"]["context_length"], 272000)
+
+    def test_messages_endpoint_posts_translated_responses_request_to_mock_upstream(self) -> None:
+        server = self.start_local_bridge_server()
+        client = FakeForwardClient(
+            [
+                FakeForwardResponse(
+                    200,
+                    body=(
+                        b"event: response.output_text.delta\n"
+                        b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+                    ),
+                )
+            ]
+        )
+
+        with mock.patch.object(local_codex_bridge, "build_upstream_http_client", return_value=client):
+            status, body, headers = self.post_local_bridge_json(
+                server,
+                "/accounts/acct-1/v1/messages",
+                {
+                    "model": "gpt-5.5",
+                    "max_tokens": 200,
+                    "system": "Be direct.",
+                    "stream": False,
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                },
+            )
+
+        sent = client.calls[0]["kwargs"]
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertEqual(sent["headers"]["ChatGPT-Account-Id"], "acct-1")
+        self.assertEqual(sent["headers"]["Authorization"], "Bearer unused-access-token")
+        self.assertEqual(sent["json"]["model"], "gpt-5.5")
+        self.assertEqual(sent["json"]["instructions"], "Be direct.")
+        self.assertEqual(sent["json"]["stream"], True)
+        self.assertEqual(sent["json"]["input"][0]["content"][0], {"type": "input_text", "text": "hi"})
+        payload = json.loads(body)
+        self.assertEqual(payload["type"], "message")
+        self.assertEqual(payload["content"][0], {"type": "text", "text": "hello"})
+
+    def test_chat_completions_endpoint_posts_translated_responses_request_to_mock_upstream(self) -> None:
+        server = self.start_local_bridge_server()
+        client = FakeForwardClient(
+            [
+                FakeForwardResponse(
+                    200,
+                    body=(
+                        b"event: response.output_text.delta\n"
+                        b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+                    ),
+                )
+            ]
+        )
+
+        with mock.patch.object(local_codex_bridge, "build_upstream_http_client", return_value=client):
+            status, body, headers = self.post_local_bridge_json(
+                server,
+                "/accounts/acct-1/v1/chat/completions",
+                {
+                    "model": "gpt-5.5",
+                    "stream": False,
+                    "reasoning_effort": "high",
+                    "messages": [
+                        {"role": "system", "content": "Be direct."},
+                        {"role": "user", "content": "hi"},
+                    ],
+                },
+            )
+
+        sent = client.calls[0]["kwargs"]
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertEqual(sent["headers"]["ChatGPT-Account-Id"], "acct-1")
+        self.assertEqual(sent["json"]["instructions"], "Be direct.")
+        self.assertEqual(sent["json"]["reasoning"]["effort"], "high")
+        self.assertEqual(sent["json"]["input"][0]["content"][0], {"type": "input_text", "text": "hi"})
+        payload = json.loads(body)
+        self.assertEqual(payload["object"], "chat.completion")
+        self.assertEqual(payload["choices"][0]["message"]["content"], "hello")
+
+    def test_chat_completions_endpoint_streams_openai_sse_from_mock_upstream(self) -> None:
+        server = self.start_local_bridge_server()
+        client = FakeForwardClient(
+            [
+                FakeForwardResponse(
+                    200,
+                    body=(
+                        b"event: response.output_text.delta\n"
+                        b'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+                        b"event: response.completed\n"
+                        b'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}\n\n'
+                    ),
+                )
+            ]
+        )
+
+        with mock.patch.object(local_codex_bridge, "build_upstream_http_client", return_value=client):
+            status, body, headers = self.post_local_bridge_json(
+                server,
+                "/accounts/acct-1/v1/chat/completions",
+                {
+                    "model": "gpt-5.5",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={"Accept": "text/event-stream"},
+            )
+
+        sent = client.calls[0]["kwargs"]
+        self.assertEqual(status, 200)
+        self.assertIn("text/event-stream", headers["Content-Type"])
+        self.assertEqual(sent["json"]["stream"], True)
+        self.assertIn("event: chat.completion.chunk", body)
+        self.assertIn('"content":"hi"', body)
+        self.assertIn("data: [DONE]", body)
+        self.assertNotIn("response.output_text.delta", body)
+
+    def test_anthropic_messages_request_maps_text_tools_and_thinking_to_responses(self) -> None:
+        payload = local_codex_bridge.anthropic_messages_to_responses(
+            {
+                "model": "gpt-5.5",
+                "system": "You are terse.",
+                "thinking": {"type": "enabled", "budget_tokens": 32000},
+                "tools": [
+                    {
+                        "name": "lookup",
+                        "description": "Find a record",
+                        "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}},
+                    }
+                ],
+                "tool_choice": {"type": "tool", "name": "lookup"},
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                    {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"id": "42"}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "found"}]},
+                ],
+            }
+        )
+
+        self.assertEqual(payload["model"], "gpt-5.5")
+        self.assertEqual(payload["instructions"], "You are terse.")
+        self.assertEqual(payload["reasoning"]["effort"], "high")
+        self.assertEqual(payload["tools"][0]["name"], "lookup")
+        self.assertEqual(payload["tool_choice"], {"type": "function", "name": "lookup"})
+        self.assertEqual(payload["input"][0]["content"][0]["type"], "input_text")
+        self.assertEqual(payload["input"][1]["type"], "function_call")
+        self.assertEqual(payload["input"][1]["call_id"], "toolu_1")
+        self.assertEqual(payload["input"][2]["type"], "function_call_output")
+        self.assertEqual(payload["input"][2]["output"], "found")
+
+    def test_responses_json_converts_to_anthropic_message(self) -> None:
+        payload = local_codex_bridge.responses_json_to_anthropic_message(
+            {
+                "id": "resp_1",
+                "status": "completed",
+                "model": "gpt-5.5",
+                "usage": {"input_tokens": 7, "output_tokens": 3},
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "hello"}],
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": '{"id":"42"}',
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(payload["type"], "message")
+        self.assertEqual(payload["role"], "assistant")
+        self.assertEqual(payload["model"], "gpt-5.5")
+        self.assertEqual(payload["content"][0], {"type": "text", "text": "hello"})
+        self.assertEqual(payload["content"][1]["type"], "tool_use")
+        self.assertEqual(payload["content"][1]["input"], {"id": "42"})
+        self.assertEqual(payload["usage"], {"input_tokens": 7, "output_tokens": 3})
+
+    def test_chat_completions_request_maps_messages_tools_and_reasoning(self) -> None:
+        payload = local_codex_bridge.chat_completions_to_responses(
+            {
+                "model": "gpt-5.5",
+                "reasoning_effort": "xhigh",
+                "max_completion_tokens": 123,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "description": "Find",
+                            "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+                        },
+                    }
+                ],
+                "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+                "messages": [
+                    {"role": "system", "content": "You are terse."},
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": '{"id":"42"}'},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "found"},
+                ],
+            }
+        )
+
+        self.assertEqual(payload["model"], "gpt-5.5")
+        self.assertEqual(payload["instructions"], "You are terse.")
+        self.assertEqual(payload["reasoning"], {"effort": "xhigh"})
+        self.assertEqual(payload["max_output_tokens"], 123)
+        self.assertEqual(payload["tools"][0]["name"], "lookup")
+        self.assertEqual(payload["tool_choice"], {"type": "function", "name": "lookup"})
+        self.assertEqual(payload["input"][0]["role"], "user")
+        self.assertEqual(payload["input"][1]["type"], "function_call")
+        self.assertEqual(payload["input"][2]["type"], "function_call_output")
+
+    def test_responses_json_converts_to_chat_completion(self) -> None:
+        payload = local_codex_bridge.responses_json_to_chat_completion(
+            {
+                "id": "resp_1",
+                "status": "completed",
+                "model": "gpt-5.5",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": "hello"}]},
+                    {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": '{"id":"42"}'},
+                ],
+            }
+        )
+
+        self.assertEqual(payload["object"], "chat.completion")
+        self.assertEqual(payload["model"], "gpt-5.5")
+        self.assertEqual(payload["choices"][0]["message"]["content"], "hello")
+        self.assertEqual(payload["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(payload["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "lookup")
+        self.assertEqual(payload["usage"], {"input_tokens": 3, "output_tokens": 2})
+
+    def test_chat_stream_converts_response_text_delta_and_done(self) -> None:
+        chunks = [
+            (
+                b"event: response.output_text.delta\n"
+                b'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+            ),
+            (
+                b"event: response.completed\n"
+                b'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}\n\n'
+            ),
+        ]
+
+        body = b"".join(
+            local_codex_bridge.iter_chat_completions_sse(
+                iter(chunks),
+                completion_id="chatcmpl_1",
+                model="gpt-5.5",
+            )
+        ).decode("utf-8")
+
+        self.assertIn("event: chat.completion.chunk", body)
+        self.assertIn('"content":"hi"', body)
+        self.assertIn('"finish_reason":"stop"', body)
+        self.assertIn("data: [DONE]", body)
+        self.assertNotIn("response.output_text.delta", body)
+
+    def test_anthropic_stream_uses_comments_for_reasoning_keepalive(self) -> None:
+        chunks = [
+            (
+                b"event: response.output_item.added\n"
+                b'data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"},"output_index":0}\n\n'
+            ),
+            b": bridge reasoning active source=heartbeat effort=high\n\n",
+            (
+                b"event: response.output_text.delta\n"
+                b'data: {"type":"response.output_text.delta","delta":"done"}\n\n'
+            ),
+            (
+                b"event: response.completed\n"
+                b'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"output_tokens":1}}}\n\n'
+            ),
+        ]
+
+        body = b"".join(
+            local_codex_bridge.iter_anthropic_messages_sse(
+                iter(chunks),
+                message_id="msg_1",
+                model="gpt-5.5",
+            )
+        ).decode("utf-8")
+
+        self.assertIn("event: message_start", body)
+        self.assertIn(": bridge reasoning active", body)
+        self.assertIn("event: content_block_delta", body)
+        self.assertIn('"text":"done"', body)
+        self.assertIn("event: message_stop", body)
+        self.assertNotIn("response.output_text.delta", body)
+        self.assertNotIn("思考等级", body)
+
+    def test_bridge_listen_host_rejects_non_loopback_by_default(self) -> None:
+        self.assertEqual(local_codex_bridge.resolve_listen_host("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(local_codex_bridge.resolve_listen_host("localhost"), "localhost")
+        with self.assertRaises(RuntimeError):
+            local_codex_bridge.resolve_listen_host("0.0.0.0")
+        self.assertEqual(
+            local_codex_bridge.resolve_listen_host("0.0.0.0", allow_remote=True),
+            "0.0.0.0",
+        )
+
+    def test_auth_store_session_affinity_orders_candidates_without_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "auth.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "accounts": {
+                            "acct-1": {"refresh_token": "refresh-1"},
+                            "acct-2": {"refresh_token": "refresh-2"},
+                        },
+                        "default_account_id": "acct-1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = local_codex_bridge.AuthStore(path)
+
+            self.assertEqual(store.account_candidates(None, "session:a"), ["acct-1", "acct-2"])
+            store.bind_session("session:a", "acct-2")
+            self.assertEqual(store.account_candidates(None, "session:a"), ["acct-2", "acct-1"])
+            self.assertEqual(store.account_candidates("acct-1", "session:a"), ["acct-1"])
+
+    def test_forward_responses_fails_over_to_next_account_before_writing_error(self) -> None:
+        handler = self.make_handler()
+        auth_store = PoolAuthStore()
+        handler.server = types.SimpleNamespace(auth_store=auth_store)
+        handler.headers = {}
+        handler._send_upstream_headers = mock.Mock()
+        handler._write_bytes = mock.Mock(return_value=True)
+        responses = [
+            FakeForwardResponse(503, body=b'{"error":"busy"}'),
+            FakeForwardResponse(
+                200,
+                body=(
+                    b"event: response.output_text.delta\n"
+                    b'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+                ),
+            ),
+        ]
+
+        with mock.patch.object(
+            local_codex_bridge,
+            "build_upstream_http_client",
+            side_effect=lambda timeout: FakeForwardClient(responses),
+        ):
+            handler._forward_responses_body(
+                candidate_account_ids=["acct-1", "acct-2"],
+                session_key="session:a",
+                route_path="/v1/responses",
+                request_id="bridge-test",
+                request_type="responses",
+                original_body={"model": "gpt-5.5", "input": []},
+                normalized_body={"model": "gpt-5.5", "input": [], "stream": False},
+                is_stream=False,
+                requested_model="gpt-5.5",
+                requested_effort=None,
+                output_format="responses",
+            )
+
+        self.assertEqual(auth_store.token_requests, ["acct-1", "acct-2"])
+        self.assertEqual(auth_store.bound, ("session:a", "acct-2"))
+        self.assertEqual(handler._send_upstream_headers.call_count, 1)
+        written = b"".join(call.args[0] for call in handler._write_bytes.call_args_list)
+        self.assertIn(b"ok", written)
+        self.assertNotIn(b"busy", written)
+
+    def test_request_log_redacts_account_id_and_sensitive_query(self) -> None:
+        handler = self.make_handler()
+        handler.address_string = lambda: "127.0.0.1"  # type: ignore[method-assign]
+
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            handler.log_message(
+                '"GET /accounts/acct-secret/v1/models?api_key=sk-secret&safe=1 HTTP/1.1" 200 -'
+            )
+
+        log = stderr.getvalue()
+        self.assertIn("/accounts/<redacted>/v1/models?api_key=<redacted>&safe=1", log)
+        self.assertIn("HTTP/1.1", log)
+        self.assertNotIn("acct-secret", log)
+        self.assertNotIn("sk-secret", log)
 
     def test_quota_timeout_is_local_to_quota_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -930,6 +1472,17 @@ class ServerCase(unittest.TestCase):
         self.assertIn('id="autoSwitchEnabled"', html)
         self.assertIn("OpenAI 自动切换", html)
         self.assertIn("为新账号创建 Local Codex Bridge", html)
+        self.assertIn('id="apiAccessCard"', html)
+        self.assertIn('id="simpleApiAccount"', html)
+        self.assertIn("POST /v1/messages", html)
+        self.assertIn("POST /v1/chat/completions", html)
+        self.assertIn("GET /v1/models", html)
+        self.assertIn("sk-bridgedeck-local-placeholder", html)
+        self.assertIn("ANTHROPIC_BASE_URL", html)
+        self.assertIn("ANTHROPIC_MODEL=gpt-5.5", html)
+        self.assertIn("272k context / 128k max output", html)
+        self.assertIn("copy-api-base-url", html)
+        self.assertIn("copy-claude-env", html)
         self.assertIn('id="compactWindow"', html)
         self.assertIn('data-action="compact-preset-1m"', html)
         self.assertIn('data-action="save-compact-selected"', html)

@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,10 +31,27 @@ DEFAULT_PORT = 8765
 TOKEN_REFRESH_BUFFER_SECS = 60
 ACCOUNT_ROUTE_RE = re.compile(r"^/accounts/([^/]+)(/.*)?$")
 UPSTREAM_PROXY_ENV = "CODEX_BRIDGE_UPSTREAM_PROXY"
+ALLOW_REMOTE_ENV = "CODEX_BRIDGE_ALLOW_REMOTE"
+STREAM_MAX_RETRIES_ENV = "CODEX_BRIDGE_STREAM_MAX_RETRIES"
+SESSION_AFFINITY_ENV = "CODEX_BRIDGE_SESSION_AFFINITY"
 REASONING_PLACEHOLDER_HEARTBEAT_SECS = 8.0
 REASONING_PLACEHOLDER_MODE_ENV = "CODEX_BRIDGE_REASONING_PLACEHOLDER_MODE"
 STREAM_IDLE_LOG_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_LOG_SECS", "20"))
 STREAM_IDLE_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_FAIL_SECS", "300"))
+RETRYABLE_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+SENSITIVE_QUERY_KEYS = {
+    "access_token",
+    "api_key",
+    "auth",
+    "auth_token",
+    "authorization",
+    "client_secret",
+    "key",
+    "password",
+    "refresh_token",
+    "secret",
+    "token",
+}
 BRIDGE_STATE_PATH = Path(
     os.environ.get(
         "CODEX_BRIDGE_STATE_PATH",
@@ -82,12 +100,162 @@ class BridgeStreamMetrics:
     idle_timeout_seen: bool = False
 
 
+@dataclass(frozen=True)
+class BridgeModel:
+    id: str
+    display_name: str
+    context_length: int | None = None
+    max_completion_tokens: int | None = None
+    thinking_levels: tuple[str, ...] = ()
+
+
 class TerminalStreamError(Exception):
     pass
 
 
 class BridgeStreamIdleTimeout(Exception):
     pass
+
+
+class RetryableStreamBootstrapError(Exception):
+    pass
+
+
+BRIDGE_MODELS: tuple[BridgeModel, ...] = (
+    BridgeModel(
+        id="gpt-5.5",
+        display_name="GPT 5.5",
+        context_length=272000,
+        max_completion_tokens=128000,
+        thinking_levels=("low", "medium", "high", "xhigh"),
+    ),
+    BridgeModel(id="gpt-5.4", display_name="GPT 5.4", thinking_levels=("low", "medium", "high", "xhigh")),
+    BridgeModel(id="gpt-5.4-mini", display_name="GPT 5.4 Mini", thinking_levels=("low", "medium", "high", "xhigh")),
+    BridgeModel(id="gpt-5.3-codex", display_name="GPT 5.3 Codex"),
+    BridgeModel(id="gpt-5.3-codex-spark", display_name="GPT 5.3 Codex Spark"),
+)
+
+
+def parse_bool_env(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def stream_max_retries() -> int:
+    raw = os.environ.get(STREAM_MAX_RETRIES_ENV, "2")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 2
+
+
+def is_retryable_http_status(status_code: int) -> bool:
+    return status_code in RETRYABLE_HTTP_STATUSES
+
+
+def is_retryable_stream_exception(exc: BaseException) -> bool:
+    retryable_types = (
+        httpx.RemoteProtocolError,
+        httpx.ReadError,
+        httpx.ReadTimeout,
+        httpx.WriteError,
+    )
+    return isinstance(exc, retryable_types)
+
+
+def session_affinity_enabled() -> bool:
+    return parse_bool_env(os.environ.get(SESSION_AFFINITY_ENV, "1"))
+
+
+def is_loopback_host(host: str) -> bool:
+    value = host.strip().strip("[]").lower()
+    return value in {"localhost", "127.0.0.1", "::1"}
+
+
+def resolve_listen_host(host: str, *, allow_remote: bool = False) -> str:
+    value = (host or DEFAULT_HOST).strip()
+    if is_loopback_host(value):
+        return value
+    if allow_remote:
+        return value
+    raise RuntimeError(
+        f"Refusing non-loopback CODEX_BRIDGE_HOST={value!r}; set {ALLOW_REMOTE_ENV}=1 to allow remote access"
+    )
+
+
+def redact_sensitive_query(raw_query: str) -> str:
+    if not raw_query:
+        return raw_query
+    pairs = urllib.parse.parse_qsl(raw_query, keep_blank_values=True)
+    redacted: list[str] = []
+    for key, value in pairs:
+        if key.lower() in SENSITIVE_QUERY_KEYS:
+            redacted.append(f"{urllib.parse.quote_plus(key)}=<redacted>")
+        else:
+            redacted.append(
+                f"{urllib.parse.quote_plus(key)}={urllib.parse.quote_plus(value)}"
+            )
+    return "&".join(redacted)
+
+
+def redact_request_target(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme or parsed.netloc:
+        query = redact_sensitive_query(parsed.query)
+        redacted = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
+    else:
+        path, sep, query = value.partition("?")
+        redacted = path + (sep + redact_sensitive_query(query) if sep else "")
+    redacted = re.sub(r"/accounts/[^/?#\s]+", "/accounts/<redacted>", redacted)
+    redacted = re.sub(r"(?i)Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", redacted)
+    return redacted
+
+
+def redact_log_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    redacted = re.sub(r"/accounts/[^/?#\s]+", "/accounts/<redacted>", value)
+    key_pattern = "|".join(re.escape(key) for key in sorted(SENSITIVE_QUERY_KEYS, key=len, reverse=True))
+    redacted = re.sub(
+        rf"(?i)([?&](?:{key_pattern})=)[^&\s\"']+",
+        r"\1<redacted>",
+        redacted,
+    )
+    redacted = re.sub(r"(?i)Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", redacted)
+    return redacted
+
+
+def build_models_payload() -> dict[str, Any]:
+    data: list[dict[str, Any]] = []
+    for model in BRIDGE_MODELS:
+        item: dict[str, Any] = {
+            "id": model.id,
+            "object": "model",
+            "type": "model",
+            "created": 0,
+            "created_at": "2026-05-07T00:00:00Z",
+            "owned_by": "openai",
+            "display_name": model.display_name,
+            "capabilities": {
+                "responses": True,
+                "messages": True,
+                "streaming": True,
+                "tools": True,
+            },
+        }
+        if model.context_length is not None:
+            item["context_length"] = model.context_length
+        if model.max_completion_tokens is not None:
+            item["max_completion_tokens"] = model.max_completion_tokens
+        if model.thinking_levels:
+            item["thinking"] = {"levels": list(model.thinking_levels)}
+        data.append(item)
+    return {
+        "object": "list",
+        "data": data,
+        "has_more": False,
+        "first_id": data[0]["id"] if data else None,
+        "last_id": data[-1]["id"] if data else None,
+    }
 
 
 def mask_proxy_url(proxy_url: str | None) -> str:
@@ -167,9 +335,25 @@ def log_upstream_result(
     if status_code is not None:
         summary += f" status={status_code}"
     if detail:
-        safe_detail = truncate_log_text(detail)
+        safe_detail = truncate_log_text(redact_log_text(detail))
         summary += f" detail={safe_detail}"
     print(f"{log_timestamp()} {summary}", file=sys.stderr)
+
+
+def log_bridge_stream_retry(
+    *,
+    request_id: str,
+    account_id: str,
+    requested_model: str | None,
+    attempt: int,
+    max_attempts: int,
+    reason: str,
+) -> None:
+    print(
+        f"{log_timestamp()} [bridge-stream-retry] request_id={request_id} account_id={account_id} "
+        f"model={requested_model or 'unknown'} attempt={attempt}/{max_attempts} reason={truncate_log_text(reason)}",
+        file=sys.stderr,
+    )
 
 
 def summarize_request_shape(body: dict[str, Any]) -> dict[str, Any]:
@@ -317,7 +501,7 @@ def log_upstream_diagnostic(
         payload["request_shape"] = request_shape
     if normalized_shape:
         payload["normalized_shape"] = normalized_shape
-    safe_error_detail = truncate_log_text(error_detail, limit=800)
+    safe_error_detail = truncate_log_text(redact_log_text(error_detail), limit=800) if error_detail else None
     if safe_error_detail:
         payload["error_detail"] = safe_error_detail
     print(
@@ -458,6 +642,7 @@ class AuthStore:
         self.path = path
         self._lock = threading.Lock()
         self._token_cache: dict[str, CachedToken] = {}
+        self._session_affinity: dict[str, str] = {}
 
     def load(self) -> tuple[dict[str, AccountRecord], str | None]:
         raw = json.loads(self.path.read_text())
@@ -515,6 +700,33 @@ class AuthStore:
                 expires_at=time.time() + expires_in,
             )
             return account_id, access_token
+
+    def account_candidates(self, requested_account_id: str | None, session_key: str | None = None) -> list[str]:
+        with self._lock:
+            accounts, default_account_id = self.load()
+            if requested_account_id:
+                if requested_account_id not in accounts:
+                    raise RuntimeError(f"account not found: {requested_account_id}")
+                return [requested_account_id]
+
+            ordered: list[str] = []
+            bound = self._session_affinity.get(session_key or "") if session_key else None
+            if session_affinity_enabled() and bound in accounts:
+                ordered.append(bound)
+            if default_account_id in accounts and default_account_id not in ordered:
+                ordered.append(default_account_id)
+            for account_id in accounts:
+                if account_id not in ordered:
+                    ordered.append(account_id)
+            if not ordered:
+                raise RuntimeError("account not found: default")
+            return ordered
+
+    def bind_session(self, session_key: str | None, account_id: str) -> None:
+        if not session_key or not session_affinity_enabled():
+            return
+        with self._lock:
+            self._session_affinity[session_key] = account_id
 
     def _refresh_token(self, refresh_token: str) -> dict[str, Any]:
         try:
@@ -765,14 +977,671 @@ def normalize_codex_model_and_effort(model: str) -> tuple[str, str | None]:
     return model, None
 
 
+def _coerce_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _system_to_instructions(system: Any) -> str:
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        parts: list[str] = []
+        for item in system:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n\n".join(part for part in parts if part)
+    return ""
+
+
+def _anthropic_text_from_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return _coerce_text(content)
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, dict):
+            item_type = item.get("type")
+            if item_type == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif item_type == "tool_result":
+                tool_content = item.get("content")
+                if isinstance(tool_content, str):
+                    parts.append(tool_content)
+                elif isinstance(tool_content, list):
+                    parts.append(_anthropic_text_from_content(tool_content))
+                elif tool_content is not None:
+                    parts.append(_coerce_text(tool_content))
+        elif isinstance(item, str):
+            parts.append(item)
+    return "\n".join(part for part in parts if part)
+
+
+def _anthropic_tool_result_output(part: dict[str, Any]) -> str:
+    content = part.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return _anthropic_text_from_content(content)
+    return _coerce_text(content)
+
+
+def _json_arguments(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "{}"
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _response_message_content_part(role: str, text: str) -> dict[str, Any]:
+    return {"type": "output_text" if role == "assistant" else "input_text", "text": text}
+
+
+def _anthropic_content_to_response_items(role: str, content: Any) -> list[dict[str, Any]]:
+    if isinstance(content, str):
+        return [{"role": role, "content": [_response_message_content_part(role, content)]}]
+
+    if not isinstance(content, list):
+        text = _coerce_text(content)
+        return [{"role": role, "content": [_response_message_content_part(role, text)]}] if text else []
+
+    message_parts: list[dict[str, Any]] = []
+    extra_items: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            text = _coerce_text(part)
+            if text:
+                message_parts.append(_response_message_content_part(role, text))
+            continue
+
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                message_parts.append(_response_message_content_part(role, text))
+        elif part_type == "tool_result":
+            tool_use_id = part.get("tool_use_id")
+            if isinstance(tool_use_id, str) and tool_use_id:
+                extra_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": _anthropic_tool_result_output(part),
+                    }
+                )
+        elif part_type == "tool_use":
+            tool_id = part.get("id")
+            name = part.get("name")
+            if isinstance(name, str) and name:
+                extra_items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": tool_id if isinstance(tool_id, str) and tool_id else f"call_{uuid.uuid4().hex[:12]}",
+                        "name": name,
+                        "arguments": _json_arguments(part.get("input")),
+                    }
+                )
+        elif part_type == "image":
+            source = part.get("source")
+            if isinstance(source, dict) and source.get("type") == "base64":
+                media_type = source.get("media_type")
+                data = source.get("data")
+                if isinstance(media_type, str) and isinstance(data, str):
+                    message_parts.append(
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:{media_type};base64,{data}",
+                        }
+                    )
+
+    items: list[dict[str, Any]] = []
+    if message_parts:
+        items.append({"role": role, "content": message_parts})
+    items.extend(extra_items)
+    return items
+
+
+def anthropic_messages_to_responses(body: dict[str, Any]) -> dict[str, Any]:
+    model = body.get("model")
+    responses: dict[str, Any] = {
+        "model": model if isinstance(model, str) and model else "gpt-5.5",
+        "input": [],
+        "stream": bool(body.get("stream", False)),
+        "store": False,
+    }
+
+    instructions = _system_to_instructions(body.get("system"))
+    if instructions:
+        responses["instructions"] = instructions
+
+    for key in ("temperature", "top_p"):
+        if key in body:
+            responses[key] = body[key]
+    if "max_tokens" in body:
+        responses["max_output_tokens"] = body["max_tokens"]
+
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens")
+        if isinstance(budget, int):
+            if budget >= 100000:
+                effort = "xhigh"
+            elif budget >= 32000:
+                effort = "high"
+            elif budget >= 8000:
+                effort = "medium"
+            else:
+                effort = "low"
+            responses["reasoning"] = {"effort": effort}
+
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        response_tools: list[dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            name = tool.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            schema = tool.get("input_schema")
+            response_tools.append(
+                {
+                    "type": "function",
+                    "name": name,
+                    "description": tool.get("description") if isinstance(tool.get("description"), str) else "",
+                    "parameters": schema if isinstance(schema, dict) else {"type": "object", "properties": {}},
+                }
+            )
+        if response_tools:
+            responses["tools"] = response_tools
+
+    tool_choice = body.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        choice_type = tool_choice.get("type")
+        if choice_type == "tool" and isinstance(tool_choice.get("name"), str):
+            responses["tool_choice"] = {"type": "function", "name": tool_choice["name"]}
+        elif choice_type in {"auto", "any", "none"}:
+            responses["tool_choice"] = "auto" if choice_type == "any" else choice_type
+
+    input_items: list[dict[str, Any]] = []
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            role_name = role if role in {"user", "assistant", "system"} else "user"
+            if role_name == "system":
+                text = _anthropic_text_from_content(message.get("content"))
+                if text:
+                    responses["instructions"] = "\n\n".join(
+                        part for part in (responses.get("instructions", ""), text) if isinstance(part, str) and part
+                    )
+                continue
+            input_items.extend(_anthropic_content_to_response_items(role_name, message.get("content")))
+    responses["input"] = input_items
+    return responses
+
+
+def _decode_json_arguments(arguments: Any) -> dict[str, Any]:
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str) and arguments.strip():
+        try:
+            decoded = json.loads(arguments)
+            return decoded if isinstance(decoded, dict) else {"value": decoded}
+        except json.JSONDecodeError:
+            return {"value": arguments}
+    return {}
+
+
+def _usage_to_anthropic(usage: Any) -> dict[str, int]:
+    if not isinstance(usage, dict):
+        return {"input_tokens": 0, "output_tokens": 0}
+    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0))
+    output_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0))
+    return {
+        "input_tokens": input_tokens if isinstance(input_tokens, int) else 0,
+        "output_tokens": output_tokens if isinstance(output_tokens, int) else 0,
+    }
+
+
+def responses_json_to_anthropic_message(response: dict[str, Any], fallback_model: str | None = None) -> dict[str, Any]:
+    content: list[dict[str, Any]] = []
+    output = response.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "message":
+                for part in item.get("content", []):
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = part.get("type")
+                    if part_type in {"output_text", "text"} and isinstance(part.get("text"), str):
+                        content.append({"type": "text", "text": part["text"]})
+            elif item_type == "function_call":
+                name = item.get("name")
+                if isinstance(name, str) and name:
+                    content.append(
+                        {
+                            "type": "tool_use",
+                            "id": item.get("call_id") if isinstance(item.get("call_id"), str) else item.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                            "name": name,
+                            "input": _decode_json_arguments(item.get("arguments")),
+                        }
+                    )
+    if not content:
+        content.append({"type": "text", "text": ""})
+
+    status = response.get("status")
+    stop_reason = "end_turn"
+    if status == "incomplete":
+        stop_reason = "max_tokens"
+    elif status == "failed":
+        stop_reason = "error"
+
+    return {
+        "id": response.get("id") if isinstance(response.get("id"), str) else f"msg_{uuid.uuid4().hex[:12]}",
+        "type": "message",
+        "role": "assistant",
+        "model": response.get("model") if isinstance(response.get("model"), str) else fallback_model or "gpt-5.5",
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": _usage_to_anthropic(response.get("usage")),
+    }
+
+
+def _sse_event(event_name: str, payload: dict[str, Any]) -> bytes:
+    return (
+        f"event: {event_name}\n"
+        f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    ).encode("utf-8")
+
+
+def _extract_text_from_openai_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return _coerce_text(content)
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, dict):
+            part_type = part.get("type")
+            if part_type == "text" and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+            elif part_type == "input_text" and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        elif isinstance(part, str):
+            parts.append(part)
+    return "\n".join(part for part in parts if part)
+
+
+def _openai_content_to_response_parts(role: str, content: Any) -> list[dict[str, Any]]:
+    text_type = "output_text" if role == "assistant" else "input_text"
+    if isinstance(content, str):
+        return [{"type": text_type, "text": content}]
+    if not isinstance(content, list):
+        text = _coerce_text(content)
+        return [{"type": text_type, "text": text}] if text else []
+
+    parts: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            text = _coerce_text(part)
+            if text:
+                parts.append({"type": text_type, "text": text})
+            continue
+        part_type = part.get("type")
+        if part_type in {"text", "input_text", "output_text"} and isinstance(part.get("text"), str):
+            parts.append({"type": text_type, "text": part["text"]})
+        elif part_type == "image_url":
+            image_url = part.get("image_url")
+            url = image_url.get("url") if isinstance(image_url, dict) else None
+            if isinstance(url, str) and url:
+                parts.append({"type": "input_image", "image_url": url})
+    return parts
+
+
+def chat_completions_to_responses(body: dict[str, Any]) -> dict[str, Any]:
+    model = body.get("model")
+    responses: dict[str, Any] = {
+        "model": model if isinstance(model, str) and model else "gpt-5.5",
+        "input": [],
+        "stream": bool(body.get("stream", False)),
+        "store": False,
+    }
+
+    for key in ("temperature", "top_p"):
+        if key in body:
+            responses[key] = body[key]
+    if "max_completion_tokens" in body:
+        responses["max_output_tokens"] = body["max_completion_tokens"]
+    elif "max_tokens" in body:
+        responses["max_output_tokens"] = body["max_tokens"]
+
+    reasoning_effort = body.get("reasoning_effort")
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        responses["reasoning"] = {"effort": reasoning_effort}
+
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        response_tools: list[dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") != "function":
+                continue
+            function = tool.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            response_tools.append(
+                {
+                    "type": "function",
+                    "name": name,
+                    "description": function.get("description") if isinstance(function.get("description"), str) else "",
+                    "parameters": function.get("parameters") if isinstance(function.get("parameters"), dict) else {"type": "object", "properties": {}},
+                }
+            )
+        if response_tools:
+            responses["tools"] = response_tools
+
+    tool_choice = body.get("tool_choice")
+    if isinstance(tool_choice, str):
+        responses["tool_choice"] = tool_choice
+    elif isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        if tool_choice.get("type") == "function" and isinstance(function, dict) and isinstance(function.get("name"), str):
+            responses["tool_choice"] = {"type": "function", "name": function["name"]}
+
+    instructions: list[str] = []
+    input_items: list[dict[str, Any]] = []
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            if role in {"system", "developer"}:
+                text = _extract_text_from_openai_content(content)
+                if text:
+                    instructions.append(text)
+                continue
+            if role == "tool":
+                tool_call_id = message.get("tool_call_id")
+                if isinstance(tool_call_id, str) and tool_call_id:
+                    input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": tool_call_id,
+                            "output": _extract_text_from_openai_content(content),
+                        }
+                    )
+                continue
+            role_name = role if role in {"user", "assistant"} else "user"
+            content_parts = _openai_content_to_response_parts(role_name, content)
+            if content_parts:
+                input_items.append({"role": role_name, "content": content_parts})
+
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function")
+                    if not isinstance(function, dict):
+                        continue
+                    name = function.get("name")
+                    if isinstance(name, str) and name:
+                        input_items.append(
+                            {
+                                "type": "function_call",
+                                "call_id": tool_call.get("id") if isinstance(tool_call.get("id"), str) else f"call_{uuid.uuid4().hex[:12]}",
+                                "name": name,
+                                "arguments": _json_arguments(function.get("arguments")),
+                            }
+                        )
+    if instructions:
+        responses["instructions"] = "\n\n".join(instructions)
+    responses["input"] = input_items
+    return responses
+
+
+def responses_json_to_chat_completion(response: dict[str, Any], fallback_model: str | None = None) -> dict[str, Any]:
+    content_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    output = response.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message":
+                for part in item.get("content", []):
+                    if isinstance(part, dict) and part.get("type") in {"output_text", "text"} and isinstance(part.get("text"), str):
+                        content_parts.append(part["text"])
+            elif item.get("type") == "function_call":
+                name = item.get("name")
+                if isinstance(name, str) and name:
+                    tool_calls.append(
+                        {
+                            "id": item.get("call_id") if isinstance(item.get("call_id"), str) else item.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": item.get("arguments") if isinstance(item.get("arguments"), str) else _json_arguments(item.get("arguments")),
+                            },
+                        }
+                    )
+
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts)}
+    finish_reason = "stop"
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+        finish_reason = "tool_calls"
+    if response.get("status") == "incomplete":
+        finish_reason = "length"
+
+    return {
+        "id": response.get("id") if isinstance(response.get("id"), str) else f"chatcmpl_{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": response.get("model") if isinstance(response.get("model"), str) else fallback_model or "gpt-5.5",
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": response.get("usage") if isinstance(response.get("usage"), dict) else None,
+    }
+
+
+def iter_chat_completions_sse(chunks: Any, *, completion_id: str, model: str) -> Any:
+    for chunk in chunks:
+        if not chunk:
+            continue
+        text = chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else str(chunk)
+        if text.startswith(":"):
+            yield text.encode("utf-8")
+            continue
+        for event_name, payload in parse_sse_blocks(text.encode("utf-8")):
+            if not isinstance(payload, dict):
+                continue
+            if event_name == "response.output_text.delta":
+                delta = payload.get("delta")
+                if isinstance(delta, str) and delta:
+                    yield _sse_event(
+                        "chat.completion.chunk",
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                        },
+                    )
+            elif event_name == "response.completed":
+                yield _sse_event(
+                    "chat.completion.chunk",
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    },
+                )
+                yield b"data: [DONE]\n\n"
+            elif event_name in {"response.failed", "error"}:
+                error = payload.get("error")
+                response_obj = payload.get("response")
+                if not isinstance(error, dict) and isinstance(response_obj, dict):
+                    error = response_obj.get("error")
+                yield _sse_event(
+                    "error",
+                    {
+                        "error": error if isinstance(error, dict) else {"type": "api_error", "message": _coerce_text(error)},
+                    },
+                )
+
+
+def extract_session_key(headers: Any, body: dict[str, Any]) -> str | None:
+    for header_name in ("x-session-id", "x-client-request-id", "x-amp-thread-id", "anthropic-conversation-id"):
+        value = headers.get(header_name)
+        if isinstance(value, str) and value.strip():
+            return f"{header_name}:{value.strip()}"
+    user = body.get("user")
+    if isinstance(user, str) and user.strip():
+        return f"user:{user.strip()}"
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("user_id", "session_id", "conversation_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return f"{key}:{value.strip()}"
+    return None
+
+
+def _prepend_chunk(first_chunk: bytes, chunks: Any) -> Any:
+    yield first_chunk
+    for chunk in chunks:
+        yield chunk
+
+
+def iter_anthropic_messages_sse(chunks: Any, *, message_id: str, model: str) -> Any:
+    yield _sse_event(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        },
+    )
+
+    text_block_open = False
+    stopped = False
+    for chunk in chunks:
+        if not chunk:
+            continue
+        text = chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else str(chunk)
+        if text.startswith(":"):
+            yield text.encode("utf-8")
+            continue
+        for event_name, payload in parse_sse_blocks(text.encode("utf-8")):
+            if not isinstance(payload, dict):
+                continue
+            if event_name == "response.output_text.delta":
+                delta = payload.get("delta")
+                if not isinstance(delta, str) or not delta:
+                    continue
+                if not text_block_open:
+                    text_block_open = True
+                    yield _sse_event(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {"type": "text", "text": ""},
+                        },
+                    )
+                yield _sse_event(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": delta},
+                    },
+                )
+            elif event_name == "response.completed":
+                if text_block_open:
+                    text_block_open = False
+                    yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+                response_obj = payload.get("response")
+                usage = _usage_to_anthropic(response_obj.get("usage") if isinstance(response_obj, dict) else None)
+                yield _sse_event(
+                    "message_delta",
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "usage": {"output_tokens": usage["output_tokens"]},
+                    },
+                )
+                yield _sse_event("message_stop", {"type": "message_stop"})
+                stopped = True
+            elif event_name in {"response.failed", "error"}:
+                error = payload.get("error")
+                response_obj = payload.get("response")
+                if not isinstance(error, dict) and isinstance(response_obj, dict):
+                    error = response_obj.get("error")
+                yield _sse_event(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": error if isinstance(error, dict) else {"type": "api_error", "message": _coerce_text(error)},
+                    },
+                )
+                stopped = True
+    if not stopped:
+        if text_block_open:
+            yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+        yield _sse_event(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 0},
+            },
+        )
+        yield _sse_event("message_stop", {"type": "message_stop"})
+
+
 class CodexBridgeHandler(BaseHTTPRequestHandler):
     server_version = "CodexBridge/0.1"
     protocol_version = "HTTP/1.1"
 
     def _resolve_account_route(self) -> tuple[str | None, str]:
-        match = ACCOUNT_ROUTE_RE.match(self.path)
+        target_path = urllib.parse.urlsplit(self.path).path
+        match = ACCOUNT_ROUTE_RE.match(target_path)
         if not match:
-            return None, self.path
+            return None, target_path
         account_id = match.group(1)
         suffix = match.group(2) or "/"
         return account_id, suffix
@@ -786,6 +1655,9 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self._write_bytes(payload)
+            return
+        if route_path == "/v1/models":
+            self._write_json_payload(200, build_models_payload())
             return
         if route_path == "/quota":
             try:
@@ -867,141 +1739,371 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         route_account_id, route_path = self._resolve_account_route()
-        if route_path != "/v1/responses":
-            self.send_error(404, "Not Found")
+        if route_path == "/v1/responses":
+            self._handle_responses(route_account_id, route_path)
             return
+        if route_path == "/v1/messages":
+            self._handle_messages(route_account_id, route_path)
+            return
+        if route_path == "/v1/chat/completions":
+            self._handle_chat_completions(route_account_id, route_path)
+            return
+        self.send_error(404, "Not Found")
 
+    def _read_json_body(self) -> dict[str, Any]:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        decoded = json.loads(raw_body.decode("utf-8"))
+        if not isinstance(decoded, dict):
+            raise ValueError("request body must be a JSON object")
+        return decoded
+
+    def _write_json_payload(self, status: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self._write_bytes(body, flush=True)
+
+    def _build_upstream_headers(self, account_id: str, access_token: str) -> dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "ChatGPT-Account-Id": account_id,
+            "Content-Type": "application/json",
+            "Accept": self.headers.get("Accept", "application/json"),
+            "User-Agent": CODEX_USER_AGENT,
+            "Originator": "cc-switch-local-bridge",
+        }
+        if self.headers.get("anthropic-beta"):
+            headers["anthropic-beta"] = self.headers["anthropic-beta"]
+        return headers
+
+    def _account_candidates(self, requested_account_id: str | None, body: dict[str, Any]) -> tuple[list[str], str | None]:
+        session_key = extract_session_key(self.headers, body)
+        return self.server.auth_store.account_candidates(requested_account_id, session_key), session_key
+
+    def _handle_responses(self, route_account_id: str | None, route_path: str) -> None:
         request_id = bridge_request_id()
-        started_at = time.monotonic()
-        requested_model: str | None = None
-        account_id_for_log = route_account_id or "default"
         try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-            raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
-            request_body = json.loads(raw_body.decode("utf-8"))
+            request_body = self._read_json_body()
             requested_stream = bool(request_body.get("stream", False))
-
             requested_account_id = route_account_id or self.headers.get("chatgpt-account-id")
-            account_id, access_token = self.server.auth_store.get_access_token(requested_account_id)
-            account_id_for_log = account_id
+            candidate_account_ids, session_key = self._account_candidates(requested_account_id, request_body)
             normalized_body = normalize_request_body(request_body)
-            is_stream = requested_stream
             requested_model = (
                 normalized_body.get("model")
                 if isinstance(normalized_body.get("model"), str)
                 else None
             )
             requested_effort = extract_reasoning_effort(normalized_body)
-
-            upstream_headers = {
-                "Authorization": f"Bearer {access_token}",
-                "ChatGPT-Account-Id": account_id,
-                "Content-Type": "application/json",
-                "Accept": self.headers.get("Accept", "application/json"),
-                "User-Agent": CODEX_USER_AGENT,
-                "Originator": "cc-switch-local-bridge",
-            }
-
-            if self.headers.get("anthropic-beta"):
-                upstream_headers["anthropic-beta"] = self.headers["anthropic-beta"]
-
-            upstream_url = f"{UPSTREAM_BASE_URL}/responses"
-
-            with build_upstream_http_client(timeout=600.0) as client, client.stream(
-                "POST",
-                upstream_url,
-                headers=upstream_headers,
-                json=normalized_body,
-            ) as response:
-                error_body = None
-                if not response.is_success:
-                    error_body = response.read()
-                log_upstream_result(
-                    "responses",
-                    account_id,
-                    response.is_success,
-                    status_code=response.status_code,
-                    detail=None
-                    if response.is_success
-                    else error_body.decode("utf-8", "replace") if error_body is not None else None,
-                )
-                if not response.is_success:
-                    log_upstream_diagnostic(
-                        "responses",
-                        account_id,
-                        status_code=response.status_code,
-                        route_path=route_path,
-                        response_headers=response.headers,
-                        request_shape=summarize_request_shape(request_body),
-                        normalized_shape=summarize_request_shape(normalized_body),
-                        error_detail=error_body.decode("utf-8", "replace") if error_body is not None else None,
-                    )
-
-                if not response.is_success:
-                    body = error_body if error_body is not None else b""
-                    self._send_upstream_headers(
-                        response,
-                        is_stream=True,
-                        content_length=len(body),
-                    )
-                    self._write_bytes(body, flush=True)
-                    return
-
-                upstream_request_id = response.headers.get("x-request-id")
-
-                if not is_stream:
-                    body = response.read()
-                    body = build_non_stream_json_from_sse(
-                        body,
-                        requested_model,
-                    )
-                    self._send_upstream_headers(
-                        response,
-                        is_stream=False,
-                        content_length=len(body),
-                    )
-                    self._write_bytes(body, flush=True)
-                    return
-
-                self._send_upstream_headers(response, is_stream=True)
-                metrics = BridgeStreamMetrics()
-                try:
-                    for chunk in self._iter_stream_with_reasoning_placeholder(
-                        response,
-                        account_id,
-                        request_id=request_id,
-                        started_at=started_at,
-                        requested_effort=requested_effort,
-                        requested_model=requested_model,
-                        upstream_request_id=upstream_request_id,
-                        metrics=metrics,
-                    ):
-                        if chunk and not self._write_bytes(chunk, flush=True):
-                            metrics.client_disconnected = True
-                            print(
-                                f"{log_timestamp()} [bridge-client-disconnect] request_id={request_id} model={requested_model or 'unknown'} detail=write_failed",
-                                file=sys.stderr,
-                            )
-                            break
-                        if chunk:
-                            metrics.downstream_writes += 1
-                except OSError as exc:
-                    metrics.client_disconnected = True
-                    print(
-                        f"{log_timestamp()} [bridge-client-disconnect] request_id={request_id} type={type(exc).__name__} detail={truncate_log_text(str(exc))}",
-                        file=sys.stderr,
-                    )
-                    return
+            self._forward_responses_body(
+                candidate_account_ids=candidate_account_ids,
+                session_key=session_key,
+                route_path=route_path,
+                request_id=request_id,
+                request_type="responses",
+                original_body=request_body,
+                normalized_body=normalized_body,
+                is_stream=requested_stream,
+                requested_model=requested_model,
+                requested_effort=requested_effort,
+                output_format="responses",
+            )
         except httpx.HTTPStatusError as exc:
             self._write_json_error(exc.response.status_code, exc.response.text)
         except Exception as exc:  # noqa: BLE001
             log_upstream_result(
                 "responses",
-                account_id_for_log,
+                route_account_id or "default",
                 False,
-                detail=f"request_id={request_id} model={requested_model or ''} {type(exc).__name__}: {exc}",
+                detail=f"request_id={request_id} {type(exc).__name__}: {exc}",
             )
             self._write_json_error(500, f"{type(exc).__name__}: {exc}")
+
+    def _handle_messages(self, route_account_id: str | None, route_path: str) -> None:
+        request_id = bridge_request_id()
+        try:
+            request_body = self._read_json_body()
+            requested_account_id = route_account_id or self.headers.get("chatgpt-account-id")
+            candidate_account_ids, session_key = self._account_candidates(requested_account_id, request_body)
+            responses_body = anthropic_messages_to_responses(request_body)
+            normalized_body = normalize_request_body(responses_body)
+            is_stream = bool(request_body.get("stream", False))
+            requested_model = (
+                normalized_body.get("model")
+                if isinstance(normalized_body.get("model"), str)
+                else None
+            )
+            requested_effort = extract_reasoning_effort(normalized_body)
+            self._forward_responses_body(
+                candidate_account_ids=candidate_account_ids,
+                session_key=session_key,
+                route_path=route_path,
+                request_id=request_id,
+                request_type="messages",
+                original_body=request_body,
+                normalized_body=normalized_body,
+                is_stream=is_stream,
+                requested_model=requested_model,
+                requested_effort=requested_effort,
+                output_format="messages",
+            )
+        except httpx.HTTPStatusError as exc:
+            self._write_json_error(exc.response.status_code, exc.response.text)
+        except Exception as exc:  # noqa: BLE001
+            log_upstream_result(
+                "messages",
+                route_account_id or "default",
+                False,
+                detail=f"request_id={request_id} {type(exc).__name__}: {exc}",
+            )
+            self._write_json_error(500, f"{type(exc).__name__}: {exc}")
+
+    def _handle_chat_completions(self, route_account_id: str | None, route_path: str) -> None:
+        request_id = bridge_request_id()
+        try:
+            request_body = self._read_json_body()
+            requested_account_id = route_account_id or self.headers.get("chatgpt-account-id")
+            candidate_account_ids, session_key = self._account_candidates(requested_account_id, request_body)
+            responses_body = chat_completions_to_responses(request_body)
+            normalized_body = normalize_request_body(responses_body)
+            is_stream = bool(request_body.get("stream", False))
+            requested_model = (
+                normalized_body.get("model")
+                if isinstance(normalized_body.get("model"), str)
+                else None
+            )
+            requested_effort = extract_reasoning_effort(normalized_body)
+            self._forward_responses_body(
+                candidate_account_ids=candidate_account_ids,
+                session_key=session_key,
+                route_path=route_path,
+                request_id=request_id,
+                request_type="chat.completions",
+                original_body=request_body,
+                normalized_body=normalized_body,
+                is_stream=is_stream,
+                requested_model=requested_model,
+                requested_effort=requested_effort,
+                output_format="chat",
+            )
+        except httpx.HTTPStatusError as exc:
+            self._write_json_error(exc.response.status_code, exc.response.text)
+        except Exception as exc:  # noqa: BLE001
+            log_upstream_result(
+                "chat.completions",
+                route_account_id or "default",
+                False,
+                detail=f"request_id={request_id} {type(exc).__name__}: {exc}",
+            )
+            self._write_json_error(500, f"{type(exc).__name__}: {exc}")
+
+    def _forward_responses_body(
+        self,
+        *,
+        candidate_account_ids: list[str],
+        session_key: str | None,
+        route_path: str,
+        request_id: str,
+        request_type: str,
+        original_body: dict[str, Any],
+        normalized_body: dict[str, Any],
+        is_stream: bool,
+        requested_model: str | None,
+        requested_effort: str | None,
+        output_format: str,
+    ) -> None:
+        upstream_url = f"{UPSTREAM_BASE_URL}/responses"
+        max_attempts = stream_max_retries() + 1 if is_stream else 1
+        started_at = time.monotonic()
+
+        for account_index, candidate_account_id in enumerate(candidate_account_ids):
+            account_id, access_token = self.server.auth_store.get_access_token(candidate_account_id)
+            upstream_headers = self._build_upstream_headers(account_id, access_token)
+            has_next_account = account_index < len(candidate_account_ids) - 1
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    with build_upstream_http_client(timeout=600.0) as client, client.stream(
+                        "POST",
+                        upstream_url,
+                        headers=upstream_headers,
+                        json=normalized_body,
+                    ) as response:
+                        error_body = response.read() if not response.is_success else None
+                        log_upstream_result(
+                            request_type,
+                            account_id,
+                            response.is_success,
+                            status_code=response.status_code,
+                            detail=None
+                            if response.is_success
+                            else error_body.decode("utf-8", "replace") if error_body is not None else None,
+                        )
+                        if not response.is_success:
+                            log_upstream_diagnostic(
+                                request_type,
+                                account_id,
+                                status_code=response.status_code,
+                                route_path=route_path,
+                                response_headers=response.headers,
+                                request_shape=summarize_request_shape(original_body),
+                                normalized_shape=summarize_request_shape(normalized_body),
+                                error_detail=error_body.decode("utf-8", "replace") if error_body is not None else None,
+                            )
+                            if is_retryable_http_status(response.status_code):
+                                if is_stream and attempt < max_attempts:
+                                    log_bridge_stream_retry(
+                                        request_id=request_id,
+                                        account_id=account_id,
+                                        requested_model=requested_model,
+                                        attempt=attempt,
+                                        max_attempts=max_attempts,
+                                        reason=f"HTTP {response.status_code}",
+                                    )
+                                    continue
+                                if has_next_account:
+                                    print(
+                                        f"{log_timestamp()} [bridge-account-failover] request_id={request_id} from_account={account_id} reason=HTTP {response.status_code}",
+                                        file=sys.stderr,
+                                    )
+                                    break
+                            body = error_body if error_body is not None else b""
+                            self._send_upstream_headers(response, is_stream=is_stream, content_length=len(body))
+                            self._write_bytes(body, flush=True)
+                            return
+
+                        upstream_request_id = response.headers.get("x-request-id")
+
+                        if not is_stream:
+                            body = response.read()
+                            response_body = json.loads(
+                                build_non_stream_json_from_sse(body, requested_model).decode("utf-8")
+                            )
+                            if output_format == "messages":
+                                response_body = responses_json_to_anthropic_message(response_body, requested_model)
+                            elif output_format == "chat":
+                                response_body = responses_json_to_chat_completion(response_body, requested_model)
+                            payload = json.dumps(response_body, ensure_ascii=False).encode("utf-8")
+                            self.server.auth_store.bind_session(session_key, account_id)
+                            self._send_upstream_headers(response, is_stream=False, content_length=len(payload))
+                            self._write_bytes(payload, flush=True)
+                            return
+
+                        metrics = BridgeStreamMetrics()
+                        response_chunks = self._iter_stream_with_reasoning_placeholder(
+                            response,
+                            account_id,
+                            request_id=request_id,
+                            started_at=started_at,
+                            requested_effort=requested_effort,
+                            requested_model=requested_model,
+                            upstream_request_id=upstream_request_id,
+                            metrics=metrics,
+                        )
+                        chunks: Any = iter(())
+                        try:
+                            if output_format == "messages":
+                                first_response_chunk = next(response_chunks)
+                                chunks = iter_anthropic_messages_sse(
+                                    _prepend_chunk(first_response_chunk, response_chunks),
+                                    message_id=f"msg_{request_id}",
+                                    model=requested_model or "gpt-5.5",
+                                )
+                            elif output_format == "chat":
+                                first_response_chunk = next(response_chunks)
+                                chunks = iter_chat_completions_sse(
+                                    _prepend_chunk(first_response_chunk, response_chunks),
+                                    completion_id=f"chatcmpl_{request_id}",
+                                    model=requested_model or "gpt-5.5",
+                                )
+                            else:
+                                chunks = response_chunks
+                            first_chunk = next(chunks)
+                        except StopIteration:
+                            first_chunk = b""
+                        except RetryableStreamBootstrapError as exc:
+                            if attempt < max_attempts:
+                                log_bridge_stream_retry(
+                                    request_id=request_id,
+                                    account_id=account_id,
+                                    requested_model=requested_model,
+                                    attempt=attempt,
+                                    max_attempts=max_attempts,
+                                    reason=str(exc),
+                                )
+                                continue
+                            if has_next_account:
+                                print(
+                                    f"{log_timestamp()} [bridge-account-failover] request_id={request_id} from_account={account_id} reason={type(exc).__name__}",
+                                    file=sys.stderr,
+                                )
+                                break
+                            raise
+
+                        if output_format == "messages":
+                            self.send_response(response.status_code)
+                            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                            self.send_header("Cache-Control", "no-cache")
+                            self.send_header("Connection", "close")
+                            self.end_headers()
+                        elif output_format == "chat":
+                            self.send_response(response.status_code)
+                            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                            self.send_header("Cache-Control", "no-cache")
+                            self.send_header("Connection", "close")
+                            self.end_headers()
+                        else:
+                            self._send_upstream_headers(response, is_stream=True)
+
+                        self.server.auth_store.bind_session(session_key, account_id)
+                        try:
+                            if first_chunk:
+                                if not self._write_bytes(first_chunk, flush=True):
+                                    metrics.client_disconnected = True
+                                    print(
+                                        f"{log_timestamp()} [bridge-client-disconnect] request_id={request_id} model={requested_model or 'unknown'} detail=write_failed",
+                                        file=sys.stderr,
+                                    )
+                                    return
+                                metrics.downstream_writes += 1
+                            for chunk in chunks:
+                                if chunk and not self._write_bytes(chunk, flush=True):
+                                    metrics.client_disconnected = True
+                                    print(
+                                        f"{log_timestamp()} [bridge-client-disconnect] request_id={request_id} model={requested_model or 'unknown'} detail=write_failed",
+                                        file=sys.stderr,
+                                    )
+                                    break
+                                if chunk:
+                                    metrics.downstream_writes += 1
+                        except OSError as exc:
+                            metrics.client_disconnected = True
+                            print(
+                                f"{log_timestamp()} [bridge-client-disconnect] request_id={request_id} type={type(exc).__name__} detail={truncate_log_text(str(exc))}",
+                                file=sys.stderr,
+                            )
+                        return
+                except Exception as exc:
+                    if is_stream and is_retryable_stream_exception(exc):
+                        if attempt < max_attempts:
+                            log_bridge_stream_retry(
+                                request_id=request_id,
+                                account_id=account_id,
+                                requested_model=requested_model,
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                                reason=f"{type(exc).__name__}: {exc}",
+                            )
+                            continue
+                        if has_next_account:
+                            print(
+                                f"{log_timestamp()} [bridge-account-failover] request_id={request_id} from_account={account_id} reason={type(exc).__name__}",
+                                file=sys.stderr,
+                            )
+                            break
+                    raise
 
     def _iter_stream_with_reasoning_placeholder(
         self,
@@ -1114,6 +2216,8 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 if queued is done_marker:
                     break
                 if isinstance(queued, BaseException):
+                    if metrics.upstream_events == 0 and is_retryable_stream_exception(queued):
+                        raise RetryableStreamBootstrapError(f"{type(queued).__name__}: {queued}") from queued
                     if state.completed:
                         break
                     log_bridge_stream_error(
@@ -1357,7 +2461,8 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             yield placeholder
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        sys.stderr.write(f"{log_timestamp()} [codex-bridge] {self.address_string()} - {fmt % args}\n")
+        message = redact_log_text(fmt % args) or ""
+        sys.stderr.write(f"{log_timestamp()} [codex-bridge] {self.address_string()} - {message}\n")
 
     def _write_json_error(self, status: int, message: str) -> None:
         payload = json.dumps({"error": message}, ensure_ascii=False).encode("utf-8")
@@ -1397,6 +2502,11 @@ def main() -> int:
         proxy_url = get_upstream_proxy_url()
     except Exception as exc:  # noqa: BLE001
         print(f"{log_timestamp()} invalid upstream proxy config: {exc}", file=sys.stderr)
+        return 1
+    try:
+        host = resolve_listen_host(host, allow_remote=parse_bool_env(os.environ.get(ALLOW_REMOTE_ENV)))
+    except Exception as exc:  # noqa: BLE001
+        print(f"{log_timestamp()} invalid listen host: {exc}", file=sys.stderr)
         return 1
 
     auth_store = AuthStore(auth_store_path)
