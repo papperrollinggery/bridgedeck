@@ -140,8 +140,9 @@ Claude Desktop 第三方 gateway 形式：
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8876/accounts/<account_id>/v1
-ANTHROPIC_AUTH_TOKEN=sk-bridgedeck-local-placeholder
+ANTHROPIC_AUTH_TOKEN=local-bridge
 ANTHROPIC_MODEL=gpt-5.5
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
 ```
 
 Supported local routes:

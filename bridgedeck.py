@@ -58,6 +58,20 @@ COMPACT_THRESHOLD_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 MAX_CONTEXT_TOKENS_ENV = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
 DEFAULT_COMPACT_WINDOW_TOKENS = 220_000
 DEFAULT_COMPACT_THRESHOLD_PERCENT = 80
+DEFAULT_BRIDGE_PROVIDER_MODEL = "gpt-5.5"
+BRIDGE_MODEL_OPTIONS = (
+    {
+        "id": "gpt-5.5",
+        "name": "gpt-5.5",
+        "context_tokens": 272_000,
+        "max_output_tokens": 128_000,
+        "thinking_levels": ("low", "medium", "high", "xhigh"),
+    },
+    {"id": "gpt-5.4", "name": "gpt-5.4", "context_tokens": 220_000, "thinking_levels": ("low", "medium", "high", "xhigh")},
+    {"id": "gpt-5.4-mini", "name": "gpt-5.4 Mini", "context_tokens": 220_000, "thinking_levels": ("low", "medium", "high", "xhigh")},
+    {"id": "gpt-5.3-codex", "name": "gpt-5.3-codex", "context_tokens": 220_000},
+    {"id": "gpt-5.3-codex-spark", "name": "gpt-5.3-codex-spark", "context_tokens": 220_000},
+)
 MODEL_ENV_KEYS = (
     "ANTHROPIC_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -225,6 +239,49 @@ def normalize_provider_model_env(env: dict[str, Any]) -> None:
     for key in MODEL_ENV_KEYS:
         if isinstance(env.get(key), str):
             env[key] = normalize_openai_model_id(env[key])
+
+
+def bridge_model_option(model_id: str | None) -> dict[str, Any] | None:
+    normalized = normalize_openai_model_id(model_id)
+    for item in BRIDGE_MODEL_OPTIONS:
+        if item["id"] == normalized:
+            return item
+    return None
+
+
+def normalize_bridge_model_config(config: dict[str, Any] | None) -> dict[str, str]:
+    config = config if isinstance(config, dict) else {}
+    model = normalize_openai_model_id(config.get("model") or config.get("id") or DEFAULT_BRIDGE_PROVIDER_MODEL)
+    option = bridge_model_option(model)
+    if option is None and not re.match(r"(?i)^gpt-", model):
+        raise ValueError(f"不支持的模型: {model}")
+
+    context_raw = str(config.get("context_tokens") or config.get("context_length") or "").strip()
+    if not context_raw and option and option.get("context_tokens"):
+        context_raw = str(option["context_tokens"])
+    context_tokens = ""
+    if context_raw:
+        context_tokens = str(_parse_int_setting(context_raw, "模型上下文", min_value=10_000, max_value=2_000_000))
+
+    max_output_raw = str(config.get("max_output_tokens") or config.get("max_completion_tokens") or "").strip()
+    if not max_output_raw and option and option.get("max_output_tokens"):
+        max_output_raw = str(option["max_output_tokens"])
+    max_output_tokens = ""
+    if max_output_raw:
+        max_output_tokens = str(_parse_int_setting(max_output_raw, "最大输出", min_value=1_000, max_value=2_000_000))
+
+    return {"model": model, "context_tokens": context_tokens, "max_output_tokens": max_output_tokens}
+
+
+def apply_bridge_model_config_to_env(env: dict[str, Any], model_config: dict[str, Any] | None) -> dict[str, str]:
+    normalized = normalize_bridge_model_config(model_config)
+    env["ANTHROPIC_MODEL"] = normalized["model"]
+    if normalized["context_tokens"]:
+        env[MAX_CONTEXT_TOKENS_ENV] = normalized["context_tokens"]
+    else:
+        env.pop(MAX_CONTEXT_TOKENS_ENV, None)
+    normalize_provider_model_env(env)
+    return normalized
 
 
 def common_provider_env(env: dict[str, Any]) -> dict[str, Any]:
@@ -1949,6 +2006,7 @@ class BridgeManager:
         settings_config: dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
         compact_config: dict[str, Any] | None = None,
+        model_config: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         settings = copy.deepcopy(settings_config) if isinstance(settings_config, dict) else {}
         if not isinstance(settings, dict):
@@ -1958,7 +2016,10 @@ class BridgeManager:
             env = {}
         env["ANTHROPIC_BASE_URL"] = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}"
         env["ANTHROPIC_AUTH_TOKEN"] = "local-bridge"
-        env.setdefault("ANTHROPIC_MODEL", "gpt-5.4")
+        if model_config is not None:
+            apply_bridge_model_config_to_env(env, model_config)
+        else:
+            env.setdefault("ANTHROPIC_MODEL", DEFAULT_BRIDGE_PROVIDER_MODEL)
         env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "gpt-5.4-mini")
         env.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", "gpt-5.3-codex")
         env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "gpt-5.4")
@@ -2098,6 +2159,8 @@ class BridgeManager:
                         "api_format": meta.get("apiFormat") if isinstance(meta.get("apiFormat"), str) else "",
                         "account_id": account_id,
                         "base_url": env.get("ANTHROPIC_BASE_URL") if isinstance(env.get("ANTHROPIC_BASE_URL"), str) else "",
+                        "model": env.get("ANTHROPIC_MODEL") if isinstance(env.get("ANTHROPIC_MODEL"), str) else "",
+                        "max_context_tokens": env.get(MAX_CONTEXT_TOKENS_ENV) if isinstance(env.get(MAX_CONTEXT_TOKENS_ENV), str) else "",
                         "auth_token": auth_token if include_secrets else "",
                         "auth_token_masked": mask_token(auth_token),
                         "compact_enabled": bool(str(env.get(COMPACT_WINDOW_ENV) or "").strip()),
@@ -2152,6 +2215,7 @@ class BridgeManager:
         provider_name: str,
         set_current: bool,
         compact_config: dict[str, Any] | None = None,
+        model_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not account_id.strip():
             raise ValueError("account_id 不能为空")
@@ -2190,6 +2254,7 @@ class BridgeManager:
                     settings_config=current_settings,
                     meta=current_meta,
                     compact_config=compact_config,
+                    model_config=model_config,
                 )
                 settings_text = json.dumps(new_settings, ensure_ascii=False)
                 meta_text = json.dumps(new_meta, ensure_ascii=False)
@@ -2314,7 +2379,12 @@ class BridgeManager:
                 "backups": [db_bak],
             }
 
-    def update_provider_compact(self, provider_id: str, compact_config: dict[str, Any] | None) -> dict[str, Any]:
+    def update_provider_compact(
+        self,
+        provider_id: str,
+        compact_config: dict[str, Any] | None,
+        model_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not provider_id.strip():
             raise ValueError("provider_id 不能为空")
 
@@ -2338,6 +2408,7 @@ class BridgeManager:
                 base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
                 if not base_url.startswith(f"{LOCAL_BRIDGE_BASE_URL}/accounts/"):
                     raise ValueError("仅支持 Local Codex Bridge provider")
+                normalized_model = apply_bridge_model_config_to_env(env, model_config) if model_config is not None else None
                 normalized = apply_compact_config_to_env(env, compact_config)
                 settings["env"] = env
                 conn.execute(
@@ -2351,6 +2422,7 @@ class BridgeManager:
                 "message": "上下文配置已保存",
                 "provider_id": provider_id,
                 "compact_config": normalized,
+                "model_config": normalized_model,
                 "backups": [db_bak],
             }
 
@@ -3524,6 +3596,10 @@ INDEX_HTML = """<!doctype html>
             <select id="account"></select>
             <label>显示名称</label>
             <input id="providerName" placeholder="Local Codex Bridge - xxx" />
+            <label>模型</label>
+            <select id="bridgeModel"></select>
+            <label>上下文 tokens</label>
+            <input id="modelContextTokens" type="number" min="10000" max="2000000" step="1000" value="272000" readonly />
             <label><input type="checkbox" id="setCurrent" checked /> 设为当前</label>
             <button class="primary" data-action="create-provider">创建/更新 Claude 桥接</button>
           </div>
@@ -3532,16 +3608,17 @@ INDEX_HTML = """<!doctype html>
             <div class="row">
               <label><input type="checkbox" id="compactEnabled" checked /> 启用</label>
               <label>窗口 tokens</label>
-              <input id="compactWindow" type="number" min="10000" max="2000000" step="1000" value="220000" />
+              <input id="compactWindow" type="number" min="10000" max="2000000" step="1000" value="272000" />
               <label>阈值 %</label>
               <input id="compactPct" type="number" min="1" max="100" step="1" value="80" />
+              <button class="miniBtn" data-action="compact-preset-model">模型上下文</button>
               <button class="miniBtn" data-action="compact-preset-220k">220k</button>
               <button class="miniBtn" data-action="compact-preset-1m">1m</button>
               <button class="miniBtn" data-action="compact-off">关闭</button>
-              <button class="miniBtn" data-action="save-compact-selected">保存到选中 provider</button>
+              <button class="miniBtn" data-action="save-compact-selected">保存模型/上下文到选中 provider</button>
               <button class="miniBtn" data-action="sync-common-env-selected">同步通用 env 到全部</button>
             </div>
-            <div class="muted">220000 适合实际窗口偏小的 GPT；1000000 适合 1m 模型。</div>
+            <div class="muted" id="bridgeModelMeta">gpt-5.5 = 272000 context tokens / 128000 max output。</div>
           </div>
           <div class="muted">工具会自动写入本地 bridge 配置，不需要手动编辑 URL/token。</div>
           </div>
@@ -3601,6 +3678,7 @@ INDEX_HTML = """<!doctype html>
                   <th class="smallCol">当前</th>
                   <th class="accountCol">account</th>
                   <th class="urlCol">base_url</th>
+                  <th class="smallCol">model</th>
                   <th class="smallCol">compact</th>
                   <th class="tokenCol">token</th>
                 </tr>
@@ -3668,7 +3746,10 @@ INDEX_HTML = """<!doctype html>
     let lastData = null;
     let tokenVisible = false;
     let lastAccounts = [];
-    const DEFAULT_COMPACT_WINDOW = '220000';
+    const BRIDGE_MODELS = __BRIDGE_MODELS_JSON__;
+    const DEFAULT_BRIDGE_MODEL = 'gpt-5.5';
+    const DEFAULT_COMPACT_WINDOW = '272000';
+    const CONSERVATIVE_COMPACT_WINDOW = '220000';
     const DEFAULT_COMPACT_PCT = '80';
     const LOCAL_BRIDGE_BASE_URL = "__LOCAL_BRIDGE_BASE_URL__";
     const LOCAL_API_KEY_PLACEHOLDER = 'sk-bridgedeck-local-placeholder';
@@ -4167,7 +4248,7 @@ INDEX_HTML = """<!doctype html>
     }
     function anthropicAccessEnv(item) {
       const baseUrl = anthropicAccessBaseUrl(item);
-      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_MODEL=gpt-5.5` : '';
+      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_MODEL=gpt-5.5\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` : '';
     }
     function apiOpenAiEnv(item) {
       const baseUrl = apiAccessBaseUrl(item);
@@ -4245,6 +4326,60 @@ INDEX_HTML = """<!doctype html>
     function copyClaudeEnv() {
       return copyAnthropicEnv();
     }
+    function bridgeModelOption(modelId) {
+      const normalized = String(modelId || '').trim().toLowerCase();
+      return BRIDGE_MODELS.find((item) => item.id === normalized) || BRIDGE_MODELS[0] || null;
+    }
+    function bridgeModelContext(modelId) {
+      const option = bridgeModelOption(modelId);
+      return option && option.context_tokens ? String(option.context_tokens) : '';
+    }
+    function bridgeModelMaxOutput(modelId) {
+      const option = bridgeModelOption(modelId);
+      return option && option.max_output_tokens ? String(option.max_output_tokens) : '';
+    }
+    function selectedBridgeModel() {
+      const sel = document.getElementById('bridgeModel');
+      return sel && sel.value ? sel.value : DEFAULT_BRIDGE_MODEL;
+    }
+    function updateBridgeModelMeta() {
+      const model = selectedBridgeModel();
+      const context = bridgeModelContext(model);
+      const maxOutput = bridgeModelMaxOutput(model);
+      document.getElementById('modelContextTokens').value = context || '';
+      const outputText = maxOutput ? ` / ${maxOutput} max output` : '';
+      document.getElementById('bridgeModelMeta').textContent = `${model}${context ? ' = ' + context + ' context tokens' : ''}${outputText}。220k 是保守压缩窗口，1m 只给 1m 模型。`;
+    }
+    function renderBridgeModels() {
+      const sel = document.getElementById('bridgeModel');
+      if (!sel) return;
+      sel.innerHTML = '';
+      BRIDGE_MODELS.forEach((item) => {
+        const opt = document.createElement('option');
+        opt.value = item.id;
+        const context = item.context_tokens ? ` · ${item.context_tokens}` : '';
+        opt.textContent = `${item.name || item.id}${context}`;
+        sel.appendChild(opt);
+      });
+      sel.value = DEFAULT_BRIDGE_MODEL;
+      sel.onchange = () => applyModelContextPreset();
+      updateBridgeModelMeta();
+    }
+    function setBridgeModel(modelId, applyContext = false) {
+      const sel = document.getElementById('bridgeModel');
+      const option = bridgeModelOption(modelId || DEFAULT_BRIDGE_MODEL);
+      if (sel && option) sel.value = option.id;
+      updateBridgeModelMeta();
+      if (applyContext) applyModelContextPreset();
+    }
+    function bridgeModelConfigPayload() {
+      const model = selectedBridgeModel();
+      return {
+        model,
+        context_tokens: bridgeModelContext(model),
+        max_output_tokens: bridgeModelMaxOutput(model)
+      };
+    }
     function setCompactFields(enabled, windowTokens, pct) {
       document.getElementById('compactEnabled').checked = Boolean(enabled);
       document.getElementById('compactWindow').value = windowTokens || '';
@@ -4260,6 +4395,11 @@ INDEX_HTML = """<!doctype html>
     function applyCompactPreset(windowTokens, pct = DEFAULT_COMPACT_PCT) {
       setCompactFields(Boolean(windowTokens), windowTokens, pct);
     }
+    function applyModelContextPreset() {
+      const context = bridgeModelContext(selectedBridgeModel());
+      updateBridgeModelMeta();
+      if (context) setCompactFields(true, context, DEFAULT_COMPACT_PCT);
+    }
     function providerCompactText(provider) {
       if (!provider || !provider.compact_enabled) return '关闭';
       const pct = provider.compact_threshold_percent || DEFAULT_COMPACT_PCT;
@@ -4267,6 +4407,7 @@ INDEX_HTML = """<!doctype html>
     }
     function applyCompactFromProvider(provider) {
       if (!provider) return;
+      setBridgeModel(provider.model || DEFAULT_BRIDGE_MODEL, false);
       if (provider.compact_enabled) {
         setCompactFields(true, provider.compact_window_tokens || DEFAULT_COMPACT_WINDOW, provider.compact_threshold_percent || DEFAULT_COMPACT_PCT);
       } else {
@@ -4428,6 +4569,7 @@ INDEX_HTML = """<!doctype html>
           <td>${p.is_current ? '<span class="ok">当前</span>' : '<span class="muted">未选</span>'} ${currentBySettings ? '<span class="ok">设置同步</span>' : ''}</td>
           <td class="mono">${esc(maskId(p.account_id || ''))}</td>
           <td class="mono">${esc(p.base_url || '')}</td>
+          <td class="mono">${esc(p.model || '')}${p.max_context_tokens ? '<br>' + esc(p.max_context_tokens) : ''}</td>
           <td class="mono">${esc(providerCompactText(p))}</td>
           <td class="mono">${esc(tokenText(p))}</td>
         `;
@@ -4634,6 +4776,7 @@ INDEX_HTML = """<!doctype html>
         account_id: accountId,
         provider_name: providerName,
         set_current: setCurrent,
+        model_config: bridgeModelConfigPayload(),
         compact_config: compactConfigPayload()
       });
       log(`${res.message}: ${res.provider_name} (${res.provider_id})`);
@@ -4711,7 +4854,7 @@ INDEX_HTML = """<!doctype html>
     async function saveCompactSelected() {
       const id = selectedProviderId();
       if (!id) return log('请先选中一个 provider');
-      const res = await api('/api/provider-compact', 'POST', { provider_id: id, compact_config: compactConfigPayload() });
+      const res = await api('/api/provider-compact', 'POST', { provider_id: id, model_config: bridgeModelConfigPayload(), compact_config: compactConfigPayload() });
       log(`${res.message}: ${providerCompactText({ compact_enabled: res.compact_config.enabled, compact_window_tokens: res.compact_config.window_tokens, compact_threshold_percent: res.compact_config.threshold_percent })}`);
       await refreshData();
     }
@@ -4786,7 +4929,8 @@ INDEX_HTML = """<!doctype html>
           if (action === 'set-current-selected') return setCurrentFromSelected();
           if (action === 'patch-selected') return patchSelected();
           if (action === 'repair-plus-pro') return repairPlusPro();
-          if (action === 'compact-preset-220k') return applyCompactPreset(DEFAULT_COMPACT_WINDOW);
+          if (action === 'compact-preset-model') return applyModelContextPreset();
+          if (action === 'compact-preset-220k') return applyCompactPreset(CONSERVATIVE_COMPACT_WINDOW);
           if (action === 'compact-preset-1m') return applyCompactPreset('1000000');
           if (action === 'compact-off') return applyCompactPreset('');
           if (action === 'save-compact-selected') return saveCompactSelected();
@@ -4832,6 +4976,7 @@ INDEX_HTML = """<!doctype html>
       });
     }
     bindActions();
+    renderBridgeModels();
     initGuideObserver();
     refreshData().catch((e) => log(`初始化失败: ${e.message}`));
     setInterval(() => {
@@ -4885,6 +5030,7 @@ def build_handler(
                     INDEX_HTML.replace("__CSRF_TOKEN__", csrf_token)
                     .replace("__CSP_NONCE__", csp_nonce)
                     .replace("__LOCAL_BRIDGE_BASE_URL__", LOCAL_BRIDGE_BASE_URL)
+                    .replace("__BRIDGE_MODELS_JSON__", json.dumps(BRIDGE_MODEL_OPTIONS, ensure_ascii=False))
                     .encode("utf-8")
                 )
                 self.send_response(200)
@@ -5021,7 +5167,14 @@ def build_handler(
                     provider_name = str(payload.get("provider_name") or "")
                     set_current = bool(payload.get("set_current", True))
                     compact_config = payload.get("compact_config") if isinstance(payload.get("compact_config"), dict) else None
-                    result = manager.create_or_update_provider(account_id, provider_name, set_current, compact_config=compact_config)
+                    model_config = payload.get("model_config") if isinstance(payload.get("model_config"), dict) else None
+                    result = manager.create_or_update_provider(
+                        account_id,
+                        provider_name,
+                        set_current,
+                        compact_config=compact_config,
+                        model_config=model_config,
+                    )
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/patch-provider":
@@ -5032,7 +5185,8 @@ def build_handler(
                 if self.path == "/api/provider-compact":
                     provider_id = str(payload.get("provider_id") or "")
                     compact_config = payload.get("compact_config") if isinstance(payload.get("compact_config"), dict) else {}
-                    result = manager.update_provider_compact(provider_id, compact_config)
+                    model_config = payload.get("model_config") if isinstance(payload.get("model_config"), dict) else None
+                    result = manager.update_provider_compact(provider_id, compact_config, model_config=model_config)
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/sync-common-env":

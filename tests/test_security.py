@@ -96,6 +96,8 @@ class FakeManager:
                     "name": "Provider",
                     "account_id": "01234567-89ab-cdef-0123-456789abcdef",
                     "base_url": "http://127.0.0.1:8876/accounts/01234567-89ab-cdef-0123-456789abcdef",
+                    "model": "gpt-5.5",
+                    "max_context_tokens": "272000",
                     "auth_token": "full-token" if include_secrets else "",
                     "auth_token_masked": "full...oken",
                     "compact_enabled": True,
@@ -156,18 +158,25 @@ class FakeManager:
         provider_name: str,
         set_current: bool,
         compact_config: dict[str, Any] | None = None,
+        model_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {"ok": True}
 
     def patch_provider(self, provider_id: str) -> dict[str, Any]:
         return {"ok": True}
 
-    def update_provider_compact(self, provider_id: str, compact_config: dict[str, Any] | None) -> dict[str, Any]:
+    def update_provider_compact(
+        self,
+        provider_id: str,
+        compact_config: dict[str, Any] | None,
+        model_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         return {
             "ok": True,
             "message": "上下文配置已保存",
             "provider_id": provider_id,
             "compact_config": bridgedeck.normalize_compact_config(compact_config),
+            "model_config": bridgedeck.normalize_bridge_model_config(model_config),
         }
 
     def sync_common_env_to_bridge_providers(self, provider_id: str) -> dict[str, Any]:
@@ -1531,9 +1540,13 @@ class ServerCase(unittest.TestCase):
         self.assertIn("sk-bridgedeck-local-placeholder", html)
         self.assertIn("ANTHROPIC_BASE_URL", html)
         self.assertIn("ANTHROPIC_MODEL=gpt-5.5", html)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000", html)
         self.assertIn("272k context / 128k max output", html)
         self.assertIn("copy-api-base-url", html)
         self.assertIn("copy-claude-env", html)
+        self.assertIn('id="bridgeModel"', html)
+        self.assertIn('id="modelContextTokens"', html)
+        self.assertIn('data-action="compact-preset-model"', html)
         self.assertIn('id="compactWindow"', html)
         self.assertIn('data-action="compact-preset-1m"', html)
         self.assertIn('data-action="save-compact-selected"', html)
@@ -1691,6 +1704,7 @@ class ServerCase(unittest.TestCase):
             method="POST",
             body={
                 "provider_id": "provider-1",
+                "model_config": {"model": "gpt-5.5"},
                 "compact_config": {"enabled": True, "window_tokens": "1000000", "threshold_percent": "80"},
             },
             headers={"X-CCSBT-Token": "test-token"},
@@ -1698,6 +1712,8 @@ class ServerCase(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(payload["compact_config"]["window_tokens"], "1000000")
+        self.assertEqual(payload["model_config"]["model"], "gpt-5.5")
+        self.assertEqual(payload["model_config"]["context_tokens"], "272000")
 
     def test_sync_common_env_endpoint_uses_selected_provider(self) -> None:
         server, _ = self.start_server()
@@ -2193,6 +2209,20 @@ class LauncherCase(unittest.TestCase):
 
             self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", settings["env"])
             self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", settings["env"])
+
+    def test_provider_payload_applies_selected_bridge_model_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+
+            settings, _ = manager._build_provider_payload(
+                "acct-1",
+                settings_config={"env": {}},
+                model_config={"model": "GPT-5.5"},
+            )
+
+            env = settings["env"]
+            self.assertEqual(env["ANTHROPIC_MODEL"], "gpt-5.5")
+            self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "272000")
 
     def test_provider_payload_normalizes_gpt_model_env_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
