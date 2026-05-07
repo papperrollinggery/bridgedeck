@@ -123,6 +123,40 @@ or use the generated launcher:
 ~/.cc-switch/codex-cli-launchers/codex-<name>.command
 ```
 
+### Generic API Access / 通用 API 接入
+
+BridgeDeck exposes account-scoped OpenAI-compatible and Anthropic-compatible routes on the local bridge. The UI shows copy-safe examples with a placeholder key only.
+
+BridgeDeck 在本地 bridge 上提供账号级 OpenAI 兼容和 Anthropic 兼容路由。UI 只展示 placeholder key，不展示真实 OAuth token。
+
+```bash
+OPENAI_API_KEY=sk-bridgedeck-local-placeholder
+OPENAI_BASE_URL=http://127.0.0.1:8876/accounts/<account_id>/v1
+```
+
+Claude Desktop 3P gateway style:
+
+Claude Desktop 第三方 gateway 形式：
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8876/accounts/<account_id>/v1
+ANTHROPIC_AUTH_TOKEN=sk-bridgedeck-local-placeholder
+ANTHROPIC_MODEL=gpt-5.5
+```
+
+Supported local routes:
+
+本地支持路由：
+
+- `POST /accounts/<account_id>/v1/responses`
+- `POST /accounts/<account_id>/v1/messages`
+- `POST /accounts/<account_id>/v1/chat/completions`
+- `GET /accounts/<account_id>/v1/models`
+
+`gpt-5.5` is exposed as `272000` context tokens, `128000` max output tokens, with thinking levels `low`, `medium`, `high`, and `xhigh`.
+
+`gpt-5.5` 展示为 `272000` context tokens、`128000` max output tokens，thinking levels 为 `low`、`medium`、`high`、`xhigh`。
+
 ### Global Codex CLI / 全局 Codex CLI
 
 For tools such as Paperclip that call the default `codex` command and do not let you enter a launch command, use `设为全局 Codex CLI`.
