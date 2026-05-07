@@ -67,10 +67,10 @@ BRIDGE_MODEL_OPTIONS = (
         "max_output_tokens": 128_000,
         "thinking_levels": ("low", "medium", "high", "xhigh"),
     },
-    {"id": "gpt-5.4", "name": "gpt-5.4", "context_tokens": 220_000, "thinking_levels": ("low", "medium", "high", "xhigh")},
-    {"id": "gpt-5.4-mini", "name": "gpt-5.4 Mini", "context_tokens": 220_000, "thinking_levels": ("low", "medium", "high", "xhigh")},
-    {"id": "gpt-5.3-codex", "name": "gpt-5.3-codex", "context_tokens": 220_000},
-    {"id": "gpt-5.3-codex-spark", "name": "gpt-5.3-codex-spark", "context_tokens": 220_000},
+    {"id": "gpt-5.4", "name": "gpt-5.4", "thinking_levels": ("low", "medium", "high", "xhigh")},
+    {"id": "gpt-5.4-mini", "name": "gpt-5.4 Mini", "thinking_levels": ("low", "medium", "high", "xhigh")},
+    {"id": "gpt-5.3-codex", "name": "gpt-5.3-codex"},
+    {"id": "gpt-5.3-codex-spark", "name": "gpt-5.3-codex-spark"},
 )
 MODEL_ENV_KEYS = (
     "ANTHROPIC_MODEL",
@@ -3417,8 +3417,9 @@ INDEX_HTML = """<!doctype html>
             <button class="miniBtn" data-action="start-local-bridge">启动 Local Bridge</button>
             <button class="miniBtn" data-action="restart-local-bridge">重启 Local Bridge</button>
             <button class="miniBtn warn" data-action="stop-local-bridge">停止 Local Bridge</button>
+            <button class="miniBtn warn" data-action="stop-bridgedeck-ui">关闭 BridgeDeck UI</button>
           </div>
-          <div id="serviceMessage" class="muted mt10">未操作</div>
+          <div id="serviceMessage" class="muted mt10">关闭 BridgeDeck UI 只停 8899，不影响 8876 Local Bridge。</div>
           <div id="proxyDiagnosis" class="sectionHint">未诊断</div>
         </div>
       </div>
@@ -4157,6 +4158,17 @@ INDEX_HTML = """<!doctype html>
       await refreshQuotas();
       return res;
     }
+    async function stopBridgeDeckUi() {
+      if (!confirm('只关闭 BridgeDeck UI (8899)，Local Bridge (8876) 会继续运行。继续？')) return;
+      const res = await api('/api/ui-control', 'POST', { action: 'shutdown' });
+      const message = res.message || 'BridgeDeck UI 正在关闭；Local Bridge 保持运行。';
+      document.getElementById('serviceMessage').textContent = message;
+      log(message);
+      setTimeout(() => {
+        document.body.innerHTML = '<main class="wrap"><div class="card"><h1>BridgeDeck UI 已关闭</h1><p class="muted">8876 Local Bridge 继续运行。重新打开 BridgeDeck.app 可恢复 UI。</p></div></main>';
+      }, 250);
+      return res;
+    }
     async function repairQuotaQuery() {
       const res = await api('/api/repair-quota-query', 'POST', {});
       if (res.services) renderServices({ services: res.services });
@@ -4338,6 +4350,9 @@ INDEX_HTML = """<!doctype html>
       const option = bridgeModelOption(modelId);
       return option && option.max_output_tokens ? String(option.max_output_tokens) : '';
     }
+    function bridgeModelRecommendedCompact(modelId) {
+      return bridgeModelContext(modelId) || CONSERVATIVE_COMPACT_WINDOW;
+    }
     function selectedBridgeModel() {
       const sel = document.getElementById('bridgeModel');
       return sel && sel.value ? sel.value : DEFAULT_BRIDGE_MODEL;
@@ -4348,7 +4363,9 @@ INDEX_HTML = """<!doctype html>
       const maxOutput = bridgeModelMaxOutput(model);
       document.getElementById('modelContextTokens').value = context || '';
       const outputText = maxOutput ? ` / ${maxOutput} max output` : '';
-      document.getElementById('bridgeModelMeta').textContent = `${model}${context ? ' = ' + context + ' context tokens' : ''}${outputText}。220k 是保守压缩窗口，1m 只给 1m 模型。`;
+      document.getElementById('bridgeModelMeta').textContent = context
+        ? `${model} = ${context} context tokens${outputText}。`
+        : `${model} 未探测到真实 context；自动压缩使用保守 ${CONSERVATIVE_COMPACT_WINDOW}，不会写 CLAUDE_CODE_MAX_CONTEXT_TOKENS。`;
     }
     function renderBridgeModels() {
       const sel = document.getElementById('bridgeModel');
@@ -4357,7 +4374,7 @@ INDEX_HTML = """<!doctype html>
       BRIDGE_MODELS.forEach((item) => {
         const opt = document.createElement('option');
         opt.value = item.id;
-        const context = item.context_tokens ? ` · ${item.context_tokens}` : '';
+        const context = item.context_tokens ? ` · ${item.context_tokens}` : ' · context unknown';
         opt.textContent = `${item.name || item.id}${context}`;
         sel.appendChild(opt);
       });
@@ -4396,7 +4413,7 @@ INDEX_HTML = """<!doctype html>
       setCompactFields(Boolean(windowTokens), windowTokens, pct);
     }
     function applyModelContextPreset() {
-      const context = bridgeModelContext(selectedBridgeModel());
+      const context = bridgeModelRecommendedCompact(selectedBridgeModel());
       updateBridgeModelMeta();
       if (context) setCompactFields(true, context, DEFAULT_COMPACT_PCT);
     }
@@ -4951,6 +4968,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'start-local-bridge') return controlLocalBridge('start');
           if (action === 'stop-local-bridge') return controlLocalBridge('stop');
           if (action === 'restart-local-bridge') return controlLocalBridge('restart');
+          if (action === 'stop-bridgedeck-ui') return stopBridgeDeckUi();
           if (action === 'select-cli-account') return selectCliAccount(button.dataset.accountId || '');
         };
         const originalText = button.textContent;
@@ -5019,6 +5037,15 @@ def build_handler(
             if not site:
                 return True
             return site in {"same-origin", "same-site", "none"}
+
+        def _shutdown_server_later(self) -> None:
+            server = self.server
+
+            def stop() -> None:
+                time.sleep(0.2)
+                server.shutdown()
+
+            threading.Thread(target=stop, daemon=True).start()
 
         def do_GET(self) -> None:
             if not self._valid_host():
@@ -5248,6 +5275,21 @@ def build_handler(
                     result = manager.control_local_bridge(str(payload.get("action") or ""))
                     json_response(self, 200 if result.get("ok") else 400, result)
                     return
+                if self.path == "/api/ui-control":
+                    action = str(payload.get("action") or "")
+                    if action != "shutdown":
+                        json_response(self, 400, {"ok": False, "error": "Unsupported UI action"})
+                        return
+                    json_response(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "message": "BridgeDeck UI 正在关闭；Local Bridge 保持运行。重新打开 BridgeDeck.app 可恢复 UI。",
+                        },
+                    )
+                    self._shutdown_server_later()
+                    return
                 if self.path == "/api/repair-quota-query":
                     result = manager.repair_quota_query()
                     json_response(self, 200 if result.get("ok", True) else 400, result)
@@ -5279,6 +5321,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow write APIs and token reveal when using --allow-remote. Use only on trusted networks.",
     )
+    parser.add_argument(
+        "--local-bridge",
+        choices=("start", "stop", "restart", "status"),
+        help="Control the 8876 Local Codex Bridge without starting the 8899 UI.",
+    )
     return parser.parse_args()
 
 
@@ -5296,6 +5343,12 @@ def main() -> int:
             auth_store=args.auth_store,
         )
     )
+    if args.local_bridge:
+        if args.local_bridge == "status":
+            print(json.dumps(manager.services().get("services", {}).get("local_bridge", {}), ensure_ascii=False))
+        else:
+            print(json.dumps(manager.control_local_bridge(args.local_bridge), ensure_ascii=False))
+        return 0
     allow_sensitive = host_is_loopback or bool(args.allow_remote_write)
     handler = build_handler(
         manager,

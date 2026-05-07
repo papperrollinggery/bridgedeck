@@ -1547,10 +1547,13 @@ class ServerCase(unittest.TestCase):
         self.assertIn('id="bridgeModel"', html)
         self.assertIn('id="modelContextTokens"', html)
         self.assertIn('data-action="compact-preset-model"', html)
+        self.assertIn("context unknown", html)
         self.assertIn('id="compactWindow"', html)
         self.assertIn('data-action="compact-preset-1m"', html)
         self.assertIn('data-action="save-compact-selected"', html)
         self.assertIn('data-action="sync-common-env-selected"', html)
+        self.assertIn('data-action="stop-bridgedeck-ui"', html)
+        self.assertIn("只停 8899，不影响 8876 Local Bridge", html)
         self.assertIn('id="pluginSyncStatus"', html)
         self.assertIn('data-action="extract-safe-common-config"', html)
         self.assertIn('data-action="sync-claude-plugins"', html)
@@ -1898,6 +1901,38 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "Write APIs are disabled for remote mode")
 
+    def test_ui_control_shutdown_is_local_only_and_async(self) -> None:
+        server, _ = self.start_server()
+
+        with mock.patch.object(server, "shutdown") as shutdown:
+            status, payload = self.request(
+                server,
+                "/api/ui-control",
+                method="POST",
+                body={"action": "shutdown"},
+                headers={"X-CCSBT-Token": "test-token"},
+            )
+            time.sleep(0.35)
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertIn("Local Bridge 保持运行", payload["message"])
+        shutdown.assert_called_once()
+
+    def test_ui_control_requires_local_write_mode(self) -> None:
+        server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
+
+        status, payload = self.request(
+            server,
+            "/api/ui-control",
+            method="POST",
+            body={"action": "shutdown"},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "Write APIs are disabled for remote mode")
+
     def test_remote_services_redacts_process_paths_and_proxy(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
 
@@ -2223,6 +2258,13 @@ class LauncherCase(unittest.TestCase):
             env = settings["env"]
             self.assertEqual(env["ANTHROPIC_MODEL"], "gpt-5.5")
             self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "272000")
+
+    def test_unknown_bridge_model_does_not_invent_context(self) -> None:
+        normalized = bridgedeck.normalize_bridge_model_config({"model": "gpt-5.4"})
+
+        self.assertEqual(normalized["model"], "gpt-5.4")
+        self.assertEqual(normalized["context_tokens"], "")
+        self.assertEqual(normalized["max_output_tokens"], "")
 
     def test_provider_payload_normalizes_gpt_model_env_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
