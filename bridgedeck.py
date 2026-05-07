@@ -1956,7 +1956,7 @@ class BridgeManager:
         env = settings.get("env")
         if not isinstance(env, dict):
             env = {}
-        env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:8876/accounts/{account_id}"
+        env["ANTHROPIC_BASE_URL"] = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}"
         env["ANTHROPIC_AUTH_TOKEN"] = "local-bridge"
         env.setdefault("ANTHROPIC_MODEL", "gpt-5.4")
         env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "gpt-5.4-mini")
@@ -3389,7 +3389,7 @@ INDEX_HTML = """<!doctype html>
         <div class="toolCard">
           <div>
             <div class="toolName">通用 API 接入</div>
-            <div class="toolText">给支持 OpenAI Base URL 的项目复制本地配置。API key 是占位符，不是真实 token。</div>
+            <div class="toolText">给支持 OpenAI Base URL 或 Claude/Anthropic 环境变量的项目复制本地配置。key 是占位符，不是真实 token。</div>
             <div class="toolSelect">
               <label for="simpleApiAccount">API 用哪个账号</label>
               <select id="simpleApiAccount"></select>
@@ -3403,11 +3403,22 @@ INDEX_HTML = """<!doctype html>
                 <div class="apiEnvLabel">OPENAI_BASE_URL</div>
                 <div class="apiEnvValue" id="apiAccessBaseUrl">选择账号后生成</div>
               </div>
+              <div class="apiEnvLine">
+                <div class="apiEnvLabel">ANTHROPIC_AUTH_TOKEN</div>
+                <div class="apiEnvValue" id="anthropicAccessToken">local-bridge</div>
+              </div>
+              <div class="apiEnvLine">
+                <div class="apiEnvLabel">ANTHROPIC_BASE_URL</div>
+                <div class="apiEnvValue" id="anthropicAccessBaseUrl">选择账号后生成</div>
+              </div>
             </div>
             <div class="apiEnvActions">
               <button class="miniBtn" data-action="copy-api-key">复制 API key</button>
               <button class="miniBtn" data-action="copy-api-base-url">复制 Base URL</button>
               <button class="miniBtn" data-action="copy-api-env">复制 .env</button>
+              <button class="miniBtn" data-action="copy-anthropic-token">复制 Anthropic token</button>
+              <button class="miniBtn" data-action="copy-anthropic-base-url">复制 Anthropic URL</button>
+              <button class="miniBtn" data-action="copy-anthropic-env">复制 Anthropic .env</button>
             </div>
             <div class="actualLine mt10" id="simpleApiActual">当前实际：选择账号后可用。</div>
           </div>
@@ -3608,7 +3619,9 @@ INDEX_HTML = """<!doctype html>
     let lastAccounts = [];
     const DEFAULT_COMPACT_WINDOW = '220000';
     const DEFAULT_COMPACT_PCT = '80';
+    const LOCAL_BRIDGE_BASE_URL = "__LOCAL_BRIDGE_BASE_URL__";
     const LOCAL_API_KEY_PLACEHOLDER = 'sk-bridgedeck-local-placeholder';
+    const LOCAL_ANTHROPIC_AUTH_TOKEN = 'local-bridge';
     const GUIDES = {
       simpleFlow: {
         title: '日常模式',
@@ -4081,10 +4094,16 @@ INDEX_HTML = """<!doctype html>
       return sel ? findAccount(sel.value) : null;
     }
     function apiAccessBaseUrl(item) {
-      return item && item.account_id ? `http://127.0.0.1:8876/accounts/${encodeURIComponent(item.account_id)}/v1` : '';
+      return item && item.account_id ? `${LOCAL_BRIDGE_BASE_URL}/accounts/${encodeURIComponent(item.account_id)}/v1` : '';
+    }
+    function anthropicAccessBaseUrl(item) {
+      return item && item.account_id ? `${LOCAL_BRIDGE_BASE_URL}/accounts/${encodeURIComponent(item.account_id)}` : '';
     }
     function apiAccessEnv(item) {
       return `OPENAI_API_KEY=${LOCAL_API_KEY_PLACEHOLDER}\nOPENAI_BASE_URL=${apiAccessBaseUrl(item)}`;
+    }
+    function anthropicAccessEnv(item) {
+      return `ANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_BASE_URL=${anthropicAccessBaseUrl(item)}`;
     }
     async function copyText(value, label) {
       const text = String(value || '');
@@ -4111,9 +4130,13 @@ INDEX_HTML = """<!doctype html>
       const item = selectedAccount('simpleApiAccount');
       const keyBox = document.getElementById('apiAccessKey');
       const baseBox = document.getElementById('apiAccessBaseUrl');
+      const anthropicTokenBox = document.getElementById('anthropicAccessToken');
+      const anthropicBaseBox = document.getElementById('anthropicAccessBaseUrl');
       const actual = document.getElementById('simpleApiActual');
       if (keyBox) keyBox.textContent = LOCAL_API_KEY_PLACEHOLDER;
       if (baseBox) baseBox.textContent = apiAccessBaseUrl(item) || '选择账号后生成';
+      if (anthropicTokenBox) anthropicTokenBox.textContent = LOCAL_ANTHROPIC_AUTH_TOKEN;
+      if (anthropicBaseBox) anthropicBaseBox.textContent = anthropicAccessBaseUrl(item) || '选择账号后生成';
       if (actual) {
         actual.innerHTML = item
           ? `当前实际：<strong>${esc(accountLabel(item))}</strong><br><span class="warnText">只复制本地 fake key，不显示真实 OAuth token。</span>`
@@ -4129,6 +4152,16 @@ INDEX_HTML = """<!doctype html>
     function copyApiEnv() {
       const item = selectedAccount('simpleApiAccount');
       return copyText(item ? apiAccessEnv(item) : '', '.env');
+    }
+    function copyAnthropicToken() {
+      return copyText(LOCAL_ANTHROPIC_AUTH_TOKEN, 'ANTHROPIC_AUTH_TOKEN');
+    }
+    function copyAnthropicBaseUrl() {
+      return copyText(anthropicAccessBaseUrl(selectedAccount('simpleApiAccount')), 'ANTHROPIC_BASE_URL');
+    }
+    function copyAnthropicEnv() {
+      const item = selectedAccount('simpleApiAccount');
+      return copyText(item ? anthropicAccessEnv(item) : '', 'Anthropic .env');
     }
     function setCompactFields(enabled, windowTokens, pct) {
       document.getElementById('compactEnabled').checked = Boolean(enabled);
@@ -4276,7 +4309,7 @@ INDEX_HTML = """<!doctype html>
         const item = accounts[simpleApiSel.selectedIndex];
         if (!item) return;
         renderApiAccess();
-        setSimpleResult(`通用 API 接入已选择 ${accountLabel(item)}。复制 .env 后给支持 OpenAI Base URL 的项目使用。`);
+        setSimpleResult(`通用 API 接入已选择 ${accountLabel(item)}。可复制 OpenAI 或 Anthropic .env。`);
       };
       simpleDefaultSel.onchange = () => {
         const item = accounts[simpleDefaultSel.selectedIndex];
@@ -4654,6 +4687,9 @@ INDEX_HTML = """<!doctype html>
           if (action === 'copy-api-key') return copyApiKey();
           if (action === 'copy-api-base-url') return copyApiBaseUrl();
           if (action === 'copy-api-env') return copyApiEnv();
+          if (action === 'copy-anthropic-token') return copyAnthropicToken();
+          if (action === 'copy-anthropic-base-url') return copyAnthropicBaseUrl();
+          if (action === 'copy-anthropic-env') return copyAnthropicEnv();
           if (action === 'migrate-cli-home') return migrateCliHome();
           if (action === 'toggle-tokens') return toggleTokens();
           if (action === 'set-current-selected') return setCurrentFromSelected();
@@ -4754,6 +4790,7 @@ def build_handler(
                 body = (
                     INDEX_HTML.replace("__CSRF_TOKEN__", csrf_token)
                     .replace("__CSP_NONCE__", csp_nonce)
+                    .replace("__LOCAL_BRIDGE_BASE_URL__", LOCAL_BRIDGE_BASE_URL)
                     .encode("utf-8")
                 )
                 self.send_response(200)
