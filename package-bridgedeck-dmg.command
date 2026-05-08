@@ -99,8 +99,9 @@ ui_running() {
 }
 
 open_ui() {
-  log_event "open_ui $APP_URL"
-  /usr/bin/open "$APP_URL" >/dev/null 2>&1 &
+  local open_url="$APP_URL/?t=$(/bin/date +%s)"
+  log_event "open_ui $open_url"
+  /usr/bin/open "$open_url" >/dev/null 2>&1 &
 }
 
 start_ui() {

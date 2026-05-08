@@ -4476,9 +4476,33 @@ INDEX_HTML = """<!doctype html>
       const resp = await fetch(path, init);
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok || data.ok === false) {
-        throw new Error(data.error || data.message || `HTTP ${resp.status}`);
+        const err = new Error(data.error || data.message || `HTTP ${resp.status}`);
+        err.status = resp.status;
+        err.payload = data;
+        throw err;
       }
       return data;
+    }
+    function setInitState(message, cls='muted') {
+      const status = document.getElementById('status');
+      if (status) status.innerHTML = `<span class="${cls}">${esc(message)}</span>`;
+    }
+    function handleInitError(error) {
+      const message = error && error.message ? error.message : String(error || 'unknown');
+      const statusCode = error && error.status ? Number(error.status) : 0;
+      setInitState(`初始化失败：${message}`, 'bad');
+      const recommendation = document.getElementById('recommendation');
+      if (recommendation) {
+        recommendation.className = 'recommend fail';
+        recommendation.innerHTML = `<b>页面初始化失败</b><br>- ${esc(message)}<br>- 如果刚重启过 BridgeDeck，请刷新页面。`;
+      }
+      log(`初始化失败: ${message}`);
+      if ((statusCode === 403 || message.toLowerCase().includes('csrf')) && !sessionStorage.getItem('bridgedeckCsrfReloaded')) {
+        sessionStorage.setItem('bridgedeckCsrfReloaded', '1');
+        const next = new URL(window.location.href);
+        next.searchParams.set('t', String(Date.now()));
+        window.location.replace(next.toString());
+      }
     }
     function renderAccounts(data) {
       const accounts = data.accounts || [];
@@ -5009,7 +5033,8 @@ INDEX_HTML = """<!doctype html>
     bindActions();
     renderBridgeModels();
     initGuideObserver();
-    refreshData().catch((e) => log(`初始化失败: ${e.message}`));
+    setInitState('正在连接本地 UI 服务...');
+    refreshData().catch(handleInitError);
     setInterval(() => {
       if (document.getElementById('autoSwitchEnabled')?.checked) {
         runAutoSwitch(false, false).catch((e) => log(`自动切换失败: ${e.message}`));
