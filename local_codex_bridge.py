@@ -30,6 +30,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 TOKEN_REFRESH_BUFFER_SECS = 60
 ACCOUNT_ROUTE_RE = re.compile(r"^/accounts/([^/]+)(/.*)?$")
+MODELS_PATHS = {"/v1/models", "/models", "/v1/v1/models"}
+RESPONSES_PATHS = {"/v1/responses", "/responses", "/v1/v1/responses"}
+MESSAGES_PATHS = {"/v1/messages", "/messages", "/v1/v1/messages"}
+CHAT_COMPLETIONS_PATHS = {"/v1/chat/completions", "/chat/completions", "/v1/v1/chat/completions"}
 UPSTREAM_PROXY_ENV = "CODEX_BRIDGE_UPSTREAM_PROXY"
 ALLOW_REMOTE_ENV = "CODEX_BRIDGE_ALLOW_REMOTE"
 STREAM_MAX_RETRIES_ENV = "CODEX_BRIDGE_STREAM_MAX_RETRIES"
@@ -143,6 +147,27 @@ BRIDGE_MODELS: tuple[BridgeModel, ...] = (
     BridgeModel(id="gpt-5.3-codex-spark", display_name="GPT 5.3 Codex Spark"),
 )
 
+CLAUDE_DESKTOP_MODEL_ROUTES: tuple[dict[str, str], ...] = (
+    {
+        "id": "claude-haiku-4-5",
+        "display_name": "Claude Haiku 4.5",
+        "env": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "default": "gpt-5.3-codex-spark",
+    },
+    {
+        "id": "claude-sonnet-4-6",
+        "display_name": "Claude Sonnet 4.6",
+        "env": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "default": "gpt-5.3-codex",
+    },
+    {
+        "id": "claude-opus-4-7",
+        "display_name": "Claude Opus 4.7",
+        "env": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "default": "gpt-5.5",
+    },
+)
+
 
 def parse_bool_env(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -246,30 +271,85 @@ def redact_log_text(value: str | None) -> str | None:
     return redacted
 
 
+def normalize_bridge_model_id(value: Any) -> str:
+    model = str(value or "").strip()
+    if re.match(r"(?i)^gpt-", model):
+        return model.lower()
+    return model
+
+
+def bridge_model_by_id(model_id: str | None) -> BridgeModel | None:
+    normalized = normalize_bridge_model_id(model_id)
+    for model in BRIDGE_MODELS:
+        if model.id == normalized:
+            return model
+    return None
+
+
+def claude_desktop_model_route_map() -> dict[str, str]:
+    routes: dict[str, str] = {}
+    for route in CLAUDE_DESKTOP_MODEL_ROUTES:
+        source_model = normalize_bridge_model_id(os.environ.get(route["env"]) or route["default"])
+        if source_model:
+            routes[route["id"]] = source_model
+    return routes
+
+
+def map_claude_desktop_model(model_id: Any) -> Any:
+    if not isinstance(model_id, str):
+        return model_id
+    requested = model_id.strip()
+    if not requested:
+        return model_id
+    return claude_desktop_model_route_map().get(requested.lower(), model_id)
+
+
+def model_payload_item(
+    model: BridgeModel,
+    *,
+    model_id: str | None = None,
+    display_name: str | None = None,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "id": model_id or model.id,
+        "object": "model",
+        "type": "model",
+        "created": 0,
+        "created_at": "2026-05-07T00:00:00Z",
+        "owned_by": "openai",
+        "display_name": display_name or model.display_name,
+        "capabilities": {
+            "responses": True,
+            "messages": True,
+            "streaming": True,
+            "tools": True,
+        },
+    }
+    if model.context_length is not None:
+        item["context_length"] = model.context_length
+    if model.max_completion_tokens is not None:
+        item["max_completion_tokens"] = model.max_completion_tokens
+    if model.thinking_levels:
+        item["thinking"] = {"levels": list(model.thinking_levels)}
+    return item
+
+
 def build_models_payload() -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     for model in BRIDGE_MODELS:
-        item: dict[str, Any] = {
-            "id": model.id,
-            "object": "model",
-            "type": "model",
-            "created": 0,
-            "created_at": "2026-05-07T00:00:00Z",
-            "owned_by": "openai",
-            "display_name": model.display_name,
-            "capabilities": {
-                "responses": True,
-                "messages": True,
-                "streaming": True,
-                "tools": True,
-            },
-        }
-        if model.context_length is not None:
-            item["context_length"] = model.context_length
-        if model.max_completion_tokens is not None:
-            item["max_completion_tokens"] = model.max_completion_tokens
-        if model.thinking_levels:
-            item["thinking"] = {"levels": list(model.thinking_levels)}
+        data.append(model_payload_item(model))
+    route_map = claude_desktop_model_route_map()
+    for route in CLAUDE_DESKTOP_MODEL_ROUTES:
+        route_id = route["id"]
+        source_model = route_map.get(route_id)
+        source = bridge_model_by_id(source_model) or BridgeModel(
+            id=source_model or route["default"],
+            display_name=source_model or route["default"],
+        )
+        item = model_payload_item(source, model_id=route_id, display_name=route["display_name"])
+        item["owned_by"] = "anthropic"
+        item["bridge_target_model"] = source.id
+        item["capabilities"]["claude_desktop_gateway"] = True
         data.append(item)
     return {
         "object": "list",
@@ -863,6 +943,14 @@ def normalize_request_body(body: dict[str, Any]) -> dict[str, Any]:
 
     model = normalized.get("model")
     if isinstance(model, str):
+        routed_model = map_claude_desktop_model(model)
+        if routed_model != model:
+            print(
+                f"[bridge-normalize] desktop route {model} -> {routed_model}",
+                file=sys.stderr,
+            )
+            normalized["model"] = routed_model
+            model = routed_model
         normalized_model, default_effort = normalize_codex_model_and_effort(model)
         if normalized_model != model:
             print(
@@ -1745,7 +1833,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self._write_bytes(payload)
             return
-        if route_path == "/v1/models":
+        if route_path in MODELS_PATHS:
             self._write_json_payload(200, build_models_payload())
             return
         if route_path == "/quota":
@@ -1828,13 +1916,13 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         route_account_id, route_path = self._resolve_account_route()
-        if route_path == "/v1/responses":
+        if route_path in RESPONSES_PATHS:
             self._handle_responses(route_account_id, route_path)
             return
-        if route_path == "/v1/messages":
+        if route_path in MESSAGES_PATHS:
             self._handle_messages(route_account_id, route_path)
             return
-        if route_path == "/v1/chat/completions":
+        if route_path in CHAT_COMPLETIONS_PATHS:
             self._handle_chat_completions(route_account_id, route_path)
             return
         self.send_error(404, "Not Found")

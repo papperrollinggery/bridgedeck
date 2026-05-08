@@ -957,6 +957,23 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertTrue(by_id["gpt-5.5"]["capabilities"]["messages"])
         self.assertTrue(by_id["gpt-5.5"]["capabilities"]["responses"])
 
+    def test_models_registry_exposes_claude_desktop_safe_routes(self) -> None:
+        payload = local_codex_bridge.build_models_payload()
+        by_id = {item["id"]: item for item in payload["data"]}
+
+        self.assertEqual(by_id["claude-haiku-4-5"]["bridge_target_model"], "gpt-5.3-codex-spark")
+        self.assertEqual(by_id["claude-sonnet-4-6"]["bridge_target_model"], "gpt-5.3-codex")
+        self.assertEqual(by_id["claude-opus-4-7"]["bridge_target_model"], "gpt-5.5")
+        self.assertEqual(by_id["claude-opus-4-7"]["context_length"], 272000)
+        self.assertTrue(by_id["claude-opus-4-7"]["capabilities"]["claude_desktop_gateway"])
+
+    def test_claude_desktop_safe_route_maps_before_forwarding(self) -> None:
+        body = local_codex_bridge.normalize_request_body(
+            {"model": "claude-opus-4-7", "input": [{"role": "user", "content": []}]}
+        )
+
+        self.assertEqual(body["model"], "gpt-5.5")
+
     def test_models_endpoint_is_account_scoped_and_ignores_sensitive_query(self) -> None:
         server = self.start_local_bridge_server()
         request = urllib.request.Request(
@@ -969,7 +986,19 @@ class LocalCodexBridgeCase(unittest.TestCase):
         by_id = {item["id"]: item for item in payload["data"]}
         self.assertEqual(response.status, 200)
         self.assertIn("gpt-5.5", by_id)
+        self.assertIn("claude-opus-4-7", by_id)
         self.assertEqual(by_id["gpt-5.5"]["context_length"], 272000)
+
+    def test_models_endpoint_accepts_openai_base_url_path_variants(self) -> None:
+        server = self.start_local_bridge_server()
+        for path in ("/accounts/acct-1/models", "/accounts/acct-1/v1/v1/models"):
+            with self.subTest(path=path):
+                request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}{path}")
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+
+                self.assertEqual(response.status, 200)
+                self.assertIn("gpt-5.5", {item["id"] for item in payload["data"]})
 
     def test_messages_endpoint_posts_translated_responses_request_to_mock_upstream(self) -> None:
         server = self.start_local_bridge_server()
@@ -1010,6 +1039,68 @@ class LocalCodexBridgeCase(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(payload["type"], "message")
         self.assertEqual(payload["content"][0], {"type": "text", "text": "hello"})
+
+    def test_messages_endpoint_maps_claude_desktop_safe_model_to_gpt(self) -> None:
+        server = self.start_local_bridge_server()
+        client = FakeForwardClient(
+            [
+                FakeForwardResponse(
+                    200,
+                    body=(
+                        b"event: response.output_text.delta\n"
+                        b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+                    ),
+                )
+            ]
+        )
+
+        with mock.patch.object(local_codex_bridge, "build_upstream_http_client", return_value=client):
+            status, _, _ = self.post_local_bridge_json(
+                server,
+                "/accounts/acct-1/v1/messages",
+                {
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 200,
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+
+        sent = client.calls[0]["kwargs"]
+        self.assertEqual(status, 200)
+        self.assertEqual(sent["json"]["model"], "gpt-5.3-codex")
+
+    def test_chat_completions_endpoint_accepts_openai_base_url_path_variants(self) -> None:
+        for path in ("/accounts/acct-1/chat/completions", "/accounts/acct-1/v1/v1/chat/completions"):
+            with self.subTest(path=path):
+                server = self.start_local_bridge_server()
+                client = FakeForwardClient(
+                    [
+                        FakeForwardResponse(
+                            200,
+                            body=(
+                                b"event: response.output_text.delta\n"
+                                b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+                            ),
+                        )
+                    ]
+                )
+
+                with mock.patch.object(local_codex_bridge, "build_upstream_http_client", return_value=client):
+                    status, body, _ = self.post_local_bridge_json(
+                        server,
+                        path,
+                        {
+                            "model": "gpt-5.5",
+                            "stream": False,
+                            "messages": [{"role": "user", "content": "hi"}],
+                        },
+                    )
+
+                payload = json.loads(body)
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["choices"][0]["message"]["content"], "hello")
+                self.assertEqual(client.calls[0]["kwargs"]["json"]["model"], "gpt-5.5")
 
     def test_chat_completions_endpoint_posts_translated_responses_request_to_mock_upstream(self) -> None:
         server = self.start_local_bridge_server()
@@ -1540,6 +1631,13 @@ class ServerCase(unittest.TestCase):
         self.assertIn("sk-bridgedeck-local-placeholder", html)
         self.assertIn("ANTHROPIC_BASE_URL", html)
         self.assertIn("ANTHROPIC_MODEL=gpt-5.5", html)
+        self.assertIn("ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark", html)
+        self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex", html)
+        self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5", html)
+        self.assertIn("claude-haiku-4-5", html)
+        self.assertIn("claude-sonnet-4-6", html)
+        self.assertIn("claude-opus-4-7", html)
+        self.assertIn("Desktop Gateway", html)
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000", html)
         self.assertIn("272k context / 128k max output", html)
         self.assertIn("copy-api-base-url", html)
@@ -2207,6 +2305,9 @@ class LauncherCase(unittest.TestCase):
             env = settings["env"]
             self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8876/accounts/acct-1")
             self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "local-bridge")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gpt-5.3-codex-spark")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-5.3-codex")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gpt-5.5")
             self.assertEqual(meta["apiFormat"], "openai_responses")
             self.assertEqual(meta["codexOauthTransport"], "local_bridge")
             self.assertEqual(meta["authBinding"]["authProvider"], "codex_oauth")

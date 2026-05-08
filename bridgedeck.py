@@ -2020,9 +2020,9 @@ class BridgeManager:
             apply_bridge_model_config_to_env(env, model_config)
         else:
             env.setdefault("ANTHROPIC_MODEL", DEFAULT_BRIDGE_PROVIDER_MODEL)
-        env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "gpt-5.4-mini")
+        env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "gpt-5.3-codex-spark")
         env.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", "gpt-5.3-codex")
-        env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "gpt-5.4")
+        env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "gpt-5.5")
         normalize_provider_model_env(env)
         if compact_config is not None:
             apply_compact_config_to_env(env, compact_config)
@@ -3543,7 +3543,7 @@ INDEX_HTML = """<!doctype html>
         <span class="muted" id="apiAccessGuideAccount">沿用上方通用 API 接入选择</span>
         <button class="miniBtn" data-action="copy-api-base-url">复制 BASE_URL</button>
         <button class="miniBtn" data-action="copy-api-env">复制 OpenAI env</button>
-        <button class="miniBtn" data-action="copy-claude-env">复制 Claude Desktop env</button>
+        <button class="miniBtn" data-action="copy-claude-env">复制 Desktop Gateway</button>
       </div>
       <div class="paths" id="apiAccessGuideBaseUrl"></div>
       <div class="apiMatrix">
@@ -3553,7 +3553,7 @@ INDEX_HTML = """<!doctype html>
         </div>
         <div class="apiCard ok">
           <div class="apiCardTitle">Anthropic Messages</div>
-          <div class="apiCardMeta"><span class="mono">POST /v1/messages</span><br />Claude Desktop 3P gateway 最小兼容路径，映射到 Responses。</div>
+          <div class="apiCardMeta"><span class="mono">POST /v1/messages</span><br />Claude Desktop 3P 使用 Claude-safe 路由名，BridgeDeck 映射到 GPT。</div>
         </div>
         <div class="apiCard ok">
           <div class="apiCardTitle">Chat Completions</div>
@@ -3561,7 +3561,7 @@ INDEX_HTML = """<!doctype html>
         </div>
         <div class="apiCard ok">
           <div class="apiCardTitle">Scoped Models</div>
-          <div class="apiCardMeta"><span class="mono">GET /v1/models</span><br />返回 account-scoped 模型能力；gpt-5.5 为 272k context / 128k max output。</div>
+          <div class="apiCardMeta"><span class="mono">GET /v1/models</span><br />同时返回 gpt-* 和 claude-* Desktop 路由；gpt-5.5 为 272k context / 128k max output。</div>
         </div>
       </div>
       <div class="apiExampleGrid">
@@ -3755,6 +3755,11 @@ INDEX_HTML = """<!doctype html>
     const LOCAL_BRIDGE_BASE_URL = "__LOCAL_BRIDGE_BASE_URL__";
     const LOCAL_API_KEY_PLACEHOLDER = 'sk-bridgedeck-local-placeholder';
     const LOCAL_ANTHROPIC_AUTH_TOKEN = 'local-bridge';
+    const CLAUDE_DESKTOP_ROUTES = [
+      ['claude-haiku-4-5', 'gpt-5.3-codex-spark'],
+      ['claude-sonnet-4-6', 'gpt-5.3-codex'],
+      ['claude-opus-4-7', 'gpt-5.5']
+    ];
     const GUIDES = {
       simpleFlow: {
         title: '日常模式',
@@ -3776,7 +3781,7 @@ INDEX_HTML = """<!doctype html>
           '选择要暴露给工具的 ChatGPT 账号。',
           'BASE_URL 使用账号级路径，不暴露真实 OAuth token。',
           'OpenAI-compatible 工具使用 placeholder API key。',
-          'Claude Desktop 3P 使用 ANTHROPIC_BASE_URL 指向同一账号路径。',
+          'Claude Desktop 3P 使用账号级 gateway，模型列表只暴露 claude-* 路由。',
           '这里只复制配置，不写入 provider，也不改变当前运行工具。'
         ]
       },
@@ -4254,20 +4259,28 @@ INDEX_HTML = """<!doctype html>
     function anthropicAccessBaseUrl(item) {
       return apiAccessBaseUrl(item);
     }
+    function claudeDesktopGatewayBaseUrl(item) {
+      return item && item.account_id ? `${LOCAL_BRIDGE_BASE_URL}/accounts/${encodeURIComponent(item.account_id)}` : '';
+    }
+    function claudeDesktopRoutesText() {
+      return CLAUDE_DESKTOP_ROUTES.map(([route, target]) => `${route} -> ${target}`).join('\n');
+    }
     function apiAccessEnv(item) {
       const baseUrl = apiAccessBaseUrl(item);
       return baseUrl ? `OPENAI_API_KEY=${LOCAL_API_KEY_PLACEHOLDER}\nOPENAI_BASE_URL=${baseUrl}` : '';
     }
     function anthropicAccessEnv(item) {
       const baseUrl = anthropicAccessBaseUrl(item);
-      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_MODEL=gpt-5.5\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` : '';
+      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_MODEL=gpt-5.5\nANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark\nANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex\nANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` : '';
     }
     function apiOpenAiEnv(item) {
       const baseUrl = apiAccessBaseUrl(item);
       return baseUrl ? `OPENAI_API_KEY=${LOCAL_API_KEY_PLACEHOLDER}\nOPENAI_BASE_URL=${baseUrl}\nMODEL=gpt-5.5` : '';
     }
     function apiClaudeEnv(item) {
-      return anthropicAccessEnv(item);
+      const gatewayBase = claudeDesktopGatewayBaseUrl(item);
+      if (!gatewayBase) return '';
+      return `inferenceGatewayBaseUrl=${gatewayBase}\ninferenceGatewayApiKey=${LOCAL_ANTHROPIC_AUTH_TOKEN}\ninferenceGatewayAuthScheme=bearer\ninferenceModels=${CLAUDE_DESKTOP_ROUTES.map(([route]) => route).join(',')}\n${claudeDesktopRoutesText()}`;
     }
     async function copyText(value, label) {
       const text = String(value || '');
@@ -4305,7 +4318,7 @@ INDEX_HTML = """<!doctype html>
       const guideAccount = document.getElementById('apiAccessGuideAccount');
       const openaiExample = document.getElementById('apiOpenAiExample');
       const claudeExample = document.getElementById('apiClaudeExample');
-      if (guideBase) guideBase.textContent = apiAccessBaseUrl(item) ? `BASE_URL: ${apiAccessBaseUrl(item)}` : 'BASE_URL: 选择账号后生成';
+      if (guideBase) guideBase.textContent = apiAccessBaseUrl(item) ? `BASE_URL: ${apiAccessBaseUrl(item)}\nDesktop Gateway: ${claudeDesktopGatewayBaseUrl(item)}` : 'BASE_URL: 选择账号后生成';
       if (guideAccount) guideAccount.textContent = item ? accountLabel(item) : '沿用上方通用 API 接入选择';
       if (openaiExample) openaiExample.textContent = apiOpenAiEnv(item);
       if (claudeExample) claudeExample.textContent = apiClaudeEnv(item);
@@ -4889,7 +4902,7 @@ INDEX_HTML = """<!doctype html>
       return copyText(apiOpenAiEnv(selectedAccount('simpleApiAccount')), 'OpenAI env');
     }
     async function copyClaudeEnv() {
-      return copyText(apiClaudeEnv(selectedAccount('simpleApiAccount')), 'Claude Desktop env');
+      return copyText(apiClaudeEnv(selectedAccount('simpleApiAccount')), 'Desktop Gateway');
     }
     async function syncClaudePlugins() {
       const res = await api('/api/sync-claude-plugins', 'POST', {});
