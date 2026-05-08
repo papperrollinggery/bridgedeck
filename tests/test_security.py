@@ -1307,7 +1307,39 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(payload["choices"][0]["message"]["content"], "hello")
         self.assertEqual(payload["choices"][0]["finish_reason"], "tool_calls")
         self.assertEqual(payload["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "lookup")
-        self.assertEqual(payload["usage"], {"input_tokens": 3, "output_tokens": 2})
+        self.assertEqual(
+            payload["usage"],
+            {
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "total_tokens": 5,
+                "input_tokens": 3,
+                "output_tokens": 2,
+            },
+        )
+
+    def test_responses_json_chat_completion_usage_never_returns_null_standard_fields(self) -> None:
+        payload = local_codex_bridge.responses_json_to_chat_completion(
+            {
+                "id": "resp_1",
+                "status": "completed",
+                "model": "gpt-5.5",
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 17,
+                    "total_tokens": 28,
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                },
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "hello"}]}],
+            }
+        )
+
+        self.assertEqual(payload["usage"]["prompt_tokens"], 11)
+        self.assertEqual(payload["usage"]["completion_tokens"], 17)
+        self.assertEqual(payload["usage"]["total_tokens"], 28)
+        self.assertIsInstance(payload["usage"]["prompt_tokens"], int)
+        self.assertIsInstance(payload["usage"]["completion_tokens"], int)
 
     def test_chat_stream_converts_response_text_delta_and_done(self) -> None:
         chunks = [

@@ -1639,7 +1639,44 @@ def responses_json_to_chat_completion(response: dict[str, Any], fallback_model: 
         "created": int(time.time()),
         "model": response.get("model") if isinstance(response.get("model"), str) else fallback_model or "gpt-5.5",
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": response.get("usage") if isinstance(response.get("usage"), dict) else None,
+        "usage": _usage_to_chat_completion(response.get("usage")),
+    }
+
+
+def _int_usage_value(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    return 0
+
+
+def _usage_to_chat_completion(usage: Any) -> dict[str, int]:
+    if not isinstance(usage, dict):
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+    prompt_tokens = _int_usage_value(usage.get("prompt_tokens"))
+    completion_tokens = _int_usage_value(usage.get("completion_tokens"))
+    input_tokens = _int_usage_value(usage.get("input_tokens"))
+    output_tokens = _int_usage_value(usage.get("output_tokens"))
+    if prompt_tokens == 0 and input_tokens:
+        prompt_tokens = input_tokens
+    if completion_tokens == 0 and output_tokens:
+        completion_tokens = output_tokens
+    total_tokens = _int_usage_value(usage.get("total_tokens"))
+    if total_tokens == 0:
+        total_tokens = prompt_tokens + completion_tokens
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "input_tokens": input_tokens or prompt_tokens,
+        "output_tokens": output_tokens or completion_tokens,
     }
 
 
