@@ -4263,7 +4263,7 @@ INDEX_HTML = """<!doctype html>
       return item && item.account_id ? `${LOCAL_BRIDGE_BASE_URL}/accounts/${encodeURIComponent(item.account_id)}` : '';
     }
     function claudeDesktopRoutesText() {
-      return CLAUDE_DESKTOP_ROUTES.map(([route, target]) => `${route} -> ${target}`).join('\n');
+      return CLAUDE_DESKTOP_ROUTES.map(([route, target]) => `${route} -> ${target}`).join('\\n');
     }
     function apiAccessEnv(item) {
       const baseUrl = apiAccessBaseUrl(item);

@@ -101,7 +101,7 @@ ui_running() {
 open_ui() {
   local open_url="$APP_URL/?t=$(/bin/date +%s)"
   log_event "open_ui $open_url"
-  /usr/bin/open "$open_url" >/dev/null 2>&1 &
+  /usr/bin/open "$open_url" >/dev/null 2>&1
 }
 
 start_ui() {
@@ -117,14 +117,57 @@ start_ui() {
   open_ui
 }
 
+stop_ui_keep_bridge() {
+  log_event "stop_ui_keep_bridge"
+  for pid in $(/usr/sbin/lsof -tiTCP:8899 -sTCP:LISTEN 2>/dev/null); do
+    cmd="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$cmd" == *"bridgedeck.py"* ]]; then
+      /bin/kill "$pid" 2>/dev/null || true
+    fi
+  done
+  /usr/bin/osascript -e 'display notification "8876 Local Bridge 继续运行" with title "BridgeDeck UI 已关闭"' >/dev/null 2>&1 || true
+}
+
+start_bridge_only() {
+  log_event "start_bridge_only"
+  CODEX_BRIDGE_SCRIPT="$RESOURCE_DIR/local_codex_bridge.py" "$(python_bin)" "$RESOURCE_DIR/bridgedeck.py" --local-bridge start >> "$LOG_FILE" 2>&1 &
+  /usr/bin/osascript -e 'display notification "8876 Local Bridge 已启动或已在运行" with title "BridgeDeck"' >/dev/null 2>&1 || true
+}
+
 if ui_running; then
   log_event "launcher_start ui_running=1"
-  open_ui
+  choice="$(/usr/bin/osascript <<'APPLESCRIPT' 2>/dev/null || true
+button returned of (display dialog "BridgeDeck UI (8899) 已在运行。" buttons {"取消", "关闭 UI 保留 Bridge", "打开 UI"} default button "打开 UI" cancel button "取消" with title "BridgeDeck")
+APPLESCRIPT
+)"
+  log_event "dialog_choice=${choice:-<empty>}"
+  case "$choice" in
+    "打开 UI") open_ui ;;
+    "关闭 UI 保留 Bridge") stop_ui_keep_bridge ;;
+    "") log_event "dialog_empty_fallback=open_ui"; open_ui ;;
+    *) exit 0 ;;
+  esac
 else
   log_event "launcher_start ui_running=0"
-  start_ui
+  choice="$(/usr/bin/osascript <<'APPLESCRIPT' 2>/dev/null || true
+button returned of (display dialog "BridgeDeck UI 未运行。要打开配置页，还是只启动 8876 Local Bridge？" buttons {"取消", "只启动 Bridge", "打开 UI"} default button "打开 UI" cancel button "取消" with title "BridgeDeck")
+APPLESCRIPT
+)"
+  log_event "dialog_choice=${choice:-<empty>}"
+  case "$choice" in
+    "打开 UI") start_ui ;;
+    "只启动 Bridge") start_bridge_only ;;
+    "") log_event "dialog_empty_fallback=start_ui"; start_ui ;;
+    *) exit 0 ;;
+  esac
 fi
 LAUNCHER
+if command -v swiftc >/dev/null 2>&1; then
+  TMP_LAUNCHER="$(mktemp /tmp/bridgedeck-launcher.XXXXXX)"
+  swiftc "$ROOT/BridgeDeckLauncher.swift" -o "$TMP_LAUNCHER"
+  cp "$TMP_LAUNCHER" "$MACOS/launcher"
+  rm -f "$TMP_LAUNCHER"
+fi
 chmod +x "$MACOS/launcher"
 
 /usr/bin/hdiutil create -volname "$APP_NAME" -srcfolder "$APP_DIR" -ov -format UDZO "$DMG"

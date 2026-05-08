@@ -39,6 +39,15 @@ func log(_ message: String) {
     }
 }
 
+func pythonBin() -> String {
+    for candidate in ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"] {
+        if FileManager.default.isExecutableFile(atPath: candidate) {
+            return candidate
+        }
+    }
+    return "/usr/bin/python3"
+}
+
 @discardableResult
 func runProcess(_ executable: String, _ arguments: [String], environment: [String: String]? = nil, wait: Bool = true, logOutput: Bool = false) -> Int32 {
     let process = Process()
@@ -55,8 +64,9 @@ func runProcess(_ executable: String, _ arguments: [String], environment: [Strin
         process.standardOutput = handle
         process.standardError = handle
     } else {
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
+        handle = FileHandle(forWritingAtPath: "/dev/null")
+        process.standardOutput = handle
+        process.standardError = handle
     }
     do {
         try process.run()
@@ -95,15 +105,16 @@ func uiRunning() -> Bool {
 }
 
 func openUI() {
-    log("open_ui \(appURL)")
-    if let url = URL(string: appURL) {
+    let openURL = "\(appURL)/?t=\(Int(Date().timeIntervalSince1970))"
+    log("open_ui \(openURL)")
+    if let url = URL(string: openURL) {
         NSWorkspace.shared.open(url)
     }
 }
 
 func startUI() {
     log("start_ui")
-    runProcess("/usr/bin/python3", [bridgeDeckScript, "--host", "127.0.0.1", "--port", "\(uiPort)"], wait: false, logOutput: true)
+    runProcess(pythonBin(), [bridgeDeckScript, "--host", "127.0.0.1", "--port", "\(uiPort)"], wait: false, logOutput: true)
     for _ in 0..<20 {
         if uiRunning() {
             openUI()
@@ -129,7 +140,7 @@ func stopUIKeepBridge() {
 func startBridgeOnly() {
     log("start_bridge_only")
     runProcess(
-        "/usr/bin/python3",
+        pythonBin(),
         [bridgeDeckScript, "--local-bridge", "start"],
         environment: ["CODEX_BRIDGE_SCRIPT": localBridgeScript],
         wait: true,
@@ -138,14 +149,16 @@ func startBridgeOnly() {
 }
 
 func showAlert(title: String, message: String, buttons: [String]) -> NSApplication.ModalResponse {
-    NSApplication.shared.setActivationPolicy(.accessory)
-    NSApplication.shared.activate(ignoringOtherApps: true)
     let alert = NSAlert()
     alert.messageText = title
     alert.informativeText = message
     for button in buttons {
         alert.addButton(withTitle: button)
     }
+    NSApplication.shared.setActivationPolicy(.regular)
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    alert.window.level = .floating
+    alert.window.orderFrontRegardless()
     return alert.runModal()
 }
 
