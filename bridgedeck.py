@@ -1180,6 +1180,7 @@ class BridgeManager:
         return data
 
     def _list_codex_providers(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        known_account_ids = {item["account_id"] for item in self._load_accounts()}
         rows = conn.execute(
             """
             SELECT id, name, provider_type, is_current, sort_index, meta, settings_config
@@ -1196,7 +1197,13 @@ class BridgeManager:
             auth = settings.get("auth") if isinstance(settings.get("auth"), dict) else {}
             tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
             meta_account = binding.get("accountId") if isinstance(binding.get("accountId"), str) else ""
-            token_account = tokens.get("account_id") if isinstance(tokens.get("account_id"), str) else ""
+            embedded_token_account = tokens.get("account_id") if isinstance(tokens.get("account_id"), str) else ""
+            uses_managed_auth_store = (
+                binding.get("source") == "managed_account"
+                and binding.get("authProvider") == "codex_oauth"
+                and meta_account in known_account_ids
+            )
+            token_account = meta_account if uses_managed_auth_store else embedded_token_account
             refresh_token = tokens.get("refresh_token") if isinstance(tokens.get("refresh_token"), str) else ""
             providers.append(
                 {
@@ -1208,6 +1215,14 @@ class BridgeManager:
                     "meta_provider_type": meta.get("providerType") if isinstance(meta.get("providerType"), str) else "",
                     "meta_account_id": meta_account,
                     "token_account_id": token_account,
+                    "embedded_token_account_id": embedded_token_account,
+                    "uses_managed_auth_store": uses_managed_auth_store,
+                    "embedded_token_stale": bool(
+                        uses_managed_auth_store
+                        and embedded_token_account
+                        and meta_account
+                        and embedded_token_account != meta_account
+                    ),
                     "refresh_sha12": sha12(refresh_token),
                     "token_mismatch": bool(meta_account and token_account and meta_account != token_account),
                 }
@@ -3181,6 +3196,7 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(provider, dict):
             provider["meta_account_id"] = mask_id_value(provider.get("meta_account_id"))
             provider["token_account_id"] = mask_id_value(provider.get("token_account_id"))
+            provider["embedded_token_account_id"] = mask_id_value(provider.get("embedded_token_account_id"))
     for home in redacted.get("cli_homes", []):
         if isinstance(home, dict):
             home["path"] = redact_path_value(home.get("path"))

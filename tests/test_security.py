@@ -2243,6 +2243,64 @@ class LauncherCase(unittest.TestCase):
             )
         )
 
+    def test_managed_codex_provider_uses_auth_store_binding_over_embedded_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(manager.paths.db) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE providers (
+                        id TEXT NOT NULL,
+                        app_type TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        settings_config TEXT NOT NULL,
+                        meta TEXT NOT NULL,
+                        provider_type TEXT,
+                        is_current BOOLEAN NOT NULL DEFAULT 0,
+                        sort_index INTEGER
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO providers (
+                        id, app_type, name, settings_config, meta, provider_type, is_current, sort_index
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "codex-1",
+                        "codex",
+                        "OpenAI PRO",
+                        json.dumps(
+                            {"auth": {"tokens": {"account_id": "acct-2", "refresh_token": "old-token"}}}
+                        ),
+                        json.dumps(
+                            {
+                                "authBinding": {
+                                    "source": "managed_account",
+                                    "authProvider": "codex_oauth",
+                                    "accountId": "acct-1",
+                                }
+                            }
+                        ),
+                        "codex_oauth",
+                        1,
+                        1,
+                    ),
+                )
+
+            with manager._connect() as conn:
+                providers = manager._list_codex_providers(conn)
+
+        self.assertEqual(providers[0]["meta_account_id"], "acct-1")
+        self.assertEqual(providers[0]["token_account_id"], "acct-1")
+        self.assertEqual(providers[0]["embedded_token_account_id"], "acct-2")
+        self.assertTrue(providers[0]["uses_managed_auth_store"])
+        self.assertTrue(providers[0]["embedded_token_stale"])
+        self.assertFalse(providers[0]["token_mismatch"])
+
     def test_create_cli_launcher_does_not_refresh_or_write_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
