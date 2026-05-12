@@ -729,11 +729,18 @@ def terminal_stream_error_from_payload(event_name: str | None, payload: dict[str
     return TerminalStreamError(str(message))
 
 
-def record_bridge_stream_error(payload: dict[str, Any]) -> None:
-    state = {
-        "updated_at": int(time.time()),
-        "last_stream_error": payload,
-    }
+def _read_bridge_state() -> dict[str, Any]:
+    if not BRIDGE_STATE_PATH.exists() or BRIDGE_STATE_PATH.is_symlink():
+        return {}
+    try:
+        payload = json.loads(BRIDGE_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_bridge_state(state: dict[str, Any]) -> None:
+    state["updated_at"] = int(time.time())
     try:
         BRIDGE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = BRIDGE_STATE_PATH.with_name(
@@ -754,6 +761,73 @@ def record_bridge_stream_error(payload: dict[str, Any]) -> None:
             f"{log_timestamp()} [bridge-state-error] type={type(exc).__name__} detail={truncate_log_text(str(exc))}",
             file=sys.stderr,
         )
+
+
+def record_bridge_stream_error(payload: dict[str, Any]) -> None:
+    state = _read_bridge_state()
+    state["last_stream_error"] = payload
+    _write_bridge_state(state)
+
+
+def _usage_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(value))
+    return 0
+
+
+def _extract_usage_counts(usage: Any) -> dict[str, int]:
+    if not isinstance(usage, dict):
+        return {}
+    input_tokens = _usage_int(usage.get("input_tokens") or usage.get("prompt_tokens"))
+    output_tokens = _usage_int(usage.get("output_tokens") or usage.get("completion_tokens"))
+    total_tokens = _usage_int(usage.get("total_tokens")) or input_tokens + output_tokens
+    input_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+    cache_details = usage.get("cache_creation_input_tokens_details") if isinstance(usage.get("cache_creation_input_tokens_details"), dict) else {}
+    cached_tokens = _usage_int(usage.get("cached_tokens") or input_details.get("cached_tokens"))
+    cache_creation_tokens = _usage_int(usage.get("cache_creation_tokens") or cache_details.get("cache_creation_tokens"))
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cached_tokens": cached_tokens,
+        "cache_creation_tokens": cache_creation_tokens,
+    }
+
+
+def _usage_from_payload(payload: Any) -> dict[str, int]:
+    if not isinstance(payload, dict):
+        return {}
+    response = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+    return _extract_usage_counts(response.get("usage") if isinstance(response, dict) else None)
+
+
+def record_bridge_usage(
+    *,
+    account_id: str,
+    model: str | None,
+    request_type: str,
+    request_id: str,
+    usage: Any,
+) -> None:
+    counts = _extract_usage_counts(usage)
+    if not counts or not any(counts.values()):
+        return
+    state = _read_bridge_state()
+    metrics = state.get("usage_metrics") if isinstance(state.get("usage_metrics"), dict) else {}
+    for key in ("input_tokens", "output_tokens", "total_tokens", "cached_tokens", "cache_creation_tokens"):
+        metrics[key] = _usage_int(metrics.get(key)) + counts[key]
+    metrics["request_count"] = _usage_int(metrics.get("request_count")) + 1
+    metrics["last_account_id"] = account_id
+    metrics["last_model"] = model or ""
+    metrics["last_request_type"] = request_type
+    metrics["last_request_id"] = request_id
+    metrics["last_updated_at"] = int(time.time())
+    state["usage_metrics"] = metrics
+    _write_bridge_state(state)
 
 
 def log_bridge_stream_error(
@@ -2195,6 +2269,13 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             response_body = json.loads(
                                 build_non_stream_json_from_sse(body, requested_model).decode("utf-8")
                             )
+                            record_bridge_usage(
+                                account_id=account_id,
+                                model=requested_model,
+                                request_type=request_type,
+                                request_id=request_id,
+                                usage=response_body.get("usage") if isinstance(response_body, dict) else None,
+                            )
                             if output_format == "messages":
                                 response_body = responses_json_to_anthropic_message(response_body, requested_model)
                             elif output_format == "chat":
@@ -2386,6 +2467,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         metrics = metrics or BridgeStreamMetrics()
         committed = False
         pending_chunks: list[bytes] = []
+        usage_recorded = False
 
         try:
             while True:
@@ -2474,6 +2556,17 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
 
                 state.last_upstream_at = time.monotonic()
                 event_name, payload, _data_lines = self._parse_sse_block(queued)
+                if not usage_recorded and event_name == "response.completed":
+                    usage_counts = _usage_from_payload(payload)
+                    if usage_counts:
+                        record_bridge_usage(
+                            account_id=account_id,
+                            model=requested_model,
+                            request_type="responses",
+                            request_id=stream_request_id,
+                            usage=usage_counts,
+                        )
+                        usage_recorded = True
                 terminal_error = terminal_stream_error_from_payload(event_name, payload)
                 if terminal_error is not None and not committed and is_retryable_terminal_stream_error(terminal_error):
                     metrics.upstream_events += 1

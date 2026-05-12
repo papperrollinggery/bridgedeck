@@ -144,6 +144,16 @@ class FakeManager:
                 "shims": [],
                 "risk_flags": ["omc_codex_shim_missing"],
             },
+            "usage_metrics": {
+                "request_count": 3,
+                "input_tokens": 1200,
+                "output_tokens": 340,
+                "total_tokens": 1540,
+                "cached_tokens": 900,
+                "cache_creation_tokens": 100,
+                "last_account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                "last_model": "gpt-5.5",
+            },
             "account_matrix": [],
             "current_provider_from_settings": "",
         }
@@ -1341,6 +1351,38 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIsInstance(payload["usage"]["prompt_tokens"], int)
         self.assertIsInstance(payload["usage"]["completion_tokens"], int)
 
+    def test_record_bridge_usage_accumulates_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "bridge-state.json"
+            with mock.patch.object(local_codex_bridge, "BRIDGE_STATE_PATH", state_path):
+                local_codex_bridge.record_bridge_usage(
+                    account_id="acct-1",
+                    model="gpt-5.5",
+                    request_type="responses",
+                    request_id="req-1",
+                    usage={
+                        "input_tokens": 11,
+                        "output_tokens": 7,
+                        "input_tokens_details": {"cached_tokens": 5},
+                    },
+                )
+                local_codex_bridge.record_bridge_usage(
+                    account_id="acct-1",
+                    model="gpt-5.5",
+                    request_type="chat.completions",
+                    request_id="req-2",
+                    usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                )
+
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["usage_metrics"]["request_count"], 2)
+        self.assertEqual(payload["usage_metrics"]["input_tokens"], 14)
+        self.assertEqual(payload["usage_metrics"]["output_tokens"], 9)
+        self.assertEqual(payload["usage_metrics"]["total_tokens"], 23)
+        self.assertEqual(payload["usage_metrics"]["cached_tokens"], 5)
+        self.assertEqual(payload["usage_metrics"]["last_request_type"], "chat.completions")
+
     def test_chat_stream_converts_response_text_delta_and_done(self) -> None:
         chunks = [
             (
@@ -1548,6 +1590,33 @@ class LocalCodexBridgeCase(unittest.TestCase):
 
         self.assertEqual(payload["last_stream_error"]["error_type"], "RemoteProtocolError")
         self.assertEqual(payload["last_stream_error"]["request_id"], "bridge-test")
+
+    def test_bridge_state_reads_usage_metrics_without_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": 123,
+                        "usage_metrics": {
+                            "request_count": 2,
+                            "input_tokens": 11,
+                            "output_tokens": 7,
+                            "total_tokens": 18,
+                            "cached_tokens": 5,
+                            "cache_creation_tokens": 3,
+                            "last_model": "gpt-5.5",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = bridgedeck.read_local_bridge_state(state_path)
+
+        self.assertEqual(payload["usage_metrics"]["request_count"], 2)
+        self.assertEqual(payload["usage_metrics"]["total_tokens"], 18)
+        self.assertEqual(payload["usage_metrics"]["cached_tokens"], 5)
 
 
 class ServerCase(unittest.TestCase):
@@ -1939,6 +2008,8 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(payload["providers"][0]["account_id"], "01234567...cdef")
         self.assertIn("/accounts/<redacted>", payload["providers"][0]["base_url"])
         self.assertEqual(payload["cli_homes"][0]["path"], "~/.codex")
+        self.assertEqual(payload["usage_metrics"]["last_account_id"], "01234567...cdef")
+        self.assertEqual(payload["usage_metrics"]["total_tokens"], 1540)
 
     def test_cross_site_fetch_metadata_is_rejected(self) -> None:
         server, manager = self.start_server()

@@ -530,6 +530,15 @@ def probe_remote_url(
         }
 
 
+def safe_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dict[str, Any]:
     if not path.exists() or path.is_symlink():
         return {}
@@ -539,12 +548,26 @@ def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dic
         return {}
     if not isinstance(payload, dict):
         return {}
+    state: dict[str, Any] = {"updated_at": payload.get("updated_at")}
+    usage = payload.get("usage_metrics") if isinstance(payload.get("usage_metrics"), dict) else {}
+    if usage:
+        state["usage_metrics"] = {
+            "request_count": safe_int(usage.get("request_count"), 0),
+            "input_tokens": safe_int(usage.get("input_tokens"), 0),
+            "output_tokens": safe_int(usage.get("output_tokens"), 0),
+            "total_tokens": safe_int(usage.get("total_tokens"), 0),
+            "cached_tokens": safe_int(usage.get("cached_tokens"), 0),
+            "cache_creation_tokens": safe_int(usage.get("cache_creation_tokens"), 0),
+            "last_account_id": str(usage.get("last_account_id") or ""),
+            "last_model": str(usage.get("last_model") or ""),
+            "last_request_type": str(usage.get("last_request_type") or ""),
+            "last_request_id": str(usage.get("last_request_id") or ""),
+            "last_updated_at": usage.get("last_updated_at"),
+        }
     error = payload.get("last_stream_error")
     if not isinstance(error, dict):
-        return {}
-    return {
-        "updated_at": payload.get("updated_at"),
-        "last_stream_error": {
+        return state
+    state["last_stream_error"] = {
             "account_id": str(error.get("account_id") or ""),
             "model": str(error.get("model") or ""),
             "request_id": str(error.get("request_id") or ""),
@@ -552,8 +575,8 @@ def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dic
             "error_type": str(error.get("error_type") or ""),
             "error": str(error.get("error") or ""),
             "upstream_request_id": str(error.get("upstream_request_id") or ""),
-        },
     }
+    return state
 
 
 def mask_url_credentials(value: str) -> str:
@@ -2115,6 +2138,7 @@ class BridgeManager:
             "codex_desktop": self._codex_desktop_status(),
             "current_codex_launcher": self._current_codex_launcher_status(),
             "omc_codex_shim": self._omc_codex_shim_status(),
+            "usage_metrics": read_local_bridge_state().get("usage_metrics", {}),
             "account_matrix": [],
             "current_provider_from_settings": self._current_provider_from_settings(),
             "auto_switch": self._load_auto_switch_config(),
@@ -3225,6 +3249,9 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             stream_error = service.get("last_stream_error")
             if isinstance(stream_error, dict):
                 stream_error["account_id"] = mask_id_value(stream_error.get("account_id"))
+    usage_metrics = redacted.get("usage_metrics")
+    if isinstance(usage_metrics, dict):
+        usage_metrics["last_account_id"] = mask_id_value(usage_metrics.get("last_account_id"))
     codex_auth = redacted.get("codex_auth")
     if isinstance(codex_auth, dict):
         codex_auth.pop("path", None)
@@ -3329,6 +3356,28 @@ INDEX_HTML = """<!doctype html>
     .tile { border:1px solid var(--line); border-radius:8px; padding:12px; background:var(--panel2); min-height:76px; }
     .tileLabel { color:var(--muted); font-size:12px; margin-bottom:6px; }
     .tileValue { font-size:24px; font-weight:850; }
+    .metricGrid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; margin-top:12px; }
+    .metricCard { border:1px solid var(--line); border-radius:8px; padding:16px; min-height:148px; background:linear-gradient(180deg, #171a21 0%, #121722 100%); display:grid; align-content:space-between; gap:12px; }
+    .metricHead { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--muted); font-size:15px; font-weight:850; }
+    .metricIcon { width:34px; height:34px; border-radius:12px; display:grid; place-items:center; font-size:18px; background:#18263a; color:var(--brand2); }
+    .metricIcon.ok { background:#132b21; color:#53e5a0; }
+    .metricIcon.warn { background:#352711; color:#ffd070; }
+    .metricIcon.bad { background:#351717; color:#ff8e8e; }
+    .metricValue { font-size:32px; line-height:1; font-weight:900; letter-spacing:0; }
+    .metricSub { border-top:1px solid var(--line); padding-top:10px; display:grid; gap:5px; color:var(--muted); font-size:12px; }
+    .metricLine { display:flex; justify-content:space-between; gap:10px; }
+    .overviewGrid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; margin-top:12px; }
+    .overviewCard { border:1px solid var(--line); border-radius:8px; padding:13px; background:var(--panel2); min-height:122px; display:grid; gap:8px; align-content:start; }
+    .overviewLabel { color:var(--muted); font-size:12px; font-weight:850; }
+    .overviewMain { font-size:16px; font-weight:850; overflow-wrap:anywhere; }
+    .overviewMeta { color:var(--muted); font-size:12px; line-height:1.45; overflow-wrap:anywhere; }
+    .taskList { display:grid; gap:8px; }
+    .taskItem { border:1px solid var(--line); border-radius:8px; padding:9px 10px; background:#0d1320; color:var(--soft); font-size:12px; line-height:1.45; }
+    .taskItem.bad { border-color:#743333; background:#241313; color:#ffc0c0; }
+    .taskItem.warn { border-color:#73551c; background:#21190d; color:#ffe0a3; }
+    .taskItem.ok { border-color:#245f43; background:#102318; color:#a6f3c6; }
+    .quickActions { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
+    .quickActions button { min-height:38px; font-weight:800; }
     .summaryGrid, .splitGrid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; }
     .recommend { margin-top:10px; padding:12px; border:1px solid var(--line); border-radius:8px; background:var(--panel2); line-height:1.55; }
     .recommend.okState { border-color:#255c43; background:#0f2018; }
@@ -3407,7 +3456,7 @@ INDEX_HTML = """<!doctype html>
       .appShell { grid-template-columns:1fr; }
       .appSidebar { position:static; height:auto; }
       .sideNav { grid-template-columns:repeat(2, minmax(0, 1fr)); }
-      .topGrid, .summaryGrid, .splitGrid, .formGrid { grid-template-columns:1fr; }
+      .topGrid, .metricGrid, .overviewGrid, .summaryGrid, .splitGrid, .formGrid, .quickActions { grid-template-columns:1fr; }
       .topBar { flex-direction:column; }
       input, select { min-width:0; width:100%; }
     }
@@ -3468,7 +3517,73 @@ INDEX_HTML = """<!doctype html>
               <div class="tile"><div class="tileLabel">账号不一致</div><div id="tileMismatches" class="tileValue">-</div></div>
               <div class="tile"><div class="tileLabel">CLI 配置</div><div id="tileCliHomes" class="tileValue">-</div></div>
             </div>
+            <div class="metricGrid">
+              <div class="metricCard">
+                <div class="metricHead"><span>账号状态</span><span id="metricAccountIcon" class="metricIcon ok">✓</span></div>
+                <div id="metricAccountValue" class="metricValue">-</div>
+                <div class="metricSub">
+                  <div class="metricLine"><span>正常</span><strong id="metricAccountOk">-</strong></div>
+                  <div class="metricLine"><span>需处理</span><strong id="metricAccountRisk">-</strong></div>
+                </div>
+              </div>
+              <div class="metricCard">
+                <div class="metricHead"><span>额度消耗</span><span id="metricQuotaIcon" class="metricIcon">▣</span></div>
+                <div id="metricQuotaValue" class="metricValue">-</div>
+                <div class="metricSub">
+                  <div class="metricLine"><span>当前账号</span><strong id="metricQuotaAccount">-</strong></div>
+                  <div class="metricLine"><span>剩余单位</span><strong id="metricQuotaRemaining">-</strong></div>
+                </div>
+              </div>
+              <div class="metricCard">
+                <div class="metricHead"><span>Token 用量</span><span class="metricIcon">◇</span></div>
+                <div id="metricTokenValue" class="metricValue">未采集</div>
+                <div class="metricSub">
+                  <div class="metricLine"><span>Input</span><strong id="metricTokenInput">-</strong></div>
+                  <div class="metricLine"><span>Output</span><strong id="metricTokenOutput">-</strong></div>
+                </div>
+              </div>
+              <div class="metricCard">
+                <div class="metricHead"><span>缓存 Token</span><span class="metricIcon warn">◎</span></div>
+                <div id="metricCacheValue" class="metricValue">未采集</div>
+                <div class="metricSub">
+                  <div class="metricLine"><span>创建</span><strong id="metricCacheCreate">-</strong></div>
+                  <div class="metricLine"><span>命中</span><strong id="metricCacheHit">-</strong></div>
+                </div>
+              </div>
+            </div>
+            <div class="overviewGrid">
+              <div class="overviewCard">
+                <div class="overviewLabel">Claude Code</div>
+                <div id="overviewClaudeMain" class="overviewMain">检测中...</div>
+                <div id="overviewClaudeMeta" class="overviewMeta">-</div>
+              </div>
+              <div class="overviewCard">
+                <div class="overviewLabel">全局 Codex CLI / Desktop</div>
+                <div id="overviewDesktopMain" class="overviewMain">检测中...</div>
+                <div id="overviewDesktopMeta" class="overviewMeta">-</div>
+              </div>
+              <div class="overviewCard">
+                <div class="overviewLabel">OMC / tmux 固定入口</div>
+                <div id="overviewOmniMain" class="overviewMain">检测中...</div>
+                <div id="overviewOmniMeta" class="overviewMeta">-</div>
+              </div>
+            </div>
             <div id="recommendation" class="recommend">加载中...</div>
+            <div class="summaryGrid mt10">
+              <div class="panel">
+                <h2>待处理事项</h2>
+                <div id="overviewTasks" class="taskList"><div class="taskItem">检测中...</div></div>
+              </div>
+              <div class="panel">
+                <h2>快捷动作</h2>
+                <div class="quickActions">
+                  <button class="miniBtn" data-page="switching">入口切换</button>
+                  <button class="miniBtn" data-page="quota">额度详情</button>
+                  <button class="miniBtn" data-page="diagnostics">账号矩阵</button>
+                  <button class="miniBtn" data-page="services">服务状态</button>
+                </div>
+              </div>
+            </div>
             <div class="summaryGrid mt10">
               <div class="panel guideSection" data-guide="simpleFlow">
                 <h2>当前实际使用</h2>
@@ -4048,10 +4163,16 @@ INDEX_HTML = """<!doctype html>
       if (account) return accountLabel(account);
       return maskId(accountId || '');
     }
+    function desktopUnmappedText(desktop) {
+      const mode = statusText(desktop.managed_by || 'unknown');
+      if (!desktop.detected) return '未检测';
+      if (desktop.managed_by === 'default') return '默认配置 / 账号未映射';
+      return `${mode || '未知配置'} / 账号未映射`;
+    }
     function desktopAccountText(data) {
       const desktop = data.codex_desktop || {};
       if (desktop.account_id) return accountDisplay(desktop.account_id);
-      return statusText(desktop.managed_by || 'unknown');
+      return desktopUnmappedText(desktop);
     }
     function desktopModeText(data) {
       const desktop = data.codex_desktop || {};
@@ -4074,6 +4195,87 @@ INDEX_HTML = """<!doctype html>
     function omcShimText(data) {
       const shim = data.omc_codex_shim || {};
       return shim.active ? 'OMC/tmux 已接管 codex' : 'OMC/tmux 未接管 codex';
+    }
+    function fmtMetricNumber(value) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return '-';
+      return new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(num);
+    }
+    function setMetricIcon(id, state) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.className = `metricIcon ${state || ''}`.trim();
+    }
+    function setText(id, value) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = value;
+    }
+    function renderOverviewDashboard(data) {
+      const rows = data.account_matrix || [];
+      const riskRows = rows.filter((row) => row.account_status && row.account_status !== 'ok');
+      const okRows = rows.filter((row) => !row.account_status || row.account_status === 'ok');
+      setText('metricAccountValue', `${okRows.length}/${data.accounts.length || 0}`);
+      setText('metricAccountOk', okRows.length);
+      setText('metricAccountRisk', riskRows.length);
+      setMetricIcon('metricAccountIcon', riskRows.length ? 'bad' : 'ok');
+
+      const usage = data.usage_metrics || {};
+      const totalTokens = Number(usage.total_tokens);
+      const inputTokens = Number(usage.input_tokens);
+      const outputTokens = Number(usage.output_tokens);
+      setText('metricTokenValue', Number.isFinite(totalTokens) && totalTokens > 0 ? fmtMetricNumber(totalTokens) : '未采集');
+      setText('metricTokenInput', Number.isFinite(inputTokens) && inputTokens > 0 ? fmtMetricNumber(inputTokens) : '-');
+      setText('metricTokenOutput', Number.isFinite(outputTokens) && outputTokens > 0 ? fmtMetricNumber(outputTokens) : '-');
+      setText('metricCacheValue', Number.isFinite(Number(usage.cached_tokens)) && Number(usage.cached_tokens) > 0 ? fmtMetricNumber(usage.cached_tokens) : '未采集');
+      setText('metricCacheCreate', Number.isFinite(Number(usage.cache_creation_tokens)) && Number(usage.cache_creation_tokens) > 0 ? fmtMetricNumber(usage.cache_creation_tokens) : '-');
+      setText('metricCacheHit', Number.isFinite(Number(usage.cached_tokens)) && Number(usage.cached_tokens) > 0 ? fmtMetricNumber(usage.cached_tokens) : '-');
+
+      const provider = currentClaudeProvider(data);
+      const claudeAccount = provider && provider.account_id ? accountDisplay(provider.account_id) : '外部供应商/未检测到';
+      setText('overviewClaudeMain', claudeAccount);
+      setText('overviewClaudeMeta', provider ? `${provider.name || 'Claude Provider'} / ${provider.model || '未指定模型'}` : '未检测到当前 Claude Provider');
+      setText('overviewDesktopMain', desktopAccountText(data));
+      setText('overviewDesktopMeta', desktopModeText(data));
+      setText('overviewOmniMain', currentLauncherAccountText(data));
+      setText('overviewOmniMeta', `${currentLauncherModeText(data)}；${omcShimText(data)}`);
+
+      const tasks = [];
+      const mismatches = data.codex_providers.filter((p) => p.token_mismatch);
+      mismatches.forEach((p) => {
+        tasks.push({ cls: 'bad', text: `${p.name}: 绑定 ${maskId(p.meta_account_id || '')}，实际 ${maskId(p.token_account_id || '')}` });
+      });
+      const desktop = data.codex_desktop || {};
+      if (desktop.detected && !desktop.account_id) {
+        tasks.push({ cls: 'warn', text: `Desktop/默认 CLI：${desktopUnmappedText(desktop)}，固定入口仍可走 ${currentLauncherAccountText(data)}` });
+      }
+      if (!tasks.length) {
+        tasks.push({ cls: 'ok', text: '账号、入口和 provider 绑定未发现阻断项。' });
+      }
+      const taskBox = document.getElementById('overviewTasks');
+      if (taskBox) {
+        taskBox.innerHTML = tasks.map((item) => `<div class="taskItem ${item.cls}">${esc(item.text)}</div>`).join('');
+      }
+    }
+    function renderOverviewQuotaMetrics(payload) {
+      const quotas = payload && Array.isArray(payload.quotas) ? payload.quotas : [];
+      if (!quotas.length) {
+        setText('metricQuotaValue', '未返回');
+        setText('metricQuotaAccount', '-');
+        setText('metricQuotaRemaining', '-');
+        setMetricIcon('metricQuotaIcon', 'warn');
+        return;
+      }
+      const current = currentClaudeProvider(lastData || {});
+      const currentQuota = quotas.find((q) => current && q.account_id === current.account_id) || quotas[0];
+      const usedValues = (currentQuota.windows || [])
+        .map((w) => Number(w.used_percent))
+        .filter((value) => Number.isFinite(value));
+      const maxUsed = usedValues.length ? Math.max(...usedValues) : NaN;
+      setText('metricQuotaValue', Number.isFinite(maxUsed) ? `${fmtMetricNumber(maxUsed)}%` : '未返回');
+      setText('metricQuotaAccount', maskEmail(currentQuota.email || currentQuota.label || maskId(currentQuota.account_id || '')));
+      const remaining = Number(currentQuota.effective_remaining_units);
+      setText('metricQuotaRemaining', Number.isFinite(remaining) ? fmtMetricNumber(remaining) : '-');
+      setMetricIcon('metricQuotaIcon', currentQuota.quota_status === 'limit_reached' ? 'bad' : (currentQuota.quota_status === 'near_limit' ? 'warn' : 'ok'));
     }
     function renderActualCurrentAccounts(data) {
       const box = document.getElementById('actualCurrentAccounts');
@@ -4262,9 +4464,14 @@ INDEX_HTML = """<!doctype html>
         const payload = await api('/api/quotas');
         renderQuotaBoard(payload);
         renderMissingBridgeStatus(payload);
+        renderOverviewQuotaMetrics(payload);
         return payload;
       } catch (e) {
         document.getElementById('quotaBoard').textContent = `额度查询失败: ${e.message}`;
+        setText('metricQuotaValue', '查询失败');
+        setText('metricQuotaAccount', '-');
+        setText('metricQuotaRemaining', '-');
+        setMetricIcon('metricQuotaIcon', 'bad');
         return null;
       }
     }
@@ -4886,7 +5093,12 @@ INDEX_HTML = """<!doctype html>
         unsupported_region: '地区受限',
         bridge_down: 'bridge 断开',
         proxy_down: 'CC Switch 断开',
-        stale_launcher: '旧 CLI token'
+        stale_launcher: '旧 CLI token',
+        default: '默认配置',
+        custom: '自定义配置',
+        cc_switch: 'CC Switch',
+        bridgedeck_or_local_bridge: 'BridgeDeck 本地桥',
+        unknown: '未知'
       };
       return map[value] || value || '';
     }
@@ -4895,7 +5107,7 @@ INDEX_HTML = """<!doctype html>
       body.innerHTML = '';
       const desktop = data.codex_desktop || {};
       const desktopAccount = desktop.account_id || '';
-      const desktopUnknown = desktop.detected ? '未识别' : '未检测';
+      const desktopUnknown = desktopUnmappedText(desktop);
       (data.account_matrix || []).forEach((row) => {
         const status = row.account_status || 'ok';
         const cls = status === 'ok' ? 'ok' : (status === 'stale_launcher' ? 'warnText' : 'bad');
@@ -5024,6 +5236,7 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('status').innerHTML = `版本: <b>${esc(data.version || '')}</b> | 账号: <b>${data.accounts.length}</b> | Claude providers: <b>${data.providers.length}</b> | Codex mismatches: <b class="${mismatches ? 'bad' : 'ok'}">${mismatches}</b>`;
       document.getElementById('paths').textContent = `db: ${humanPath(data.paths.db)}\\nsettings: ${humanPath(data.paths.settings)}\\nauth_store: ${humanPath(data.paths.auth_store)}`;
       renderHealth(data);
+      renderOverviewDashboard(data);
       renderAccounts(data);
       renderAccountMatrix(data);
       renderProviders(data);
