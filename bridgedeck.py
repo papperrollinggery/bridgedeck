@@ -3519,11 +3519,11 @@ INDEX_HTML = """<!doctype html>
             </div>
             <div class="metricGrid">
               <div class="metricCard">
-                <div class="metricHead"><span>账号状态</span><span id="metricAccountIcon" class="metricIcon ok">✓</span></div>
+                <div class="metricHead"><span>Provider 匹配</span><span id="metricAccountIcon" class="metricIcon ok">✓</span></div>
                 <div id="metricAccountValue" class="metricValue">-</div>
                 <div class="metricSub">
-                  <div class="metricLine"><span>正常</span><strong id="metricAccountOk">-</strong></div>
-                  <div class="metricLine"><span>需处理</span><strong id="metricAccountRisk">-</strong></div>
+                  <div class="metricLine"><span>匹配</span><strong id="metricAccountOk">-</strong></div>
+                  <div class="metricLine"><span>错配</span><strong id="metricAccountRisk">-</strong></div>
                 </div>
               </div>
               <div class="metricCard">
@@ -4211,13 +4211,13 @@ INDEX_HTML = """<!doctype html>
       if (el) el.textContent = value;
     }
     function renderOverviewDashboard(data) {
-      const rows = data.account_matrix || [];
-      const riskRows = rows.filter((row) => row.account_status && row.account_status !== 'ok');
-      const okRows = rows.filter((row) => !row.account_status || row.account_status === 'ok');
-      setText('metricAccountValue', `${okRows.length}/${data.accounts.length || 0}`);
-      setText('metricAccountOk', okRows.length);
-      setText('metricAccountRisk', riskRows.length);
-      setMetricIcon('metricAccountIcon', riskRows.length ? 'bad' : 'ok');
+      const codexProviders = data.codex_providers || [];
+      const mismatchedProviders = codexProviders.filter((provider) => provider.token_mismatch);
+      const matchedProviders = codexProviders.length - mismatchedProviders.length;
+      setText('metricAccountValue', codexProviders.length ? `${matchedProviders}/${codexProviders.length}` : '-');
+      setText('metricAccountOk', matchedProviders);
+      setText('metricAccountRisk', mismatchedProviders.length);
+      setMetricIcon('metricAccountIcon', mismatchedProviders.length ? 'bad' : 'ok');
 
       const usage = data.usage_metrics || {};
       const totalTokens = Number(usage.total_tokens);
@@ -5168,7 +5168,7 @@ INDEX_HTML = """<!doctype html>
         text = `发现 ${staleCount} 个旧 CLI tokenful profile。建议迁移为 launcher-only，避免 refresh_token 重复使用。`;
       } else if (mismatchCount > 0) {
         state = 'badState';
-        text = `发现 ${mismatchCount} 个 Codex Provider 账号不匹配。回 CC Switch 重新授权对应账号。`;
+        text = `当前有 ${accountCount} 个账号；${mismatchCount} 个 Codex Provider 的绑定账号与实际 token 账号不一致。回 CC Switch 重新授权红色 provider。`;
       } else if (providerCount === 0) {
         state = 'warnState';
         text = '还没有 Claude 配置。选择账号后点“Claude Code 用这个账号”。';
