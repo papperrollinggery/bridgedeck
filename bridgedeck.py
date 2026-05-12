@@ -931,7 +931,7 @@ class BridgeManager:
             "enabled": bool(config.get("enabled", False)),
             "claude": bool(config.get("claude", True)),
             "default_codex": bool(config.get("default_codex", False)),
-            "priority": ["plus", "pro", "pro20x"],
+            "priority": ["pro20x", "pro5x", "plus"],
             "last_result": config.get("last_result") if isinstance(config.get("last_result"), dict) else {},
         }
 
@@ -942,7 +942,7 @@ class BridgeManager:
                 "enabled": bool(config.get("enabled", current["enabled"])),
                 "claude": bool(config.get("claude", current["claude"])),
                 "default_codex": bool(config.get("default_codex", current["default_codex"])),
-                "priority": ["plus", "pro", "pro20x"],
+                "priority": ["pro20x", "pro5x", "plus"],
                 "last_result": config.get("last_result", current.get("last_result", {})),
             }
         )
@@ -1719,19 +1719,30 @@ class BridgeManager:
     def _priority_rank(self, account_id: str, providers: list[dict[str, Any]], quota: dict[str, Any] | None = None) -> tuple[int, str]:
         names = " ".join(str(p.get("name") or "").lower() for p in providers if p.get("account_id") == account_id)
         plan_type = str((quota or {}).get("plan_type") or "").lower()
-        haystack = f"{plan_type} {names}"
-        if "20x" in haystack or "pro max" in haystack or "promax" in haystack:
-            return (2, haystack)
-        if "plus" in haystack:
+        # Provider names are user labels; prefer the quota payload plan whenever it exists.
+        haystack = plan_type or names
+        if "20x" in plan_type or "pro max" in plan_type or "promax" in plan_type or plan_type == "pro":
             return (0, haystack)
-        if "pro" in haystack:
+        if "pro_lite" in plan_type or "pro-lite" in plan_type or "pro lite" in plan_type or "prolite" in plan_type or "5x" in plan_type:
             return (1, haystack)
+        if "plus" in plan_type:
+            return (2, haystack)
+        if "20x" in haystack or "pro max" in haystack or "promax" in haystack:
+            return (0, haystack)
+        if "5x" in haystack or "pro_lite" in haystack or "pro-lite" in haystack or "pro lite" in haystack or "prolite" in haystack:
+            return (1, haystack)
+        if "plus" in haystack:
+            return (2, haystack)
+        if "pro" in haystack:
+            return (0, haystack)
         return (9, account_id)
 
     def _quota_capacity_factor(self, account_id: str, providers: list[dict[str, Any]], quota: dict[str, Any] | None = None) -> int:
         names = " ".join(str(p.get("name") or "").lower() for p in providers if p.get("account_id") == account_id)
         plan_type = str((quota or {}).get("plan_type") or "").lower()
-        return quota_capacity_factor_from_text(plan_type, names)
+        if plan_type:
+            return quota_capacity_factor_from_text(plan_type)
+        return quota_capacity_factor_from_text(names)
 
     def _quota_effective_remaining(self, account_id: str, providers: list[dict[str, Any]], quota: dict[str, Any]) -> float:
         return effective_remaining_units(
@@ -1823,10 +1834,12 @@ class BridgeManager:
         suffix = ""
         if "20x" in plan or "pro max" in plan or "promax" in plan:
             suffix = "Pro 20x"
+        elif "pro_lite" in plan or "pro-lite" in plan or "pro lite" in plan or "prolite" in plan or "5x" in plan:
+            suffix = "Pro 5x"
+        elif plan == "pro" or plan.startswith("pro_") or plan.startswith("pro-"):
+            suffix = "Pro 20x"
         elif "plus" in plan:
             suffix = "Plus"
-        elif "pro" in plan:
-            suffix = "Pro"
         if suffix:
             candidate = f"Local Codex Bridge - {suffix}"
             if candidate not in existing_names:
@@ -3031,13 +3044,23 @@ def summarize_rate_limit_windows(rate_limit: dict[str, Any]) -> tuple[list[dict[
 
 
 def quota_capacity_factor_from_text(*values: Any) -> int:
-    haystack = " ".join(str(value or "").lower() for value in values)
-    if "20x" in haystack or "pro max" in haystack or "promax" in haystack:
+    parts = [str(value or "").lower().strip() for value in values if str(value or "").strip()]
+    plan_type = parts[0] if parts else ""
+    haystack = " ".join(parts)
+    if "20x" in plan_type or "pro max" in plan_type or "promax" in plan_type:
         return 20
-    if "pro" in haystack:
+    if "pro_lite" in plan_type or "pro-lite" in plan_type or "pro lite" in plan_type or "prolite" in plan_type or "5x" in plan_type:
         return 5
     if "plus" in haystack:
         return 1
+    if plan_type == "pro" or plan_type.startswith("pro_") or plan_type.startswith("pro-"):
+        return 20
+    if "20x" in haystack or "pro max" in haystack or "promax" in haystack:
+        return 20
+    if "pro_lite" in haystack or "pro-lite" in haystack or "pro lite" in haystack or "prolite" in haystack or "5x" in haystack:
+        return 5
+    if "pro" in haystack:
+        return 20
     return 1
 
 
@@ -3249,495 +3272,601 @@ INDEX_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>BridgeDeck</title>
   <style nonce="__CSP_NONCE__">
-    :root { --bg:#0f1115; --panel:#171a21; --line:#2a3040; --text:#e8ecf5; --muted:#9aa4b5; --ok:#39c980; --warn:#f0b429; --bad:#ff6b6b; --brand:#56a8ff; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
-    .wrap { max-width: 1280px; margin: 24px auto; padding: 0 16px; }
-    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:14px; }
-    .sectionHint { color:var(--muted); font-size:12px; margin:-4px 0 12px; line-height:1.5; }
-    .layout { display:grid; grid-template-columns: 320px minmax(0, 1fr); gap:14px; align-items:start; }
-    .sidebar { position: sticky; top: 16px; }
-    .main { min-width:0; }
-    h1 { margin:0 0 12px; font-size:20px; }
-    h2 { margin:0 0 10px; font-size:16px; }
-    .muted { color: var(--muted); font-size: 12px; }
-    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:8px; }
-    input, select, button, textarea { border-radius:8px; border:1px solid var(--line); background:#0f1320; color:var(--text); padding:8px 10px; }
-    input, select { min-width: 220px; }
-    button { cursor:pointer; background:#1d2535; }
+    :root {
+      --bg:#0c0f14; --surface:#111722; --panel:#151c29; --panel2:#101621; --line:#263244;
+      --text:#edf2fb; --muted:#9aa7ba; --soft:#c6d0df; --ok:#2ec27e; --warn:#f5b642;
+      --bad:#ff6f6f; --brand:#59a7ff; --brand2:#8cc6ff; --focus:#213756;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+    .wrap { min-height:100vh; }
+    .appShell { display:grid; grid-template-columns:260px minmax(0, 1fr); min-height:100vh; }
+    .appSidebar { position:sticky; top:0; height:100vh; padding:18px 14px; border-right:1px solid var(--line); background:#0a0d12; display:flex; flex-direction:column; gap:14px; }
+    .brand { display:grid; gap:4px; padding:4px 6px 12px; border-bottom:1px solid var(--line); }
+    .brandName { font-size:19px; font-weight:850; }
+    .brandSub { color:var(--muted); font-size:12px; }
+    .sideNav { display:grid; gap:6px; }
+    .navItem { width:100%; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; border:1px solid transparent; border-radius:8px; background:transparent; color:var(--soft); text-align:left; font-weight:700; }
+    .navItem:hover, .navItem.active { background:var(--focus); border-color:#315077; color:var(--text); }
+    .navHint { color:var(--muted); font-size:11px; font-weight:600; }
+    .sidePanel { margin-top:auto; border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--panel2); }
+    .workspace { min-width:0; padding:20px; display:grid; grid-template-columns:minmax(0, 1fr) 300px; gap:16px; align-items:start; align-content:start; }
+    .topBar { grid-column:1 / -1; grid-row:1; display:flex; justify-content:space-between; gap:16px; align-items:flex-start; padding:16px; border:1px solid var(--line); border-radius:8px; background:var(--surface); }
+    .topBar h1 { margin:0; font-size:24px; }
+    .topBar p { margin:6px 0 0; color:var(--muted); font-size:13px; }
+    .topActions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+    .pageStack { grid-column:1; grid-row:2; min-width:0; }
+    .deckPage { display:none; }
+    .deckPage.active { display:block; }
+    .guideDock { grid-column:2; grid-row:2; position:sticky; top:20px; }
+    .card, .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:14px; }
+    .panel.subtle { background:var(--panel2); }
+    .pageHeader { display:flex; justify-content:space-between; gap:14px; align-items:flex-start; margin-bottom:14px; }
+    .pageTitle { margin:0; font-size:21px; font-weight:850; }
+    .pageDesc { margin:5px 0 0; color:var(--muted); font-size:13px; line-height:1.5; }
+    h1, h2 { margin:0 0 10px; }
+    h2 { font-size:16px; }
+    .sectionHint { color:var(--muted); font-size:12px; margin:-2px 0 12px; line-height:1.5; }
+    .muted { color:var(--muted); font-size:12px; }
+    .row, .toggleLine, .apiEnvActions { display:flex; gap:9px; flex-wrap:wrap; align-items:center; margin-top:10px; }
+    input, select, button, textarea { border-radius:8px; border:1px solid var(--line); background:#0d1320; color:var(--text); padding:8px 10px; font:inherit; }
+    input, select { min-width:220px; }
+    input[type="checkbox"], input[type="radio"] { min-width:0; }
+    button { cursor:pointer; background:#1a2332; }
+    button:hover { border-color:#3f5676; }
     button:disabled { opacity:.55; cursor:default; }
-    button.primary { background: var(--brand); border-color: #3d8ce0; color: #041122; font-weight:700; }
-    button.warn { background:#3a2b12; border-color:#6d4f1a; color:#ffd68a; }
-    .tableWrap { width:100%; overflow-x:hidden; border-radius:10px; }
-    table { width:100%; min-width:0; border-collapse: collapse; font-size:12px; table-layout: fixed; }
+    button.primary { background:var(--brand); border-color:#3d8ce0; color:#041122; font-weight:800; }
+    button.warn { background:#36260e; border-color:#745018; color:#ffd98f; }
+    .miniBtn { padding:6px 9px; font-size:12px; }
+    .mt10 { margin-top:10px; }
+    .ok { color:var(--ok); }
+    .bad { color:var(--bad); }
+    .warnText { color:var(--warn); }
+    .cmd, .mono, .paths, .apiEnvValue { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:anywhere; word-break:break-word; }
+    .paths { color:var(--muted); font-size:11px; line-height:1.45; white-space:pre-wrap; }
+    .mono, .cmd { color:#b7d8ff; }
+    .topGrid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:10px; }
+    .tile { border:1px solid var(--line); border-radius:8px; padding:12px; background:var(--panel2); min-height:76px; }
+    .tileLabel { color:var(--muted); font-size:12px; margin-bottom:6px; }
+    .tileValue { font-size:24px; font-weight:850; }
+    .summaryGrid, .splitGrid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; }
+    .recommend { margin-top:10px; padding:12px; border:1px solid var(--line); border-radius:8px; background:var(--panel2); line-height:1.55; }
+    .recommend.okState { border-color:#255c43; background:#0f2018; }
+    .recommend.warnState { border-color:#77571c; background:#21190d; }
+    .recommend.badState, .recommend.fail { border-color:#7a3030; background:#241313; }
+    .toolGrid, .apiMatrix, .apiExampleGrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }
+    .toolCard, .apiCard, .apiExample, .compactPanel, .serviceItem, .apiEnvLine { border:1px solid var(--line); border-radius:8px; background:var(--panel2); padding:12px; }
+    .toolCard { min-height:176px; display:flex; flex-direction:column; justify-content:space-between; gap:12px; }
+    .toolName, .apiCardTitle, .apiExampleTitle, .compactTitle, .serviceName { font-weight:850; }
+    .toolName { font-size:16px; margin-bottom:6px; }
+    .toolText, .apiCardMeta, .actualLine, .serviceMeta { color:var(--muted); font-size:12px; line-height:1.5; }
+    .toolSelect { display:grid; gap:6px; margin-top:10px; }
+    .toolSelect label, .apiEnvLabel { color:var(--muted); font-size:11px; }
+    .toolSelect select { width:100%; min-width:0; }
+    .actualRow { display:flex; gap:8px; align-items:flex-start; margin-top:8px; }
+    .actualLine { flex:1 1 auto; min-width:0; }
+    .actualLine strong { color:var(--text); }
+    .toolCard button { min-height:40px; font-weight:800; }
+    .toolCard .actualRow button { min-height:0; flex:0 0 auto; }
+    .apiEnvBox { margin-top:10px; display:grid; gap:8px; }
+    .apiEnvValue { color:#b7d8ff; font-size:12px; }
+    .simpleResult { margin-top:12px; padding:12px; border:1px solid var(--line); border-radius:8px; background:#0d1320; min-height:44px; color:var(--muted); font-size:13px; line-height:1.5; }
+    .quotaBar { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px; margin:12px 0; align-items:stretch; }
+    .quotaPill { border:1px solid var(--line); border-radius:8px; padding:13px; background:var(--panel2); display:grid; gap:10px; }
+    .quotaPill.current { border-color:#4c91d9; background:#102033; }
+    .quotaHead { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+    .quotaTitle { font-weight:850; font-size:14px; overflow-wrap:anywhere; }
+    .quotaMeta { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+    .badge { display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:999px; padding:3px 7px; font-size:11px; font-weight:800; line-height:1; }
+    .badge.ok { border-color:#245f43; background:#102318; color:#7ff0b5; }
+    .badge.warn { border-color:#75551a; background:#241a0d; color:#ffd680; }
+    .badge.bad { border-color:#733333; background:#261313; color:#ff9b9b; }
+    .quotaMeter { display:grid; gap:5px; }
+    .quotaMeterMeta { display:grid; grid-template-columns:1fr auto auto; gap:8px; align-items:center; font-size:12px; color:var(--muted); }
+    .quotaMeterMeta strong { color:var(--text); }
+    .quotaReset { color:#7f8ca0; }
+    .quotaProgress { width:100%; height:8px; appearance:none; border:0; border-radius:999px; overflow:hidden; background:#222a36; }
+    .quotaProgress::-webkit-progress-bar { background:#222a36; border-radius:999px; }
+    .quotaProgress::-webkit-progress-value { border-radius:999px; }
+    .quotaProgress.ok::-webkit-progress-value { background:var(--ok); }
+    .quotaProgress.warn::-webkit-progress-value { background:var(--warn); }
+    .quotaProgress.bad::-webkit-progress-value { background:var(--bad); }
+    .quotaProgress::-moz-progress-bar { border-radius:999px; background:var(--ok); }
+    .quotaWindows { color:var(--muted); font-size:12px; line-height:1.5; }
+    .servicePanel { border-top:1px solid var(--line); margin-top:12px; padding-top:12px; }
+    .serviceGrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin-top:8px; }
+    .serviceItem { min-height:84px; }
+    .serviceMeta { overflow-wrap:anywhere; }
+    .formGrid { display:grid; grid-template-columns:repeat(2, minmax(240px, 1fr)); gap:12px; align-items:end; }
+    .formGrid label { display:grid; gap:6px; color:var(--muted); font-size:12px; font-weight:700; }
+    .formGrid input, .formGrid select { width:100%; min-width:0; }
+    .tableWrap { width:100%; overflow:auto; border-radius:8px; border:1px solid var(--line); }
+    table { width:100%; min-width:760px; border-collapse:collapse; table-layout:fixed; font-size:12px; }
     th, td { border-bottom:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; overflow-wrap:anywhere; word-break:break-word; }
+    th { color:var(--muted); background:#111827; font-weight:800; }
+    tr:last-child td { border-bottom:0; }
     .nameCol { width:20%; }
     .smallCol { width:10%; }
     .accountCol { width:16%; }
     .urlCol { width:30%; }
     .tokenCol { width:12%; }
     .providerNameCell { display:flex; gap:8px; align-items:flex-start; min-width:0; }
-    .providerNameCell input { flex:0 0 auto; min-width:0; margin-top:3px; }
-    .providerNameText { min-width:0; overflow-wrap:anywhere; word-break:break-word; }
-    .ok { color: var(--ok); }
-    .bad { color: var(--bad); }
-    .warnText { color: var(--warn); }
-    .paths { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color: var(--muted); line-height:1.4; }
-    .cmd, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color:#b7d8ff; word-break: break-all; }
-    .steps { margin:0; padding-left:20px; color:var(--text); font-size:13px; line-height:1.65; }
-    .steps code { color:#b7d8ff; }
-    .stepNote { display:block; color:var(--muted); font-size:12px; margin-top:2px; }
-    .guideTarget { color:var(--muted); font-size:12px; margin-bottom:10px; }
-    .miniBtn { padding:5px 8px; font-size:12px; }
-    .mt10 { margin-top:10px; }
-    .topGrid { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:10px; margin-top:12px; }
-    .tile { border:1px solid var(--line); border-radius:8px; padding:10px; background:#101520; min-height:66px; }
-    .tileLabel { color:var(--muted); font-size:11px; margin-bottom:6px; }
-    .tileValue { font-size:18px; font-weight:700; }
-    .recommend { margin-top:10px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#111827; }
-    .recommend.okState { border-color:#265f43; background:#102018; }
-    .recommend.warnState { border-color:#7a5a1c; background:#211a0e; }
-    .recommend.badState { border-color:#7a3232; background:#251414; }
-    .quickbar { display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }
-    .simpleFlow { border-color:#35527d; background:#121a29; }
-    .simpleHeader { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; flex-wrap:wrap; margin-bottom:12px; }
-    .simpleTitle { font-size:22px; font-weight:800; margin-bottom:4px; }
-    .simpleSubtitle { color:var(--muted); font-size:13px; line-height:1.5; }
-    .bigSelectRow { display:grid; grid-template-columns: 140px minmax(260px, 520px); gap:12px; align-items:center; margin:12px 0 14px; }
-    .bigSelectRow label { font-weight:700; }
-    .bigSelectRow select { width:100%; min-height:42px; font-size:15px; }
-    .toolGrid { display:grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap:12px; }
-    .toolCard { border:1px solid var(--line); border-radius:10px; padding:14px; background:#101827; min-height:150px; display:flex; flex-direction:column; justify-content:space-between; gap:12px; }
-    .toolName { font-size:16px; font-weight:800; margin-bottom:6px; }
-    .toolText { color:var(--muted); font-size:13px; line-height:1.5; }
-    .toolSelect { margin-top:10px; display:grid; gap:6px; }
-    .toolSelect label { color:var(--muted); font-size:12px; }
-    .toolSelect select { width:100%; min-width:0; }
-    .actualRow { display:flex; gap:8px; align-items:flex-start; margin-top:8px; }
-    .actualLine { color:var(--muted); font-size:12px; line-height:1.45; flex:1 1 auto; min-width:0; }
-    .actualLine strong { color:var(--text); }
-    .toolCard button { min-height:42px; font-weight:700; }
-    .toolCard .actualRow button { min-height:0; padding:4px 8px; font-weight:600; flex:0 0 auto; }
-    .apiEnvBox { margin-top:10px; display:grid; gap:8px; }
-    .apiEnvLine { border:1px solid var(--line); border-radius:8px; padding:8px; background:#0f1320; }
-    .apiEnvLabel { color:var(--muted); font-size:11px; margin-bottom:4px; }
-    .apiEnvValue { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color:#b7d8ff; font-size:12px; overflow-wrap:anywhere; word-break:break-all; }
-    .apiEnvActions { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
-    .simpleResult { margin-top:12px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#0f1320; min-height:42px; color:var(--muted); font-size:13px; line-height:1.5; }
-    .simpleResult strong { color:var(--text); }
-    .apiMatrix { display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin:12px 0; }
-    .apiCard { border:1px solid var(--line); border-radius:8px; background:#101827; padding:10px; min-height:110px; }
-    .apiCardTitle { font-weight:800; font-size:13px; margin-bottom:6px; }
-    .apiCardMeta { color:var(--muted); font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
-    .apiCard.ok { border-color:#265f43; }
-    .apiCard.warn { border-color:#7a5a1c; }
-    .apiExampleGrid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:10px; margin-top:10px; }
-    .apiExample { border:1px solid var(--line); border-radius:8px; background:#0f1320; padding:10px; }
-    .apiExampleTitle { font-weight:800; font-size:12px; margin-bottom:6px; }
-    .quotaBar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:10px 0; }
-    .quotaPill { border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:#101827; min-width:180px; }
-    .quotaPill.current { border-color:#2f6fb2; background:#102033; }
-    .quotaTitle { font-weight:800; font-size:13px; margin-bottom:4px; }
-    .quotaWindows { font-size:12px; color:var(--muted); line-height:1.5; }
-    .servicePanel { border-top:1px solid var(--line); margin-top:12px; padding-top:12px; }
-    .serviceGrid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:8px; margin-top:8px; }
-    .serviceItem { border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:#101827; }
-    .serviceName { font-weight:800; font-size:12px; margin-bottom:4px; }
-    .serviceMeta { color:var(--muted); font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
-    .toggleLine { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:10px; color:var(--muted); font-size:12px; }
-    .toggleLine label { display:flex; gap:6px; align-items:center; }
-    .toggleLine input { min-width:0; }
-    .advancedIntro { color:var(--muted); font-size:12px; margin-bottom:10px; }
-    .compactPanel { border:1px solid var(--line); border-radius:8px; padding:10px; margin:10px 0; background:#101827; }
-    .compactTitle { font-weight:800; font-size:13px; margin-bottom:8px; }
-    .compactPanel input[type="checkbox"] { min-width:0; }
-    .compactPanel input[type="number"] { min-width:120px; width:150px; }
-    summary { cursor:pointer; font-weight:700; }
+    .providerNameText { min-width:0; }
     details.card { padding:0; }
-    details.card > summary { padding:14px; list-style:none; }
+    details.card > summary { padding:14px; list-style:none; cursor:pointer; font-weight:850; }
     details.card > summary::-webkit-details-marker { display:none; }
     details.card > .detailsBody { padding:0 14px 14px; }
-    textarea { width:100%; min-height:120px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
-    @media (max-width: 900px) {
-      .layout { grid-template-columns: 1fr; }
-      .sidebar { position: static; }
-      .topGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .toolGrid { grid-template-columns: 1fr; }
-      .bigSelectRow { grid-template-columns: 1fr; }
+    .steps { margin:0; padding-left:18px; color:var(--soft); font-size:12px; line-height:1.65; }
+    .guideTarget { color:var(--muted); font-size:12px; margin-bottom:10px; }
+    textarea { width:100%; min-height:220px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
+    @media (max-width: 1180px) {
+      .workspace { grid-template-columns:1fr; }
+      .guideDock { position:static; }
     }
-    @media (max-width: 560px) {
-      .topGrid { grid-template-columns: 1fr; }
+    @media (max-width: 900px) {
+      .appShell { grid-template-columns:1fr; }
+      .appSidebar { position:static; height:auto; }
+      .sideNav { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+      .topGrid, .summaryGrid, .splitGrid, .formGrid { grid-template-columns:1fr; }
+      .topBar { flex-direction:column; }
+      input, select { min-width:0; width:100%; }
     }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      <h1>BridgeDeck</h1>
-      <div id="status" class="muted">加载中...</div>
-      <div class="topGrid">
-        <div class="tile"><div class="tileLabel">账号</div><div id="tileAccounts" class="tileValue">-</div></div>
-        <div class="tile"><div class="tileLabel">Claude 配置</div><div id="tileProviders" class="tileValue">-</div></div>
-        <div class="tile"><div class="tileLabel">账号不一致</div><div id="tileMismatches" class="tileValue">-</div></div>
-        <div class="tile"><div class="tileLabel">CLI 配置</div><div id="tileCliHomes" class="tileValue">-</div></div>
-      </div>
-      <div id="recommendation" class="recommend">加载中...</div>
-      <div class="recommend">
-        <b>Claude 插件启用态</b>
-        <div id="pluginSyncStatus" class="sectionHint">插件同步检测中...</div>
-        <div class="toggleLine">
-          <button class="miniBtn" data-action="extract-safe-common-config">安全提取通用配置</button>
-          <button class="miniBtn" data-action="sync-claude-plugins">一键同步插件启用态</button>
+    <div class="appShell">
+      <aside class="appSidebar">
+        <div class="brand">
+          <div class="brandName">BridgeDeck</div>
+          <div class="brandSub">Local Codex / Claude 控制台</div>
         </div>
-      </div>
-      <div class="recommend">
-        <b>OpenAI 额度与自动切换</b>
-        <div class="sectionHint">只接管 Local Codex Bridge。你切到 MiniMax、Nvidia、SSSAiCode 等第三方供应商时不会自动改回 OpenAI。</div>
-        <div id="actualCurrentAccounts" class="actualLine">实际当前使用：检测中...</div>
-        <div id="quotaBoard" class="quotaBar">额度加载中...</div>
-        <div class="toggleLine">
-          <label><input type="checkbox" id="autoSwitchEnabled"> OpenAI 自动切换</label>
-          <label><input type="checkbox" id="autoSwitchClaude" checked> 自动切 Claude Code</label>
-          <label><input type="checkbox" id="autoSwitchDefaultCodex"> 自动切全局 Codex CLI</label>
-          <button class="miniBtn" data-action="save-auto-switch">保存</button>
-          <button class="miniBtn" data-action="run-auto-switch">立即检查并切换</button>
-          <button class="miniBtn" data-action="create-missing-bridges">为新账号创建 Local Codex Bridge</button>
-          <button class="miniBtn" data-action="preview-bridge-dedupe">预览重复 Local Bridge</button>
-          <button class="miniBtn warn" data-action="apply-bridge-dedupe">清理重复 Local Bridge</button>
-        </div>
-        <div id="missingBridgeStatus" class="muted mt10">新账号检测中...</div>
-        <div id="autoSwitchStatus" class="muted mt10">未运行</div>
-        <div class="servicePanel">
-          <b>本地服务</b>
-          <div id="serviceStatus" class="serviceGrid">服务状态加载中...</div>
-          <div class="toggleLine">
-            <button class="miniBtn" data-action="refresh-services">刷新服务</button>
-            <button class="miniBtn" data-action="proxy-diagnosis">诊断代理链路</button>
-            <button class="miniBtn" data-action="repair-quota-query">一键修复额度查询</button>
-            <button class="miniBtn" data-action="start-local-bridge">启动 Local Bridge</button>
-            <button class="miniBtn" data-action="restart-local-bridge">重启 Local Bridge</button>
-            <button class="miniBtn warn" data-action="stop-local-bridge">停止 Local Bridge</button>
-            <button class="miniBtn warn" data-action="stop-bridgedeck-ui">关闭 BridgeDeck UI</button>
-          </div>
-          <div id="serviceMessage" class="muted mt10">关闭 BridgeDeck UI 只停 8899，不影响 8876 Local Bridge。</div>
-          <div id="proxyDiagnosis" class="sectionHint">未诊断</div>
-        </div>
-      </div>
-      <details>
-        <summary>技术信息</summary>
-        <div class="paths" id="paths"></div>
-      </details>
-    </div>
-
-    <div class="card simpleFlow guideSection" id="simpleFlowCard" data-guide="simpleFlow">
-      <div class="simpleHeader">
-        <div>
-          <div class="simpleTitle">Claude Code、单独 Codex CLI、全局 Codex CLI 分开选</div>
-          <div class="simpleSubtitle">Claude Code 是当前 Claude 账号；单独 Codex CLI 是独立窗口；全局 Codex CLI 给 Paperclip、桌面版、直接运行 codex 用。</div>
-        </div>
-        <button data-action="refresh">刷新状态</button>
-      </div>
-      <div class="toolGrid">
-        <div class="toolCard">
-          <div>
-            <div class="toolName">Claude Code</div>
-            <div class="toolText">切换 Claude Code 当前使用的账号。</div>
-            <div class="toolSelect">
-              <label for="simpleClaudeAccount">Claude Code 用哪个账号</label>
-              <select id="simpleClaudeAccount"></select>
-            </div>
-            <div class="actualRow">
-              <div class="actualLine" id="simpleClaudeActual">当前实际：检测中...</div>
-              <button class="miniBtn" data-action="refresh">刷新</button>
-            </div>
-          </div>
-          <button class="primary" data-action="simple-claude">应用到 Claude Code</button>
-        </div>
-        <div class="toolCard">
-          <div>
-            <div class="toolName">单独 Codex CLI</div>
-            <div class="toolText">只为这个账号准备独立启动器，可和其它账号同时开，不改变全局默认。</div>
-            <div class="toolSelect">
-              <label for="simpleCliAccount">单独 Codex CLI 用哪个账号</label>
-              <select id="simpleCliAccount"></select>
-            </div>
-            <div class="actualRow">
-              <div class="actualLine" id="simpleCliActual">当前实际：检测中...</div>
-              <button class="miniBtn" data-action="refresh">刷新</button>
-            </div>
-          </div>
-          <button class="primary" data-action="simple-cli">准备单独 Codex CLI</button>
-        </div>
-        <div class="toolCard">
-          <div>
-            <div class="toolName">通用 API 接入</div>
-            <div class="toolText">给支持 OpenAI Base URL 或 Claude/Anthropic 环境变量的项目复制本地配置。key 是占位符，不是真实 token。</div>
-            <div class="toolSelect">
-              <label for="simpleApiAccount">API 用哪个账号</label>
-              <select id="simpleApiAccount"></select>
-            </div>
-            <div class="apiEnvBox">
-              <div class="apiEnvLine">
-                <div class="apiEnvLabel">OPENAI_API_KEY</div>
-                <div class="apiEnvValue" id="apiAccessKey">sk-bridgedeck-local-placeholder</div>
-              </div>
-              <div class="apiEnvLine">
-                <div class="apiEnvLabel">OPENAI_BASE_URL</div>
-                <div class="apiEnvValue" id="apiAccessBaseUrl">选择账号后生成</div>
-              </div>
-              <div class="apiEnvLine">
-                <div class="apiEnvLabel">ANTHROPIC_AUTH_TOKEN</div>
-                <div class="apiEnvValue" id="anthropicAccessToken">local-bridge</div>
-              </div>
-              <div class="apiEnvLine">
-                <div class="apiEnvLabel">ANTHROPIC_BASE_URL</div>
-                <div class="apiEnvValue" id="anthropicAccessBaseUrl">选择账号后生成</div>
-              </div>
-            </div>
-            <div class="apiEnvActions">
-              <button class="miniBtn" data-action="copy-api-key">复制 API key</button>
-              <button class="miniBtn" data-action="copy-api-base-url">复制 Base URL</button>
-              <button class="miniBtn" data-action="copy-api-env">复制 .env</button>
-              <button class="miniBtn" data-action="copy-anthropic-token">复制 Anthropic token</button>
-              <button class="miniBtn" data-action="copy-anthropic-base-url">复制 Anthropic URL</button>
-              <button class="miniBtn" data-action="copy-anthropic-env">复制 Anthropic .env</button>
-            </div>
-            <div class="actualLine mt10" id="simpleApiActual">当前实际：选择账号后可用。</div>
-          </div>
-        </div>
-        <div class="toolCard">
-          <div>
-            <div class="toolName">Codex Desktop</div>
-            <div class="toolText">桌面版不由 BridgeDeck 接管。这里帮你看它当前是否正常。</div>
-            <div class="actualRow">
-              <div class="actualLine" id="simpleDesktopActual">当前实际：检测中...</div>
-              <button class="miniBtn" data-action="refresh">刷新</button>
-            </div>
-          </div>
-          <button data-action="scroll" data-target="statusCard">查看桌面版状态</button>
-        </div>
-        <div class="toolCard">
-          <div>
-            <div class="toolName">全局 Codex CLI</div>
-            <div class="toolText">给 Paperclip、Codex Desktop、OMC/tmux 用。会一起写全局配置、固定入口和 codex 包装器。</div>
-            <div class="toolSelect">
-              <label for="simpleDefaultAccount">全局 Codex CLI 用哪个账号</label>
-              <select id="simpleDefaultAccount"></select>
-            </div>
-            <div class="actualRow">
-              <div class="actualLine" id="simpleDefaultActual">当前实际：检测中...</div>
-              <button class="miniBtn" data-action="refresh">刷新</button>
-            </div>
-          </div>
-          <button class="warn" data-action="simple-default-codex">设为全局 Codex CLI</button>
-        </div>
-      </div>
-      <div class="simpleResult" id="simpleResult">三种入口可以选择不同账号。</div>
-    </div>
-
-    <div class="card guideSection" id="apiAccessCard" data-guide="apiAccess">
-      <h2>通用 API 接入</h2>
-      <div class="sectionHint">只展示可复制配置和 endpoint 能力，不写 provider、不改 Claude Desktop。API key 使用占位值，真实 OAuth token 不会显示。</div>
-      <div class="row">
-        <label>账号</label>
-        <span class="muted" id="apiAccessGuideAccount">沿用上方通用 API 接入选择</span>
-        <button class="miniBtn" data-action="copy-api-base-url">复制 BASE_URL</button>
-        <button class="miniBtn" data-action="copy-api-env">复制 OpenAI env</button>
-        <button class="miniBtn" data-action="copy-claude-env">复制 Desktop Gateway</button>
-      </div>
-      <div class="paths" id="apiAccessGuideBaseUrl"></div>
-      <div class="apiMatrix">
-        <div class="apiCard ok">
-          <div class="apiCardTitle">OpenAI Responses</div>
-          <div class="apiCardMeta"><span class="mono">POST /v1/responses</span><br />Codex bridge 主路径，支持流式 reasoning keepalive。</div>
-        </div>
-        <div class="apiCard ok">
-          <div class="apiCardTitle">Anthropic Messages</div>
-          <div class="apiCardMeta"><span class="mono">POST /v1/messages</span><br />Claude Desktop 3P 使用 Claude-safe 路由名，BridgeDeck 映射到 GPT。</div>
-        </div>
-        <div class="apiCard ok">
-          <div class="apiCardTitle">Chat Completions</div>
-          <div class="apiCardMeta"><span class="mono">POST /v1/chat/completions</span><br />OpenAI 旧式工具接入路径，非流式和 SSE 都走 Responses。</div>
-        </div>
-        <div class="apiCard ok">
-          <div class="apiCardTitle">Scoped Models</div>
-          <div class="apiCardMeta"><span class="mono">GET /v1/models</span><br />同时返回 gpt-* 和 claude-* Desktop 路由；gpt-5.5 为 272k context / 128k max output。</div>
-        </div>
-      </div>
-      <div class="apiExampleGrid">
-        <div class="apiExample">
-          <div class="apiExampleTitle">OpenAI-compatible</div>
-          <div class="paths" id="apiOpenAiExample"></div>
-        </div>
-        <div class="apiExample">
-          <div class="apiExampleTitle">Claude Desktop 3P</div>
-          <div class="paths" id="apiClaudeExample"></div>
-        </div>
-      </div>
-      <div class="muted mt10">gpt-5.5 thinking levels: low / medium / high / xhigh。minimal 不作为可选级别展示。</div>
-    </div>
-
-    <div class="layout">
-      <aside class="sidebar">
-        <div class="card">
-          <h2 id="guideTitle">当前操作</h2>
-          <div id="guideTarget" class="guideTarget">随右侧当前板块自动切换</div>
-          <ol id="guideSteps" class="steps"></ol>
+        <nav class="sideNav" aria-label="BridgeDeck sections">
+          <button class="navItem active" data-page="overview">总览 <span class="navHint">状态</span></button>
+          <button class="navItem" data-page="switching">入口切换 <span class="navHint">账号</span></button>
+          <button class="navItem" data-page="quota">额度与自动切换 <span class="navHint">OpenAI</span></button>
+          <button class="navItem" data-page="claude">Claude Code <span class="navHint">桥接</span></button>
+          <button class="navItem" data-page="codex">Codex CLI <span class="navHint">启动器</span></button>
+          <button class="navItem" data-page="api">通用 API <span class="navHint">复制</span></button>
+          <button class="navItem" data-page="services">本地服务 <span class="navHint">8876</span></button>
+          <button class="navItem" data-page="diagnostics">诊断日志 <span class="navHint">排查</span></button>
+        </nav>
+        <div class="sidePanel">
+          <div id="status" class="muted">加载中...</div>
+          <details class="mt10">
+            <summary>技术信息</summary>
+            <div class="paths mt10" id="paths"></div>
+          </details>
         </div>
       </aside>
 
-      <main class="main">
-        <details class="card guideSection" id="providerCreateCard" data-guide="providerCreate">
-          <summary>高级：Claude 桥接账号</summary>
-          <div class="detailsBody">
-          <h2>Claude 桥接账号</h2>
-          <div class="sectionHint">把某个 ChatGPT 账号接到 Claude Code。通常只需要选账号，然后创建并设为当前。</div>
-          <div class="row">
-            <label>ChatGPT 账号</label>
-            <select id="account"></select>
-            <label>显示名称</label>
-            <input id="providerName" placeholder="Local Codex Bridge - xxx" />
-            <label>模型</label>
-            <select id="bridgeModel"></select>
-            <label>上下文 tokens</label>
-            <input id="modelContextTokens" type="number" min="10000" max="2000000" step="1000" value="272000" readonly />
-            <label><input type="checkbox" id="setCurrent" checked /> 设为当前</label>
-            <button class="primary" data-action="create-provider">创建/更新 Claude 桥接</button>
+      <main class="workspace">
+        <header class="topBar">
+          <div>
+            <h1>BridgeDeck 控制台</h1>
+            <p>把账户、额度、Claude、Codex CLI、API 接入和本地服务拆开管理。</p>
           </div>
-          <div class="compactPanel">
-            <div class="compactTitle">Claude Code 自动压缩</div>
-            <div class="row">
-              <label><input type="checkbox" id="compactEnabled" checked /> 启用</label>
-              <label>窗口 tokens</label>
-              <input id="compactWindow" type="number" min="10000" max="2000000" step="1000" value="272000" />
-              <label>阈值 %</label>
-              <input id="compactPct" type="number" min="1" max="100" step="1" value="80" />
-              <button class="miniBtn" data-action="compact-preset-model">模型上下文</button>
-              <button class="miniBtn" data-action="compact-preset-220k">220k</button>
-              <button class="miniBtn" data-action="compact-preset-1m">1m</button>
-              <button class="miniBtn" data-action="compact-off">关闭</button>
-              <button class="miniBtn" data-action="save-compact-selected">保存模型/上下文到选中 provider</button>
-              <button class="miniBtn" data-action="sync-common-env-selected">同步通用 env 到全部</button>
+          <div class="topActions">
+            <button data-action="refresh">刷新状态</button>
+            <button data-page="services">本地服务</button>
+            <button class="warn" data-action="stop-bridgedeck-ui">关闭 UI</button>
+          </div>
+        </header>
+
+        <div class="pageStack">
+          <section class="deckPage active" id="page-overview">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">总览</h2>
+                <p class="pageDesc">只显示当前能否用、哪里不一致、下一步该点哪个入口。</p>
+              </div>
+              <button class="primary" data-page="switching">选择账号入口</button>
             </div>
-            <div class="muted" id="bridgeModelMeta">gpt-5.5 = 272000 context tokens / 128000 max output。</div>
-          </div>
-          <div class="muted">工具会自动写入本地 bridge 配置，不需要手动编辑 URL/token。</div>
-          </div>
-        </details>
+            <div class="topGrid">
+              <div class="tile"><div class="tileLabel">账号</div><div id="tileAccounts" class="tileValue">-</div></div>
+              <div class="tile"><div class="tileLabel">Claude 配置</div><div id="tileProviders" class="tileValue">-</div></div>
+              <div class="tile"><div class="tileLabel">账号不一致</div><div id="tileMismatches" class="tileValue">-</div></div>
+              <div class="tile"><div class="tileLabel">CLI 配置</div><div id="tileCliHomes" class="tileValue">-</div></div>
+            </div>
+            <div id="recommendation" class="recommend">加载中...</div>
+            <div class="summaryGrid mt10">
+              <div class="panel guideSection" data-guide="simpleFlow">
+                <h2>当前实际使用</h2>
+                <div id="actualCurrentAccounts" class="actualLine">实际当前使用：检测中...</div>
+                <div class="row">
+                  <button class="miniBtn" data-page="switching">入口切换</button>
+                  <button class="miniBtn" data-page="quota">查看额度</button>
+                  <button class="miniBtn" data-page="diagnostics">状态矩阵</button>
+                </div>
+              </div>
+              <div class="panel">
+                <h2>Claude 插件启用态</h2>
+                <div id="pluginSyncStatus" class="sectionHint">插件同步检测中...</div>
+                <div class="row">
+                  <button class="miniBtn" data-action="extract-safe-common-config">安全提取通用配置</button>
+                  <button class="miniBtn" data-action="sync-claude-plugins">一键同步插件启用态</button>
+                </div>
+              </div>
+            </div>
+          </section>
 
-        <details class="card guideSection" id="cliHomeCard" data-guide="cliHome">
-          <summary>高级：Codex CLI 启动器</summary>
-          <div class="detailsBody">
-          <h2>单独 Codex CLI</h2>
-          <div class="sectionHint">生成 launcher-only 启动器：只设置 <code>CODEX_HOME</code>、<code>OPENAI_API_KEY</code> 和账号路由，不复制 OpenAI token，不改默认 <code>~/.codex</code>。</div>
-          <div class="row">
-            <label>账号</label>
-            <select id="cliAccount"></select>
-            <label>保存目录</label>
-            <input id="cliHome" placeholder="~/.codex-cli-pro20x" />
-            <label>启动器名称</label>
-            <input id="cliProfileName" placeholder="pro20x" />
-            <button class="primary" data-action="create-cli-home">生成启动器</button>
-            <button data-action="migrate-cli-home">迁移旧 CLI 目录</button>
-          </div>
-          <div class="muted">单独 Codex CLI = 使用对应启动脚本打开新的 Codex CLI，可多个账号同时运行，不改变全局默认。</div>
-          <div class="paths" id="cliCommand"></div>
-          <div class="muted mt10">可用账号：点“选用”自动填入推荐目录。</div>
-          <div class="tableWrap">
-            <table id="cliAccountsTable">
-              <thead>
-                <tr>
-                  <th class="nameCol">账号名</th>
-                  <th class="urlCol">email</th>
-                  <th class="accountCol">account_id</th>
-                  <th class="urlCol">推荐 CLI Home</th>
-                  <th class="smallCol">操作</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          </div>
-        </details>
+          <section class="deckPage" id="page-switching">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">入口切换</h2>
+                <p class="pageDesc">Claude Code、单独 Codex CLI、全局 Codex CLI 分开选，避免一个操作影响全部。</p>
+              </div>
+              <button data-action="refresh">刷新状态</button>
+            </div>
+            <div class="card guideSection" id="simpleFlowCard" data-guide="simpleFlow">
+              <div class="toolGrid">
+                <div class="toolCard">
+                  <div>
+                    <div class="toolName">Claude Code</div>
+                    <div class="toolText">切换 Claude Code 当前使用的账号。</div>
+                    <div class="toolSelect">
+                      <label for="simpleClaudeAccount">Claude Code 用哪个账号</label>
+                      <select id="simpleClaudeAccount"></select>
+                    </div>
+                    <div class="actualRow">
+                      <div class="actualLine" id="simpleClaudeActual">当前实际：检测中...</div>
+                      <button class="miniBtn" data-action="refresh">刷新</button>
+                    </div>
+                  </div>
+                  <button class="primary" data-action="simple-claude">应用到 Claude Code</button>
+                </div>
+                <div class="toolCard">
+                  <div>
+                    <div class="toolName">单独 Codex CLI</div>
+                    <div class="toolText">准备独立启动器，不改变全局默认。</div>
+                    <div class="toolSelect">
+                      <label for="simpleCliAccount">单独 Codex CLI 用哪个账号</label>
+                      <select id="simpleCliAccount"></select>
+                    </div>
+                    <div class="actualRow">
+                      <div class="actualLine" id="simpleCliActual">当前实际：检测中...</div>
+                      <button class="miniBtn" data-action="refresh">刷新</button>
+                    </div>
+                  </div>
+                  <button class="primary" data-action="simple-cli">准备单独 Codex CLI</button>
+                </div>
+                <div class="toolCard">
+                  <div>
+                    <div class="toolName">全局 Codex CLI</div>
+                    <div class="toolText">给 Paperclip、Codex Desktop、OMC/tmux 和直接运行 codex 使用。</div>
+                    <div class="toolSelect">
+                      <label for="simpleDefaultAccount">全局 Codex CLI 用哪个账号</label>
+                      <select id="simpleDefaultAccount"></select>
+                    </div>
+                    <div class="actualRow">
+                      <div class="actualLine" id="simpleDefaultActual">当前实际：检测中...</div>
+                      <button class="miniBtn" data-action="refresh">刷新</button>
+                    </div>
+                  </div>
+                  <button class="warn" data-action="simple-default-codex">设为全局 Codex CLI</button>
+                </div>
+                <div class="toolCard">
+                  <div>
+                    <div class="toolName">Codex Desktop</div>
+                    <div class="toolText">桌面版跟随全局 Codex CLI，这里只显示检测结果。</div>
+                    <div class="actualRow">
+                      <div class="actualLine" id="simpleDesktopActual">当前实际：检测中...</div>
+                      <button class="miniBtn" data-action="refresh">刷新</button>
+                    </div>
+                  </div>
+                  <button data-action="scroll" data-target="statusCard">查看桌面版状态</button>
+                </div>
+              </div>
+              <div class="simpleResult" id="simpleResult">三种入口可以选择不同账号。</div>
+            </div>
+          </section>
 
-        <details class="card guideSection" id="providerManageCard" data-guide="providerManage">
-          <summary>高级：Claude Provider 管理</summary>
-          <div class="detailsBody">
-          <div class="sectionHint">只在需要切换、修复、排查 token 时使用。日常只看“当前”和“账号”。</div>
-          <div class="row">
-            <button data-action="refresh">刷新</button>
-            <button class="miniBtn" id="tokenToggle" data-action="toggle-tokens">显示 token</button>
-            <button data-action="set-current-selected">设选中为当前</button>
-            <button data-action="patch-selected">修复选中桥接</button>
-            <button class="warn" data-action="repair-plus-pro">修复 Plus/Pro</button>
-          </div>
-          <div class="tableWrap">
-            <table id="providersTable">
-              <thead>
-                <tr>
-                  <th class="nameCol">name</th>
-                  <th class="smallCol">当前</th>
-                  <th class="accountCol">account</th>
-                  <th class="urlCol">base_url</th>
-                  <th class="smallCol">model</th>
-                  <th class="smallCol">compact</th>
-                  <th class="tokenCol">token</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          </div>
-        </details>
+          <section class="deckPage" id="page-quota">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">额度与自动切换</h2>
+                <p class="pageDesc">只接管 Local Codex Bridge。切到 MiniMax、Nvidia、SSSAiCode 时不会自动改回 OpenAI。</p>
+              </div>
+              <button class="primary" data-action="run-auto-switch">立即检查并切换</button>
+            </div>
+            <div class="card guideSection" data-guide="quota">
+              <div id="quotaBoard" class="quotaBar">额度加载中...</div>
+              <div class="toggleLine">
+                <label><input type="checkbox" id="autoSwitchEnabled"> OpenAI 自动切换</label>
+                <label><input type="checkbox" id="autoSwitchClaude" checked> 自动切 Claude Code</label>
+                <label><input type="checkbox" id="autoSwitchDefaultCodex"> 自动切全局 Codex CLI</label>
+              </div>
+              <div class="row">
+                <button class="miniBtn" data-action="save-auto-switch">保存</button>
+                <button class="miniBtn" data-action="run-auto-switch">立即检查并切换</button>
+                <button class="miniBtn" data-action="create-missing-bridges">为新账号创建 Local Codex Bridge</button>
+                <button class="miniBtn" data-action="preview-bridge-dedupe">预览重复 Local Bridge</button>
+                <button class="miniBtn warn" data-action="apply-bridge-dedupe">清理重复 Local Bridge</button>
+              </div>
+              <div id="missingBridgeStatus" class="muted mt10">新账号检测中...</div>
+              <div id="autoSwitchStatus" class="muted mt10">未运行</div>
+            </div>
+          </section>
 
-        <details class="card guideSection" id="statusCard" data-guide="status" open>
-          <summary>账号状态检查</summary>
-          <div class="detailsBody">
-          <div class="sectionHint">自动检测 Claude Code、单独 Codex CLI、全局 Codex CLI 当前状态。Desktop 跟随全局 Codex CLI。</div>
-          <div class="tableWrap">
-            <table id="accountMatrixTable">
-              <thead>
-                <tr>
-                  <th class="nameCol">账号</th><th class="smallCol">Claude</th><th class="smallCol">CLI</th><th class="smallCol">Desktop</th><th class="smallCol">状态</th><th class="urlCol">建议</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <br />
-          <div class="muted">CC Switch Codex OAuth Provider：用于授权和额度检查；BridgeDeck 全局入口以上面 Desktop 列为准。</div>
-          <div class="tableWrap">
-            <table id="codexProvidersTable">
-              <thead>
-                <tr>
-                  <th class="nameCol">名称</th><th class="smallCol">当前</th><th class="accountCol">绑定账号</th><th class="accountCol">实际账号</th><th class="smallCol">状态</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <div id="diagnosis" class="recommend"></div>
-          <br />
-          <div class="muted">已配置 CLI 目录：这里只显示已经存在的 CODEX_HOME。</div>
-          <div class="tableWrap">
-            <table id="cliHomesTable">
-              <thead>
-                <tr>
-                  <th class="urlCol">CLI 目录</th><th class="urlCol">切换命令</th><th class="accountCol">账号</th><th class="urlCol">email</th><th class="smallCol">状态</th><th class="urlCol">更新时间</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          </div>
-        </details>
+          <section class="deckPage" id="page-claude">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">Claude Code</h2>
+                <p class="pageDesc">创建、切换和修复 Claude Provider，同时配置模型上下文和自动压缩。</p>
+              </div>
+              <button data-action="refresh">刷新</button>
+            </div>
+            <div class="card guideSection" id="providerCreateCard" data-guide="providerCreate">
+              <h2>Claude 桥接账号</h2>
+              <div class="sectionHint">选择账号、模型和上下文后创建/更新；勾选“设为当前”会同步 CC Switch 当前 Claude Provider。</div>
+              <div class="formGrid">
+                <label>ChatGPT 账号<select id="account"></select></label>
+                <label>显示名称<input id="providerName" placeholder="Local Codex Bridge - xxx" /></label>
+                <label>模型<select id="bridgeModel"></select></label>
+                <label>上下文 tokens<input id="modelContextTokens" type="number" min="10000" max="2000000" step="1000" value="272000" readonly /></label>
+              </div>
+              <div class="row">
+                <label><input type="checkbox" id="setCurrent" checked /> 设为当前</label>
+                <button class="primary" data-action="create-provider">创建/更新 Claude 桥接</button>
+              </div>
+              <div class="compactPanel">
+                <div class="compactTitle">Claude Code 自动压缩</div>
+                <div class="row">
+                  <label><input type="checkbox" id="compactEnabled" checked /> 启用</label>
+                  <label>窗口 tokens <input id="compactWindow" type="number" min="10000" max="2000000" step="1000" value="272000" /></label>
+                  <label>阈值 % <input id="compactPct" type="number" min="1" max="100" step="1" value="80" /></label>
+                  <button class="miniBtn" data-action="compact-preset-model">模型上下文</button>
+                  <button class="miniBtn" data-action="compact-preset-220k">220k</button>
+                  <button class="miniBtn" data-action="compact-preset-1m">1m</button>
+                  <button class="miniBtn" data-action="compact-off">关闭</button>
+                  <button class="miniBtn" data-action="save-compact-selected">保存模型/上下文到选中 provider</button>
+                  <button class="miniBtn" data-action="sync-common-env-selected">同步通用 env 到全部</button>
+                </div>
+                <div class="muted" id="bridgeModelMeta">gpt-5.5 = 272000 context tokens / 128000 max output。</div>
+              </div>
+            </div>
+            <div class="card guideSection" id="providerManageCard" data-guide="providerManage">
+              <h2>Claude Provider 管理</h2>
+              <div class="sectionHint">排查 token、当前项和 base_url。默认隐藏真实 token。</div>
+              <div class="row">
+                <button data-action="refresh">刷新</button>
+                <button class="miniBtn" id="tokenToggle" data-action="toggle-tokens">显示 token</button>
+                <button data-action="set-current-selected">设选中为当前</button>
+                <button data-action="patch-selected">修复选中桥接</button>
+                <button class="warn" data-action="repair-plus-pro">修复 Plus/Pro</button>
+              </div>
+              <div class="tableWrap">
+                <table id="providersTable">
+                  <thead>
+                    <tr>
+                      <th class="nameCol">name</th>
+                      <th class="smallCol">当前</th>
+                      <th class="accountCol">account</th>
+                      <th class="urlCol">base_url</th>
+                      <th class="smallCol">model</th>
+                      <th class="smallCol">compact</th>
+                      <th class="tokenCol">token</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
 
-        <details class="card guideSection" data-guide="log">
-          <summary>执行日志</summary>
-          <div class="detailsBody">
-          <textarea id="log" readonly></textarea>
+          <section class="deckPage" id="page-codex">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">Codex CLI</h2>
+                <p class="pageDesc">生成 launcher-only 启动器，不复制 OpenAI token，不改默认 ~/.codex。</p>
+              </div>
+              <button data-action="refresh">刷新</button>
+            </div>
+            <div class="card guideSection" id="cliHomeCard" data-guide="cliHome">
+              <h2>单独 Codex CLI 启动器</h2>
+              <div class="formGrid">
+                <label>账号<select id="cliAccount"></select></label>
+                <label>保存目录<input id="cliHome" placeholder="~/.codex-cli-pro20x" /></label>
+                <label>启动器名称<input id="cliProfileName" placeholder="pro20x" /></label>
+              </div>
+              <div class="row">
+                <button class="primary" data-action="create-cli-home">生成启动器</button>
+                <button data-action="migrate-cli-home">迁移旧 CLI 目录</button>
+              </div>
+              <div class="paths" id="cliCommand"></div>
+              <div class="muted mt10">可用账号：点“选用”自动填入推荐目录。</div>
+              <div class="tableWrap mt10">
+                <table id="cliAccountsTable">
+                  <thead>
+                    <tr>
+                      <th class="nameCol">账号名</th>
+                      <th class="urlCol">email</th>
+                      <th class="accountCol">account_id</th>
+                      <th class="urlCol">推荐 CLI Home</th>
+                      <th class="smallCol">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section class="deckPage" id="page-api">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">通用 API 接入</h2>
+                <p class="pageDesc">复制 OpenAI Base URL 或 Claude/Anthropic 环境变量；API key 是占位符，不显示真实 OAuth token。</p>
+              </div>
+            </div>
+            <div class="card guideSection" id="apiAccessCard" data-guide="apiAccess">
+              <div class="toolGrid">
+                <div class="toolCard">
+                  <div>
+                    <div class="toolName">本地 API 配置</div>
+                    <div class="toolText">选择要暴露给外部工具的 ChatGPT 账号。</div>
+                    <div class="toolSelect">
+                      <label for="simpleApiAccount">API 用哪个账号</label>
+                      <select id="simpleApiAccount"></select>
+                    </div>
+                    <div class="apiEnvBox">
+                      <div class="apiEnvLine">
+                        <div class="apiEnvLabel">OPENAI_API_KEY</div>
+                        <div class="apiEnvValue" id="apiAccessKey">sk-bridgedeck-local-placeholder</div>
+                      </div>
+                      <div class="apiEnvLine">
+                        <div class="apiEnvLabel">OPENAI_BASE_URL</div>
+                        <div class="apiEnvValue" id="apiAccessBaseUrl">选择账号后生成</div>
+                      </div>
+                      <div class="apiEnvLine">
+                        <div class="apiEnvLabel">ANTHROPIC_AUTH_TOKEN</div>
+                        <div class="apiEnvValue" id="anthropicAccessToken">local-bridge</div>
+                      </div>
+                      <div class="apiEnvLine">
+                        <div class="apiEnvLabel">ANTHROPIC_BASE_URL</div>
+                        <div class="apiEnvValue" id="anthropicAccessBaseUrl">选择账号后生成</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="apiEnvActions">
+                    <button class="miniBtn" data-action="copy-api-key">复制 API key</button>
+                    <button class="miniBtn" data-action="copy-api-base-url">复制 Base URL</button>
+                    <button class="miniBtn" data-action="copy-api-env">复制 .env</button>
+                    <button class="miniBtn" data-action="copy-anthropic-token">复制 Anthropic token</button>
+                    <button class="miniBtn" data-action="copy-anthropic-base-url">复制 Anthropic URL</button>
+                    <button class="miniBtn" data-action="copy-anthropic-env">复制 Anthropic .env</button>
+                  </div>
+                  <div class="actualLine mt10" id="simpleApiActual">当前实际：选择账号后可用。</div>
+                </div>
+                <div class="toolCard">
+                  <div>
+                    <div class="toolName">复制指南</div>
+                    <div class="toolText" id="apiAccessGuideAccount">沿用左侧 API 账号选择</div>
+                    <div class="paths mt10" id="apiAccessGuideBaseUrl"></div>
+                  </div>
+                  <div class="apiEnvActions">
+                    <button class="miniBtn" data-action="copy-api-base-url">复制 BASE_URL</button>
+                    <button class="miniBtn" data-action="copy-api-env">复制 OpenAI env</button>
+                    <button class="miniBtn" data-action="copy-claude-env">复制 Desktop Gateway</button>
+                  </div>
+                </div>
+              </div>
+              <div class="apiMatrix">
+                <div class="apiCard ok">
+                  <div class="apiCardTitle">OpenAI Responses</div>
+                  <div class="apiCardMeta"><span class="mono">POST /v1/responses</span><br />Codex bridge 主路径，支持流式 reasoning keepalive。</div>
+                </div>
+                <div class="apiCard ok">
+                  <div class="apiCardTitle">Anthropic Messages</div>
+                  <div class="apiCardMeta"><span class="mono">POST /v1/messages</span><br />Claude Desktop 3P 使用 Claude-safe 路由名，BridgeDeck 映射到 GPT。</div>
+                </div>
+                <div class="apiCard ok">
+                  <div class="apiCardTitle">Chat Completions</div>
+                  <div class="apiCardMeta"><span class="mono">POST /v1/chat/completions</span><br />OpenAI 旧式工具接入路径，非流式和 SSE 都走 Responses。</div>
+                </div>
+                <div class="apiCard ok">
+                  <div class="apiCardTitle">Scoped Models</div>
+                  <div class="apiCardMeta"><span class="mono">GET /v1/models</span><br />同时返回 gpt-* 和 claude-* Desktop 路由；gpt-5.5 为 272k context / 128k max output。</div>
+                </div>
+              </div>
+              <div class="apiExampleGrid">
+                <div class="apiExample">
+                  <div class="apiExampleTitle">OpenAI-compatible</div>
+                  <div class="paths" id="apiOpenAiExample"></div>
+                </div>
+                <div class="apiExample">
+                  <div class="apiExampleTitle">Claude Desktop 3P</div>
+                  <div class="paths" id="apiClaudeExample"></div>
+                </div>
+              </div>
+              <div class="muted mt10">gpt-5.5 thinking levels: low / medium / high / xhigh。minimal 不作为可选级别展示。</div>
+            </div>
+          </section>
+
+          <section class="deckPage" id="page-services">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">本地服务</h2>
+                <p class="pageDesc">UI 8899 和 Local Bridge 8876 分开控制；关闭 UI 不影响 8876。</p>
+              </div>
+              <button class="primary" data-action="refresh-services">刷新服务</button>
+            </div>
+            <div class="card guideSection" data-guide="services">
+              <h2>服务状态</h2>
+              <div id="serviceStatus" class="serviceGrid">服务状态加载中...</div>
+              <div class="row">
+                <button class="miniBtn" data-action="refresh-services">刷新服务</button>
+                <button class="miniBtn" data-action="proxy-diagnosis">诊断代理链路</button>
+                <button class="miniBtn" data-action="repair-quota-query">一键修复额度查询</button>
+                <button class="miniBtn" data-action="start-local-bridge">启动 Local Bridge</button>
+                <button class="miniBtn" data-action="restart-local-bridge">重启 Local Bridge</button>
+                <button class="miniBtn warn" data-action="stop-local-bridge">停止 Local Bridge</button>
+                <button class="miniBtn warn" data-action="stop-bridgedeck-ui">关闭 BridgeDeck UI</button>
+              </div>
+              <div id="serviceMessage" class="muted mt10">关闭 BridgeDeck UI 只停 8899，不影响 8876 Local Bridge。</div>
+              <div id="proxyDiagnosis" class="recommend">未诊断</div>
+            </div>
+          </section>
+
+          <section class="deckPage" id="page-diagnostics">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">诊断日志</h2>
+                <p class="pageDesc">账号矩阵、Codex Provider、CLI Home 和执行日志集中排查。</p>
+              </div>
+              <button data-action="refresh">刷新</button>
+            </div>
+            <div class="card guideSection" id="statusCard" data-guide="status">
+              <h2>账号状态检查</h2>
+              <div class="sectionHint">自动检测 Claude Code、单独 Codex CLI、全局 Codex CLI 当前状态。Desktop 跟随全局 Codex CLI。</div>
+              <div class="tableWrap">
+                <table id="accountMatrixTable">
+                  <thead>
+                    <tr>
+                      <th class="nameCol">账号</th><th class="smallCol">Claude</th><th class="smallCol">CLI</th><th class="smallCol">Desktop</th><th class="smallCol">状态</th><th class="urlCol">建议</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+              <div class="muted mt10">CC Switch Codex OAuth Provider：用于授权和额度检查；BridgeDeck 全局入口以上面 Desktop 列为准。</div>
+              <div class="tableWrap mt10">
+                <table id="codexProvidersTable">
+                  <thead>
+                    <tr>
+                      <th class="nameCol">名称</th><th class="smallCol">当前</th><th class="accountCol">绑定账号</th><th class="accountCol">实际账号</th><th class="smallCol">状态</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+              <div id="diagnosis" class="recommend"></div>
+              <div class="muted mt10">已配置 CLI 目录：这里只显示已经存在的 CODEX_HOME。</div>
+              <div class="tableWrap mt10">
+                <table id="cliHomesTable">
+                  <thead>
+                    <tr>
+                      <th class="urlCol">CLI 目录</th><th class="urlCol">切换命令</th><th class="accountCol">账号</th><th class="urlCol">email</th><th class="smallCol">状态</th><th class="urlCol">更新时间</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="card guideSection" data-guide="log">
+              <h2>执行日志</h2>
+              <textarea id="log" readonly></textarea>
+            </div>
+          </section>
+        </div>
+
+        <aside class="guideDock">
+          <div class="card">
+            <h2 id="guideTitle">当前操作</h2>
+            <div id="guideTarget" class="guideTarget">随当前版面自动切换</div>
+            <ol id="guideSteps" class="steps"></ol>
           </div>
-        </details>
+        </aside>
       </main>
     </div>
   </div>
@@ -3783,6 +3912,28 @@ INDEX_HTML = """<!doctype html>
           'OpenAI-compatible 工具使用 placeholder API key。',
           'Claude Desktop 3P 使用账号级 gateway，模型列表只暴露 claude-* 路由。',
           '这里只复制配置，不写入 provider，也不改变当前运行工具。'
+        ]
+      },
+      quota: {
+        title: '额度与自动切换',
+        target: '额度版面：OpenAI 账号额度和自动切换',
+        steps: [
+          '先看当前账号卡片是否标记“当前使用”。',
+          '5 小时和周额度任意一项接近阈值时，自动切换才有意义。',
+          '只勾选你希望 BridgeDeck 接管的入口。',
+          '保存后再点“立即检查并切换”。',
+          '新授权账号没有 Local Bridge 时，先创建桥接。'
+        ]
+      },
+      services: {
+        title: '本地服务',
+        target: '服务版面：8899 UI 和 8876 Local Bridge',
+        steps: [
+          '8876 Local Bridge 是 API 实际入口。',
+          '8899 BridgeDeck UI 只负责管理界面。',
+          '代理异常时先点“诊断代理链路”。',
+          '额度查询异常时点“一键修复额度查询”。',
+          '关闭 UI 不会停止 8876 Local Bridge。'
         ]
       },
       providerCreate: {
@@ -4015,6 +4166,45 @@ INDEX_HTML = """<!doctype html>
       };
       return map[value] || value || '未知';
     }
+    function quotaStatusClass(value) {
+      return value === 'ok' ? 'ok' : (value === 'near_limit' ? 'warn' : 'bad');
+    }
+    function quotaPercentClass(value) {
+      const used = Number(value);
+      if (!Number.isFinite(used)) return 'bad';
+      return used >= 100 ? 'bad' : (used >= 80 ? 'warn' : 'ok');
+    }
+    function quotaWindowLabel(windowInfo) {
+      const seconds = Number(windowInfo?.window_seconds || windowInfo?.limit_window_seconds || 0);
+      if (seconds >= 600000) return '周限额';
+      if (seconds >= 17000 && seconds <= 19000) return '5 小时限额';
+      return windowInfo?.name || '额度';
+    }
+    function quotaResetText(windowInfo) {
+      const raw = Number(windowInfo?.reset_at || 0);
+      if (!Number.isFinite(raw) || raw <= 0) return '';
+      const date = new Date(raw > 1000000000000 ? raw : raw * 1000);
+      if (Number.isNaN(date.getTime())) return '';
+      return date.toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    }
+    function quotaMeter(windowInfo, labelPrefix='') {
+      const used = Math.max(0, Math.min(100, Number(windowInfo?.used_percent ?? 0)));
+      const cls = quotaPercentClass(used);
+      const label = `${labelPrefix}${quotaWindowLabel(windowInfo)}`;
+      const reset = quotaResetText(windowInfo);
+      return `<div class="quotaMeter">
+        <div class="quotaMeterMeta"><span>${esc(label)}</span><strong>${esc(used)}%</strong><span class="quotaReset">${esc(reset)}</span></div>
+        <progress class="quotaProgress ${cls}" value="${esc(used)}" max="100"></progress>
+      </div>`;
+    }
+    function quotaPlanLabel(q) {
+      const plan = String(q.plan_type || '').trim();
+      const factor = Number(q.capacity_factor || 0);
+      if (factor >= 20) return 'Pro 20x';
+      if (factor >= 5) return 'Pro 5x';
+      if (plan) return plan.charAt(0).toUpperCase() + plan.slice(1);
+      return '未知套餐';
+    }
     function renderQuotaBoard(payload) {
       const board = document.getElementById('quotaBoard');
       const quotas = payload.quotas || [];
@@ -4025,24 +4215,35 @@ INDEX_HTML = """<!doctype html>
       const current = currentClaudeProvider(lastData || {});
       board.innerHTML = quotas.map((q) => {
         const status = q.quota_status || 'unknown';
-        const cls = status === 'ok' ? 'ok' : (status === 'near_limit' ? 'warnText' : 'bad');
+        const cls = quotaStatusClass(status);
         const currentCls = current && current.account_id === q.account_id ? ' current' : '';
-        const windows = (q.windows || []).map((w) => `${esc(w.name)}: <span class="${Number(w.used_percent) >= 100 ? 'bad' : Number(w.used_percent) >= 80 ? 'warnText' : 'ok'}">${esc(w.used_percent)}%</span>`).join('  ');
+        const windows = (q.windows || []).map((w) => quotaMeter(w)).join('');
         const spark = (q.additional_limits || []).find((item) => {
           const label = `${item.limit_name || ''} ${item.metered_feature || ''}`.toLowerCase();
           return label.includes('spark') || label.includes('bengalfox') || label.includes('gpt-5.3-codex');
         });
         const sparkWindows = spark
-          ? (spark.windows || []).map((w) => `${esc(w.name)}: <span class="${Number(w.used_percent) >= 100 ? 'bad' : Number(w.used_percent) >= 80 ? 'warnText' : 'ok'}">${esc(w.used_percent)}%</span>`).join('  ')
+          ? (spark.windows || []).map((w) => quotaMeter(w, 'GPT-5.3-Codex-Spark ')).join('')
           : '';
         const remaining = Number(q.effective_remaining_units);
         const remainingText = Number.isFinite(remaining)
-          ? `<br><span class="muted">估算剩余：${esc(remaining)} 单位，容量系数 x${esc(q.capacity_factor || 1)}</span>`
+          ? `<span class="badge ok">剩余 ${esc(remaining)} 单位</span>`
           : '';
         return `<div class="quotaPill${currentCls}">
-          <div class="quotaTitle">${esc(maskEmail(q.email || q.label || maskId(q.account_id || '')))} ${q.plan_type ? `<span class="muted">(${esc(q.plan_type)})</span>` : ''}</div>
-          <div class="quotaWindows">主额度：<span class="${cls}">${esc(quotaStatusText(status))}</span>${windows ? '<br>' + windows : ''}${remainingText}</div>
-          <div class="quotaWindows">Spark：${spark ? `<span class="${spark.quota_status === 'ok' ? 'ok' : (spark.quota_status === 'near_limit' ? 'warnText' : 'bad')}">${esc(quotaStatusText(spark.quota_status))}</span>${sparkWindows ? '<br>' + sparkWindows : ''}` : '<span class="muted">未返回</span>'}</div>
+          <div class="quotaHead">
+            <div>
+              <div class="quotaTitle">${esc(maskEmail(q.email || q.label || maskId(q.account_id || '')))}</div>
+              <div class="quotaMeta">
+                <span class="badge warn">${esc(quotaPlanLabel(q))}</span>
+                <span class="badge ${cls}">${esc(quotaStatusText(status))}</span>
+                ${currentCls ? '<span class="badge ok">当前使用</span>' : ''}
+                ${remainingText}
+              </div>
+            </div>
+            <span class="muted">x${esc(q.capacity_factor || 1)}</span>
+          </div>
+          <div>${windows || '<div class="quotaWindows">主额度未返回</div>'}</div>
+          <div>${spark ? `${sparkWindows || '<div class="quotaWindows">Spark 额度未返回</div>'}` : '<div class="quotaWindows">Spark：未返回</div>'}</div>
         </div>`;
       }).join('');
     }
@@ -4199,9 +4400,38 @@ INDEX_HTML = """<!doctype html>
       const id = selectedProviderId();
       return id && lastData ? (lastData.providers || []).find((p) => p.id === id) : null;
     }
+    function pageIdForSection(section) {
+      const page = section ? section.closest('.deckPage') : null;
+      return page && page.id ? page.id.replace(/^page-/, '') : '';
+    }
+    function showPage(pageId, pushState=false) {
+      const target = document.getElementById(`page-${pageId}`);
+      if (!target) return;
+      document.querySelectorAll('.deckPage').forEach((page) => {
+        page.classList.toggle('active', page === target);
+      });
+      document.querySelectorAll('.navItem[data-page]').forEach((item) => {
+        item.classList.toggle('active', item.dataset.page === pageId);
+      });
+      if (pushState) sessionStorage.setItem('bridgedeckPage', pageId);
+      const guideSection = target.querySelector('.guideSection');
+      if (guideSection) setGuide(guideSection.dataset.guide || 'providerCreate');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+    function initPageNav() {
+      const saved = sessionStorage.getItem('bridgedeckPage') || 'overview';
+      showPage(saved, false);
+      document.addEventListener('click', (event) => {
+        const button = event.target.closest('[data-page]');
+        if (!button) return;
+        showPage(button.dataset.page, true);
+      });
+    }
     function scrollToSection(id) {
       const section = document.getElementById(id);
       if (!section) return;
+      const pageId = pageIdForSection(section);
+      if (pageId) showPage(pageId, true);
       if (section.tagName === 'DETAILS') section.open = true;
       section.scrollIntoView({ behavior: 'smooth', block: 'start' });
       setGuide(section.dataset.guide || 'providerCreate');
@@ -4215,7 +4445,8 @@ INDEX_HTML = """<!doctype html>
     function initGuideObserver() {
       const sections = Array.from(document.querySelectorAll('.guideSection'));
       if (!sections.length) return;
-      setGuide(sections[0].dataset.guide || 'providerCreate');
+      const activeSection = document.querySelector('.deckPage.active .guideSection') || sections[0];
+      setGuide(activeSection.dataset.guide || 'providerCreate');
       sections.forEach((section) => {
         section.addEventListener('mouseenter', () => setGuide(section.dataset.guide || 'providerCreate'));
         section.addEventListener('focusin', () => setGuide(section.dataset.guide || 'providerCreate'));
@@ -5030,6 +5261,7 @@ INDEX_HTML = """<!doctype html>
         }
       });
     }
+    initPageNav();
     bindActions();
     renderBridgeModels();
     initGuideObserver();
