@@ -107,6 +107,10 @@ PROVIDER_SCOPED_ENV_KEYS = {
     COMPACT_THRESHOLD_ENV,
     MAX_CONTEXT_TOKENS_ENV,
 }
+CODEX_GLOBAL_ENV_CONFLICT_KEYS = (
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+)
 CANONICAL_BRIDGE_NAMES = (
     "Local Codex Bridge - Plus",
     "Local Codex Bridge - Pro",
@@ -314,6 +318,25 @@ def common_provider_env(env: dict[str, Any]) -> dict[str, Any]:
     }
     normalize_provider_model_env(common)
     return common
+
+
+def strip_toml_section_keys(text: str, section: str, keys: tuple[str, ...]) -> tuple[str, list[str]]:
+    removed: list[str] = []
+    output: list[str] = []
+    in_section = False
+    header = f"[{section}]"
+    key_pattern = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == header
+        if in_section:
+            match = key_pattern.match(line)
+            if match and match.group(1) in keys:
+                removed.append(match.group(1))
+                continue
+        output.append(line)
+    return "".join(output), sorted(set(removed))
 
 
 def bridge_account_id_from_base_url(base_url: str) -> str:
@@ -3688,6 +3711,11 @@ class BridgeManager:
             os.chmod(DEFAULT_CODEX_HOME, 0o700)
             backup = self._backup_file(config_path, "set-default-codex") if config_path.exists() else None
             original = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+            original, removed_env_keys = strip_toml_section_keys(
+                original,
+                "shell_environment_policy.set",
+                CODEX_GLOBAL_ENV_CONFLICT_KEYS,
+            )
             base_url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1"
             line = f'base_url = "{base_url}"'
             pattern = re.compile(r'(?m)^\s*base_url\s*=\s*["\'][^"\']*["\']\s*$')
@@ -3710,8 +3738,48 @@ class BridgeManager:
                 "omc_codex_path": omc_path,
                 "base_url": base_url,
                 "affected": ["Paperclip", "Codex Desktop", "default codex", "codex-current.command", "OMC/tmux codex"],
+                "removed_env_keys": removed_env_keys,
                 "backups": [item for item in (backup, omc_path.get("backup")) if item],
             }
+
+    def repair_codex_environment_conflicts(self) -> dict[str, Any]:
+        config_path = DEFAULT_CODEX_HOME / "config.toml"
+        if config_path.is_symlink():
+            raise ValueError("~/.codex/config.toml 不能是符号链接")
+        if not config_path.exists():
+            return {
+                "ok": True,
+                "changed": False,
+                "message": "未发现 Codex 环境冲突",
+                "config_path": str(config_path),
+                "removed_env_keys": [],
+                "backup": None,
+            }
+        original = config_path.read_text(encoding="utf-8")
+        updated, removed_env_keys = strip_toml_section_keys(
+            original,
+            "shell_environment_policy.set",
+            CODEX_GLOBAL_ENV_CONFLICT_KEYS,
+        )
+        if updated == original:
+            return {
+                "ok": True,
+                "changed": False,
+                "message": "未发现 Codex 环境冲突",
+                "config_path": str(config_path),
+                "removed_env_keys": [],
+                "backup": None,
+            }
+        backup = self._backup_file(config_path, "codex-env-conflict")
+        write_private_text_file(config_path, updated)
+        return {
+            "ok": True,
+            "changed": True,
+            "message": "已清理 Codex 环境冲突",
+            "config_path": str(config_path),
+            "removed_env_keys": removed_env_keys,
+            "backup": backup,
+        }
 
     def migrate_cli_launcher(self, account_id: str, target_dir: str, profile_name: str) -> dict[str, Any]:
         target = self._validate_cli_home(target_dir)
@@ -4781,6 +4849,7 @@ INDEX_HTML = """<!doctype html>
                 <button class="miniBtn" data-action="refresh-services">刷新服务</button>
                 <button class="miniBtn" data-action="proxy-diagnosis">诊断代理链路</button>
                 <button class="miniBtn" data-action="repair-quota-query">一键修复额度查询</button>
+                <button class="miniBtn" data-action="repair-codex-env-conflicts">清理环境冲突</button>
                 <button class="miniBtn" data-action="start-local-bridge">启动 Local Bridge</button>
                 <button class="miniBtn" data-action="restart-local-bridge">重启 Local Bridge</button>
                 <button class="miniBtn warn" data-action="stop-local-bridge">停止 Local Bridge</button>
@@ -5590,6 +5659,15 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('serviceMessage').textContent = actions || `额度查询已刷新，正常账号 ${okCount} 个`;
       log(`额度修复: ${document.getElementById('serviceMessage').textContent}`);
       await refreshData();
+      return res;
+    }
+    async function repairCodexEnvConflicts() {
+      const res = await api('/api/repair-codex-env-conflicts', 'POST', {});
+      const keys = (res.removed_env_keys || []).join(', ');
+      const message = res.changed ? `${res.message}: ${keys}` : res.message;
+      document.getElementById('serviceMessage').textContent = message;
+      log(`环境冲突清理: ${message}`);
+      await refreshServices();
       return res;
     }
     function setSimpleResult(message, level='') {
@@ -6610,6 +6688,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'refresh-services') return refreshServices();
           if (action === 'proxy-diagnosis') return runProxyDiagnosis();
           if (action === 'repair-quota-query') return repairQuotaQuery();
+          if (action === 'repair-codex-env-conflicts') return repairCodexEnvConflicts();
           if (action === 'start-local-bridge') return controlLocalBridge('start');
           if (action === 'stop-local-bridge') return controlLocalBridge('stop');
           if (action === 'restart-local-bridge') return controlLocalBridge('restart');
@@ -6971,6 +7050,10 @@ def build_handler(
                     return
                 if self.path == "/api/repair-quota-query":
                     result = manager.repair_quota_query()
+                    json_response(self, 200 if result.get("ok", True) else 400, result)
+                    return
+                if self.path == "/api/repair-codex-env-conflicts":
+                    result = manager.repair_codex_environment_conflicts()
                     json_response(self, 200 if result.get("ok", True) else 400, result)
                     return
                 json_response(self, 404, {"ok": False, "error": "Not Found"})

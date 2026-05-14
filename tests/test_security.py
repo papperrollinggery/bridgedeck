@@ -3610,7 +3610,19 @@ class LauncherCase(unittest.TestCase):
             zprofile.write_text('eval "$(/opt/homebrew/bin/brew shellenv)"\n', encoding="utf-8")
             config = codex_home / "config.toml"
             config.write_text(
-                'model = "gpt-5.5"\nbase_url = "http://127.0.0.1:15721/v1"\n',
+                '\n'.join(
+                    [
+                        'model = "gpt-5.5"',
+                        'base_url = "http://127.0.0.1:15721/v1"',
+                        '[shell_environment_policy]',
+                        'inherit = "core"',
+                        '[shell_environment_policy.set]',
+                        'ANTHROPIC_AUTH_TOKEN = "PROXY_MANAGED"',
+                        'ANTHROPIC_BASE_URL = "http://127.0.0.1:15721"',
+                        'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"',
+                        "",
+                    ]
+                ),
                 encoding="utf-8",
             )
 
@@ -3629,6 +3641,10 @@ class LauncherCase(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertIn('base_url = "http://127.0.0.1:8876/accounts/acct-1/v1"', body)
             self.assertIn('model = "gpt-5.5"', body)
+            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", body)
+            self.assertNotIn("ANTHROPIC_BASE_URL", body)
+            self.assertIn("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", body)
+            self.assertEqual(result["removed_env_keys"], ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"])
             self.assertNotIn("secret-refresh-token", body)
             self.assertNotIn("access_token", body)
             self.assertTrue(result["backups"])
@@ -3665,6 +3681,41 @@ class LauncherCase(unittest.TestCase):
                     manager.set_default_codex_account("acct-1")
 
             self.assertEqual(config.read_text(encoding="utf-8"), original)
+
+    def test_repair_codex_environment_conflicts_removes_only_global_anthropic_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text(
+                '\n'.join(
+                    [
+                        'base_url = "http://127.0.0.1:8876/accounts/acct-1/v1"',
+                        '[shell_environment_policy.set]',
+                        'ANTHROPIC_AUTH_TOKEN = "PROXY_MANAGED"',
+                        'ANTHROPIC_BASE_URL = "http://127.0.0.1:15721"',
+                        'CLAUDE_CODE_AUTO_COMPACT_WINDOW = "220000"',
+                        '[notice.model_migrations]',
+                        '"gpt-5.3-codex" = "gpt-5.4"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home):
+                result = manager.repair_codex_environment_conflicts()
+
+            body = config.read_text(encoding="utf-8")
+            self.assertTrue(result["changed"])
+            self.assertEqual(result["removed_env_keys"], ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"])
+            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", body)
+            self.assertNotIn("ANTHROPIC_BASE_URL", body)
+            self.assertIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", body)
+            self.assertIn("[notice.model_migrations]", body)
+            self.assertTrue(result["backup"])
 
     def test_error_classifier(self) -> None:
         self.assertEqual(
