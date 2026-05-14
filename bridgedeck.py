@@ -543,9 +543,10 @@ def exchange_codex_device_auth(device_auth_id: str, user_code: str) -> dict[str,
     code = str(payload.get("authorization_code") or payload.get("code") or "")
     if not code:
         raise RuntimeError("Device authorization failed: missing authorization code")
+    verifier = str(payload.get("code_verifier") or CODEX_DEVICE_CODE_VERIFIER)
     return exchange_codex_oauth_code(
         code,
-        CODEX_DEVICE_CODE_VERIFIER,
+        verifier,
         redirect_uri=CODEX_DEVICE_REDIRECT_URI,
     )
 
@@ -1029,6 +1030,7 @@ class BridgeManager:
         self._lock = threading.RLock()
         self._oauth_lock = threading.RLock()
         self._oauth_flows: dict[str, CodexOAuthFlow] = {}
+        self._load_oauth_flows()
         self._oauth_callback_server: ThreadingHTTPServer | None = None
         self._oauth_callback_thread: threading.Thread | None = None
 
@@ -1053,10 +1055,85 @@ class BridgeManager:
         expired = [
             flow_id
             for flow_id, flow in self._oauth_flows.items()
-            if flow.created_at < cutoff and flow.status == "pending"
+            if flow.created_at < cutoff and flow.status != "completed"
         ]
         for flow_id in expired:
             self._oauth_flows.pop(flow_id, None)
+        if expired:
+            self._persist_oauth_flows_locked()
+
+    def _oauth_flow_state_path(self) -> Path:
+        return self.paths.db.parent / "bridgedeck-oauth-flows.json"
+
+    def _oauth_flow_to_dict(self, flow: CodexOAuthFlow) -> dict[str, Any]:
+        return {
+            "flow_id": flow.flow_id,
+            "set_default": flow.set_default,
+            "created_at": flow.created_at,
+            "state": flow.state,
+            "verifier": flow.verifier,
+            "auth_url": flow.auth_url,
+            "status": flow.status,
+            "device_auth_id": flow.device_auth_id,
+            "user_code": flow.user_code,
+            "verification_url": flow.verification_url,
+            "interval": flow.interval,
+            "expires_at": flow.expires_at,
+            "next_poll_at": flow.next_poll_at,
+            "bridge_provider_exists": flow.bridge_provider_exists,
+            "account_id": flow.account_id,
+            "email": flow.email,
+            "error": flow.error,
+        }
+
+    def _load_oauth_flows(self) -> None:
+        try:
+            raw = load_json(self._oauth_flow_state_path(), {})
+        except Exception:
+            return
+        entries = raw.get("flows") if isinstance(raw, dict) else []
+        if not isinstance(entries, list):
+            return
+        cutoff = time.time() - CODEX_OAUTH_FLOW_TTL_SECS
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            flow_id = str(item.get("flow_id") or "")
+            created_at = safe_float(item.get("created_at"), 0.0)
+            if not flow_id or (created_at < cutoff and str(item.get("status") or "") != "completed"):
+                continue
+            status = str(item.get("status") or "pending")
+            if status == "exchanging":
+                status = "pending"
+            self._oauth_flows[flow_id] = CodexOAuthFlow(
+                flow_id=flow_id,
+                set_default=bool(item.get("set_default")),
+                created_at=created_at or time.time(),
+                state=str(item.get("state") or ""),
+                verifier=str(item.get("verifier") or ""),
+                auth_url=str(item.get("auth_url") or ""),
+                status=status,
+                device_auth_id=str(item.get("device_auth_id") or ""),
+                user_code=str(item.get("user_code") or ""),
+                verification_url=str(item.get("verification_url") or CODEX_DEVICE_VERIFY_URL),
+                interval=max(2, min(30, safe_int(item.get("interval"), 5))),
+                expires_at=str(item.get("expires_at") or ""),
+                next_poll_at=safe_float(item.get("next_poll_at"), 0.0),
+                bridge_provider_exists=bool(item.get("bridge_provider_exists")),
+                account_id=str(item.get("account_id") or ""),
+                email=str(item.get("email") or ""),
+                error=str(item.get("error") or ""),
+            )
+
+    def _persist_oauth_flows_locked(self) -> None:
+        dump_json(
+            self._oauth_flow_state_path(),
+            {
+                "version": 1,
+                "updated_at": int(time.time()),
+                "flows": [self._oauth_flow_to_dict(flow) for flow in self._oauth_flows.values()],
+            },
+        )
 
     def _oauth_flow_payload(self, flow: CodexOAuthFlow) -> dict[str, Any]:
         return {
@@ -1152,6 +1229,7 @@ class BridgeManager:
         with self._oauth_lock:
             self._cleanup_oauth_flows()
             self._oauth_flows[flow.flow_id] = flow
+            self._persist_oauth_flows_locked()
         result = self._oauth_flow_payload(flow)
         result.update(
             {
@@ -1190,6 +1268,7 @@ class BridgeManager:
             if incoming_state and incoming_state != flow.state:
                 flow.status = "error"
                 flow.error = "OAuth state 不一致"
+                self._persist_oauth_flows_locked()
                 raise ValueError(flow.error)
         return self._complete_codex_oauth_flow(flow, code)
 
@@ -1243,6 +1322,7 @@ class BridgeManager:
         mode = "updated" if existing else "created"
         with self._oauth_lock:
             flow.bridge_provider_exists = True
+            self._persist_oauth_flows_locked()
         return {
             "ok": True,
             "mode": mode,
@@ -1259,6 +1339,7 @@ class BridgeManager:
                 return {**self._oauth_flow_payload(flow), "message": "正在交换 token"}
             flow.status = "exchanging"
             flow.error = ""
+            self._persist_oauth_flows_locked()
         try:
             token_data = exchange_codex_device_auth(flow.device_auth_id, flow.user_code)
             account_id = self._save_codex_oauth_account(token_data, set_default=flow.set_default)
@@ -1269,6 +1350,7 @@ class BridgeManager:
                 flow.email = str(identity.get("email") or "")
                 flow.bridge_provider_exists = self._bridge_provider_for_account(account_id) is not None
                 flow.error = ""
+                self._persist_oauth_flows_locked()
                 return {
                     **self._oauth_flow_payload(flow),
                     "message": f"授权完成：{mask_email_value(flow.email) or mask_id_value(account_id)}",
@@ -1278,11 +1360,13 @@ class BridgeManager:
                 flow.status = "pending"
                 flow.error = ""
                 flow.next_poll_at = time.time() + flow.interval
+                self._persist_oauth_flows_locked()
                 return {**self._oauth_flow_payload(flow), "message": "等待用户输入验证码并确认"}
         except Exception as exc:  # noqa: BLE001
             with self._oauth_lock:
                 flow.status = "error"
                 flow.error = str(exc)
+                self._persist_oauth_flows_locked()
                 return self._oauth_flow_payload(flow)
 
     def _complete_codex_oauth_flow(self, flow: CodexOAuthFlow, code: str) -> dict[str, Any]:
@@ -1293,6 +1377,7 @@ class BridgeManager:
                 return {**self._oauth_flow_payload(flow), "message": "正在交换 token"}
             flow.status = "exchanging"
             flow.error = ""
+            self._persist_oauth_flows_locked()
         try:
             token_data = exchange_codex_oauth_code(code, flow.verifier)
             account_id = self._save_codex_oauth_account(token_data, set_default=flow.set_default)
@@ -1303,6 +1388,7 @@ class BridgeManager:
                 flow.email = str(identity.get("email") or "")
                 flow.bridge_provider_exists = self._bridge_provider_for_account(account_id) is not None
                 flow.error = ""
+                self._persist_oauth_flows_locked()
                 return {
                     **self._oauth_flow_payload(flow),
                     "message": f"授权完成：{mask_email_value(flow.email) or mask_id_value(account_id)}",
@@ -1311,6 +1397,7 @@ class BridgeManager:
             with self._oauth_lock:
                 flow.status = "error"
                 flow.error = str(exc)
+                self._persist_oauth_flows_locked()
                 return self._oauth_flow_payload(flow)
 
     def _save_codex_oauth_account(self, token_data: dict[str, Any], *, set_default: bool) -> str:

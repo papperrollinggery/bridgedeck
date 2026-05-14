@@ -2454,6 +2454,66 @@ class LauncherCase(unittest.TestCase):
             user_agent=bridgedeck.CODEX_DEVICE_USER_AGENT,
         )
 
+    def test_codex_oauth_device_flow_persists_across_ui_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = bridgedeck.ManagerPaths(
+                db=root / "cc-switch.db",
+                settings=root / "settings.json",
+                auth_store=root / "codex_oauth_auth.json",
+            )
+            with mock.patch.object(
+                bridgedeck,
+                "request_codex_device_code",
+                return_value={
+                    "device_auth_id": "deviceauth-test",
+                    "user_code": "ABCD-EFGH",
+                    "interval": "5",
+                    "expires_at": "2026-05-14T13:48:09Z",
+                },
+            ):
+                started = bridgedeck.BridgeManager(paths).start_codex_oauth()
+
+            restored = bridgedeck.BridgeManager(paths).codex_oauth_status(started["flow_id"])
+
+        self.assertEqual(restored["status"], "pending")
+        self.assertEqual(restored["user_code"], "ABCD-EFGH")
+
+    def test_codex_oauth_exchanging_flow_reloads_as_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            flow_path = root / "bridgedeck-oauth-flows.json"
+            flow_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "flows": [
+                            {
+                                "flow_id": "flow-1",
+                                "set_default": False,
+                                "created_at": time.time(),
+                                "status": "exchanging",
+                                "device_auth_id": "deviceauth-test",
+                                "user_code": "ABCD-EFGH",
+                                "verification_url": bridgedeck.CODEX_DEVICE_VERIFY_URL,
+                                "interval": 5,
+                                "next_poll_at": time.time() + 1000,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths = bridgedeck.ManagerPaths(
+                db=root / "cc-switch.db",
+                settings=root / "settings.json",
+                auth_store=root / "codex_oauth_auth.json",
+            )
+
+            result = bridgedeck.BridgeManager(paths).codex_oauth_status("flow-1")
+
+        self.assertEqual(result["status"], "pending")
+
     def test_exchange_codex_device_auth_exchanges_authorization_code(self) -> None:
         token = {"access_token": fake_jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct"}}), "refresh_token": "refresh"}
         with mock.patch.object(
@@ -2467,6 +2527,22 @@ class LauncherCase(unittest.TestCase):
         exchange.assert_called_once_with(
             "auth-code",
             bridgedeck.CODEX_DEVICE_CODE_VERIFIER,
+            redirect_uri=bridgedeck.CODEX_DEVICE_REDIRECT_URI,
+        )
+
+    def test_exchange_codex_device_auth_uses_returned_code_verifier(self) -> None:
+        token = {"access_token": fake_jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct"}}), "refresh_token": "refresh"}
+        with mock.patch.object(
+            bridgedeck,
+            "_post_json_url",
+            return_value={"authorization_code": "auth-code", "code_verifier": "returned-verifier"},
+        ), mock.patch.object(bridgedeck, "exchange_codex_oauth_code", return_value=token) as exchange:
+            result = bridgedeck.exchange_codex_device_auth("deviceauth-test", "ABCD-EFGH")
+
+        self.assertEqual(result, token)
+        exchange.assert_called_once_with(
+            "auth-code",
+            "returned-verifier",
             redirect_uri=bridgedeck.CODEX_DEVICE_REDIRECT_URI,
         )
 
