@@ -388,8 +388,8 @@ class FakeManager:
             },
         }
 
-    def control_local_bridge(self, action: str) -> dict[str, Any]:
-        return {"ok": True, "message": f"local bridge {action}", **self.services()}
+    def control_local_bridge(self, action: str, *, force: bool = False) -> dict[str, Any]:
+        return {"ok": True, "message": f"local bridge {action}", "force": force, **self.services()}
 
     def repair_quota_query(self) -> dict[str, Any]:
         payload = self.quotas()
@@ -1970,6 +1970,58 @@ class ServerCase(unittest.TestCase):
             "http://127.0.0.1:1087",
         )
 
+    def test_port_active_connections_parses_lsof_field_output(self) -> None:
+        proc = types.SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "p111\n"
+                "clocal_codex\n"
+                "n127.0.0.1:8876->127.0.0.1:52100\n"
+                "p222\n"
+                "cClaude\n"
+                "n127.0.0.1:52100->127.0.0.1:8876\n"
+            ),
+        )
+
+        with mock.patch.object(bridgedeck, "run_quiet", return_value=proc):
+            connections = bridgedeck.port_active_connections(8876)
+
+        self.assertEqual(len(connections), 2)
+        self.assertEqual(connections[0]["pid"], 111)
+        self.assertEqual(connections[1]["command"], "Claude")
+
+    def test_local_bridge_restart_is_blocked_with_active_connections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = bridgedeck.BridgeManager(
+                bridgedeck.ManagerPaths(
+                    db=Path(tmp) / "cc-switch.db",
+                    settings=Path(tmp) / "settings.json",
+                    auth_store=Path(tmp) / "auth.json",
+                )
+            )
+            with (
+                mock.patch.object(
+                    bridgedeck,
+                    "port_processes",
+                    return_value=[{"pid": 123, "command": "/Applications/BridgeDeck.app/Contents/Resources/local_codex_bridge.py"}],
+                ),
+                mock.patch.object(
+                    bridgedeck,
+                    "port_active_connections",
+                    return_value=[{"pid": 456, "command": "Claude", "endpoint": "127.0.0.1:52100->127.0.0.1:8876"}],
+                ),
+                mock.patch.object(bridgedeck, "detect_upstream_proxy", return_value=""),
+                mock.patch.object(bridgedeck, "tcp_open", return_value=True),
+                mock.patch.object(bridgedeck, "read_local_bridge_state", return_value={}),
+                mock.patch.object(bridgedeck.os, "kill") as kill,
+            ):
+                result = manager.control_local_bridge("restart")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["requires_force"])
+        self.assertIn("正在被客户端使用", result["message"])
+        kill.assert_not_called()
+
     def test_remote_mode_blocks_secret_reveal(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
 
@@ -2205,6 +2257,21 @@ class ServerCase(unittest.TestCase):
 
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "Write APIs are disabled for remote mode")
+
+    def test_local_bridge_control_accepts_force_flag(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/local-bridge-control",
+            method="POST",
+            body={"action": "restart", "force": True},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["force"])
 
     def test_ui_control_shutdown_is_local_only_and_async(self) -> None:
         server, _ = self.start_server()

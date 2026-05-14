@@ -935,6 +935,47 @@ def port_processes(port: int) -> list[dict[str, Any]]:
     return [{"pid": pid, "command": process_command(pid)} for pid in pids_listening_on_port(port)]
 
 
+def port_active_connections(port: int) -> list[dict[str, Any]]:
+    proc = run_quiet(["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:ESTABLISHED", "-F", "pcn"], timeout=2)
+    if not proc or proc.returncode not in (0, 1):
+        return []
+    connections: list[dict[str, Any]] = []
+    current: dict[str, Any] = {}
+    for line in proc.stdout.splitlines():
+        if not line:
+            continue
+        tag, value = line[0], line[1:]
+        if tag == "p":
+            if current:
+                connections.append(current)
+            current = {"pid": safe_int(value, 0)}
+        elif tag == "c":
+            current["command"] = value
+        elif tag == "n":
+            current["endpoint"] = value
+    if current:
+        connections.append(current)
+    filtered: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for item in connections:
+        endpoint = str(item.get("endpoint") or "")
+        pid = safe_int(item.get("pid"), 0)
+        if not pid or f":{port}" not in endpoint:
+            continue
+        key = (pid, endpoint)
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(
+            {
+                "pid": pid,
+                "command": str(item.get("command") or ""),
+                "endpoint": endpoint,
+            }
+        )
+    return filtered
+
+
 @dataclass
 class ManagerPaths:
     db: Path
@@ -1912,6 +1953,7 @@ class BridgeManager:
         bridge_script = find_local_bridge_script(bridge_processes)
         upstream_proxy = detect_upstream_proxy(bridge_processes)
         bridge_state = read_local_bridge_state()
+        active_connections = port_active_connections(LOCAL_BRIDGE_PORT)
         return {
             "ok": True,
             "services": {
@@ -1927,6 +1969,9 @@ class BridgeManager:
                     "processes": bridge_processes,
                     "script": str(bridge_script) if bridge_script else "",
                     "can_start": bool(bridge_script),
+                    "active_connections": active_connections,
+                    "active_connection_count": len(active_connections),
+                    "restart_protected": bool(active_connections),
                     "upstream_proxy": mask_url_credentials(upstream_proxy),
                     "log_path": str(self.paths.db.parent / "bridgedeck-local-bridge.log"),
                     "last_stream_error": bridge_state.get("last_stream_error") or {},
@@ -2139,7 +2184,7 @@ class BridgeManager:
             time.sleep(0.2)
         return {**self.services(), "ok": False, "error": f"Local Codex Bridge 启动超时，日志：{log_path}"}
 
-    def _stop_local_bridge(self) -> dict[str, Any]:
+    def _stop_local_bridge(self, *, force: bool = False) -> dict[str, Any]:
         processes = port_processes(LOCAL_BRIDGE_PORT)
         targets = [
             proc
@@ -2150,6 +2195,17 @@ class BridgeManager:
             return {**self.services(), "ok": True, "message": "Local Codex Bridge 未运行"}
         if not targets:
             return {**self.services(), "ok": False, "error": f"{LOCAL_BRIDGE_PORT} 端口被其它进程占用，未停止"}
+        active_connections = port_active_connections(LOCAL_BRIDGE_PORT)
+        if active_connections and not force:
+            message = "检测到 8876 正在被客户端使用，未停止 Local Bridge"
+            return {
+                **self.services(),
+                "ok": False,
+                "requires_force": True,
+                "message": message,
+                "error": message,
+                "active_connections": active_connections,
+            }
 
         for proc in targets:
             try:
@@ -2167,13 +2223,13 @@ class BridgeManager:
                 pass
         return {**self.services(), "ok": True, "message": "Local Codex Bridge 已强制停止"}
 
-    def control_local_bridge(self, action: str) -> dict[str, Any]:
+    def control_local_bridge(self, action: str, *, force: bool = False) -> dict[str, Any]:
         if action == "start":
             return self._start_local_bridge()
         if action == "stop":
-            return self._stop_local_bridge()
+            return self._stop_local_bridge(force=force)
         if action == "restart":
-            stopped = self._stop_local_bridge()
+            stopped = self._stop_local_bridge(force=force)
             if not stopped.get("ok"):
                 return stopped
             return self._start_local_bridge()
@@ -4164,7 +4220,7 @@ INDEX_HTML = """<!doctype html>
               </div>
               <div class="metricCard">
                 <div class="metricHead"><span>Token 用量</span><span class="metricIcon">◇</span></div>
-                <div id="metricTokenValue" class="metricValue">未采集</div>
+                <div id="metricTokenValue" class="metricValue">等待请求</div>
                 <div class="metricSub">
                   <div class="metricLine"><span>Input</span><strong id="metricTokenInput">-</strong></div>
                   <div class="metricLine"><span>Output</span><strong id="metricTokenOutput">-</strong></div>
@@ -4172,7 +4228,7 @@ INDEX_HTML = """<!doctype html>
               </div>
               <div class="metricCard">
                 <div class="metricHead"><span>缓存 Token</span><span class="metricIcon warn">◎</span></div>
-                <div id="metricCacheValue" class="metricValue">未采集</div>
+                <div id="metricCacheValue" class="metricValue">等待请求</div>
                 <div class="metricSub">
                   <div class="metricLine"><span>创建</span><strong id="metricCacheCreate">-</strong></div>
                   <div class="metricLine"><span>命中</span><strong id="metricCacheHit">-</strong></div>
@@ -4258,7 +4314,7 @@ INDEX_HTML = """<!doctype html>
               </div>
             </div>
             <div class="usageControls">
-              <div class="sectionHint">明细只保留最近 200 条；账号显示会按当前本机配置做脱敏。</div>
+              <div class="sectionHint">明细只保留最近 200 条；采集从新版 8876 Local Codex Bridge 启动后的下一次 LLM 请求开始，历史请求不会回填。</div>
               <div class="row">
                 <button class="miniBtn" data-page="services">服务状态</button>
                 <button class="miniBtn" data-page="diagnostics">诊断日志</button>
@@ -4996,15 +5052,18 @@ INDEX_HTML = """<!doctype html>
       setMetricIcon('metricAccountIcon', mismatchedProviders.length ? 'bad' : 'ok');
 
       const usage = data.usage_metrics || {};
+      const hasUsageRequests = Number(usage.request_count || 0) > 0;
       const totalTokens = Number(usage.total_tokens);
       const inputTokens = Number(usage.input_tokens);
       const outputTokens = Number(usage.output_tokens);
-      setText('metricTokenValue', Number.isFinite(totalTokens) && totalTokens > 0 ? fmtMetricNumber(totalTokens) : '未采集');
-      setText('metricTokenInput', Number.isFinite(inputTokens) && inputTokens > 0 ? fmtMetricNumber(inputTokens) : '-');
-      setText('metricTokenOutput', Number.isFinite(outputTokens) && outputTokens > 0 ? fmtMetricNumber(outputTokens) : '-');
-      setText('metricCacheValue', Number.isFinite(Number(usage.cached_tokens)) && Number(usage.cached_tokens) > 0 ? fmtMetricNumber(usage.cached_tokens) : '未采集');
-      setText('metricCacheCreate', Number.isFinite(Number(usage.cache_creation_tokens)) && Number(usage.cache_creation_tokens) > 0 ? fmtMetricNumber(usage.cache_creation_tokens) : '-');
-      setText('metricCacheHit', Number.isFinite(Number(usage.cached_tokens)) && Number(usage.cached_tokens) > 0 ? fmtMetricNumber(usage.cached_tokens) : '-');
+      const cachedTokens = Number(usage.cached_tokens);
+      const cacheCreationTokens = Number(usage.cache_creation_tokens);
+      setText('metricTokenValue', hasUsageRequests && Number.isFinite(totalTokens) ? fmtMetricNumber(totalTokens) : '等待请求');
+      setText('metricTokenInput', hasUsageRequests && Number.isFinite(inputTokens) ? fmtMetricNumber(inputTokens) : '-');
+      setText('metricTokenOutput', hasUsageRequests && Number.isFinite(outputTokens) ? fmtMetricNumber(outputTokens) : '-');
+      setText('metricCacheValue', hasUsageRequests && Number.isFinite(cachedTokens) ? fmtMetricNumber(cachedTokens) : '等待请求');
+      setText('metricCacheCreate', hasUsageRequests && Number.isFinite(cacheCreationTokens) ? fmtMetricNumber(cacheCreationTokens) : '-');
+      setText('metricCacheHit', hasUsageRequests && Number.isFinite(cachedTokens) ? fmtMetricNumber(cachedTokens) : '-');
 
       const provider = currentClaudeProvider(data);
       const claudeAccount = provider && provider.account_id ? accountDisplay(provider.account_id) : '外部供应商/未检测到';
@@ -5050,7 +5109,7 @@ INDEX_HTML = """<!doctype html>
       const body = document.getElementById('usageRows');
       if (!body) return;
       if (!events.length) {
-        body.innerHTML = '<tr><td colspan="11">还没有采集到 Local Codex Bridge 使用详情。</td></tr>';
+        body.innerHTML = '<tr><td colspan="11">采集已启用，等待下一次通过 8876 Local Codex Bridge 的 LLM 请求；升级前的历史请求不会回填。</td></tr>';
         return;
       }
       body.innerHTML = events.map((event) => {
@@ -5379,7 +5438,25 @@ INDEX_HTML = """<!doctype html>
       return payload;
     }
     async function controlLocalBridge(action) {
-      const res = await api('/api/local-bridge-control', 'POST', { action });
+      let res;
+      try {
+        res = await api('/api/local-bridge-control', 'POST', { action });
+      } catch (err) {
+        const payload = err && err.payload ? err.payload : {};
+        if ((action === 'stop' || action === 'restart') && payload.requires_force) {
+          const count = Number((payload.active_connections || []).length || 0);
+          const message = payload.message || '检测到 8876 正在被客户端使用，已取消操作';
+          document.getElementById('serviceMessage').textContent = message;
+          log(`Local Bridge ${action} 被保护拦截: ${message}`);
+          if (!confirm(`${message}\\n\\n活动连接：${count}\\n继续会中断当前 Claude/CC Switch 请求。确认强制执行？`)) {
+            await refreshServices();
+            return payload;
+          }
+          res = await api('/api/local-bridge-control', 'POST', { action, force: true });
+        } else {
+          throw err;
+        }
+      }
       renderServices(res);
       document.getElementById('serviceMessage').textContent = res.message || 'Local Bridge 操作完成';
       log(`Local Bridge ${action}: ${res.message || 'done'}`);
@@ -6764,8 +6841,12 @@ def build_handler(
                     json_response(self, 200 if result.get("ok", True) else 400, result)
                     return
                 if self.path == "/api/local-bridge-control":
-                    result = manager.control_local_bridge(str(payload.get("action") or ""))
-                    json_response(self, 200 if result.get("ok") else 400, result)
+                    result = manager.control_local_bridge(
+                        str(payload.get("action") or ""),
+                        force=bool(payload.get("force")),
+                    )
+                    status = 200 if result.get("ok") else (409 if result.get("requires_force") else 400)
+                    json_response(self, status, result)
                     return
                 if self.path == "/api/ui-control":
                     action = str(payload.get("action") or "")
@@ -6818,6 +6899,11 @@ def parse_args() -> argparse.Namespace:
         choices=("start", "stop", "restart", "status"),
         help="Control the 8876 Local Codex Bridge without starting the 8899 UI.",
     )
+    parser.add_argument(
+        "--force-local-bridge",
+        action="store_true",
+        help="Allow stopping/restarting Local Bridge even when active client connections exist.",
+    )
     return parser.parse_args()
 
 
@@ -6839,7 +6925,9 @@ def main() -> int:
         if args.local_bridge == "status":
             print(json.dumps(manager.services().get("services", {}).get("local_bridge", {}), ensure_ascii=False))
         else:
-            print(json.dumps(manager.control_local_bridge(args.local_bridge), ensure_ascii=False))
+            result = manager.control_local_bridge(args.local_bridge, force=bool(args.force_local_bridge))
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result.get("ok") else 2
         return 0
     allow_sensitive = host_is_loopback or bool(args.allow_remote_write)
     handler = build_handler(
