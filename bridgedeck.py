@@ -510,6 +510,23 @@ def request_codex_device_code() -> dict[str, Any]:
     return payload
 
 
+def extract_codex_token_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("access_token") and payload.get("refresh_token"):
+        return payload
+    for key in ("token", "tokens", "oauth_token"):
+        candidate = payload.get(key)
+        if not isinstance(candidate, dict):
+            continue
+        if not candidate.get("access_token") or not candidate.get("refresh_token"):
+            continue
+        merged = dict(candidate)
+        for identity_key in ("account_id", "email", "organization_id"):
+            if identity_key in payload and identity_key not in merged:
+                merged[identity_key] = payload[identity_key]
+        return merged
+    return {}
+
+
 def exchange_codex_device_auth(device_auth_id: str, user_code: str) -> dict[str, Any]:
     payload = _post_json_url(
         CODEX_DEVICE_TOKEN_URL,
@@ -520,8 +537,9 @@ def exchange_codex_device_auth(device_auth_id: str, user_code: str) -> dict[str,
         },
         user_agent=CODEX_DEVICE_USER_AGENT,
     )
-    if payload.get("access_token") and payload.get("refresh_token"):
-        return payload
+    token_payload = extract_codex_token_payload(payload)
+    if token_payload:
+        return token_payload
     code = str(payload.get("authorization_code") or payload.get("code") or "")
     if not code:
         raise RuntimeError("Device authorization failed: missing authorization code")
@@ -551,8 +569,9 @@ def exchange_codex_oauth_code(
         CODEX_OAUTH_TOKEN_URL,
         data=body,
         headers={
+            "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "bridgedeck-codex-oauth",
+            "User-Agent": CODEX_DEVICE_USER_AGENT,
         },
         method="POST",
     )

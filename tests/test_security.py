@@ -2470,6 +2470,47 @@ class LauncherCase(unittest.TestCase):
             redirect_uri=bridgedeck.CODEX_DEVICE_REDIRECT_URI,
         )
 
+    def test_exchange_codex_device_auth_prefers_nested_token_payload(self) -> None:
+        access = fake_jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct"}})
+        with mock.patch.object(
+            bridgedeck,
+            "_post_json_url",
+            return_value={
+                "authorization_code": "auth-code",
+                "token": {"access_token": access, "refresh_token": "refresh"},
+            },
+        ), mock.patch.object(bridgedeck, "exchange_codex_oauth_code") as exchange:
+            result = bridgedeck.exchange_codex_device_auth("deviceauth-test", "ABCD-EFGH")
+
+        self.assertEqual(result["access_token"], access)
+        self.assertEqual(result["refresh_token"], "refresh")
+        exchange.assert_not_called()
+
+    def test_exchange_codex_oauth_code_uses_ccswitch_headers(self) -> None:
+        access = fake_jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct"}})
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                return None
+
+            def read(self, max_bytes: int) -> bytes:
+                return json.dumps({"access_token": access, "refresh_token": "refresh"}).encode()
+
+        class FakeOpener:
+            def open(self, request: urllib.request.Request, *, timeout: float) -> FakeResponse:
+                self.request = request
+                return FakeResponse()
+
+        opener = FakeOpener()
+        with mock.patch.object(bridgedeck, "_openai_oauth_opener", return_value=opener):
+            bridgedeck.exchange_codex_oauth_code("code", "verifier", redirect_uri=bridgedeck.CODEX_DEVICE_REDIRECT_URI)
+
+        self.assertEqual(opener.request.headers["User-agent"], bridgedeck.CODEX_DEVICE_USER_AGENT)
+        self.assertEqual(opener.request.headers["Accept"], "application/json")
+
     def test_save_codex_oauth_account_stores_refresh_without_access_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
