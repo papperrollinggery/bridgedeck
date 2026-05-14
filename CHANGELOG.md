@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.20
+
+- Prevented Codex global shell environment settings from reintroducing `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` conflicts in CC Switch.
+- Added a BridgeDeck service-page repair action for Codex environment conflicts.
+- Fixed Codex OAuth device authorization to use the returned PKCE verifier and persist in-flight authorization state across UI restarts.
+- Protected Local Bridge restarts when active clients are connected, so current Claude/CC Switch requests are not interrupted.
+- Expanded README coverage for install, security boundaries, local bridge usage, and release verification.
+
 ## 0.2.19
 
 - Added BridgeDeck-managed ChatGPT/Codex OAuth device authorization with expiring user codes.
