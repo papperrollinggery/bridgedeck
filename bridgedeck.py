@@ -6,8 +6,10 @@ import base64
 import copy
 import datetime as dt
 import hashlib
+import html
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -37,7 +39,12 @@ DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH = Path.home() / ".claude" / "plugins" / "i
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CODEX_AUTH_PATH = DEFAULT_CODEX_HOME / "auth.json"
 DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
-DEFAULT_LOCAL_BRIDGE_STATE_PATH = Path.home() / ".cc-switch" / "bridgedeck-local-bridge-state.json"
+DEFAULT_LOCAL_BRIDGE_STATE_PATH = Path(
+    os.environ.get(
+        "BRIDGEDECK_LOCAL_BRIDGE_STATE_PATH",
+        str(Path.home() / ".cc-switch" / "bridgedeck-local-bridge-state.json"),
+    )
+)
 DEFAULT_OMC_CODEX_SHIM_PATHS = (
     DEFAULT_CLI_LAUNCHER_DIR / "bin" / "codex",
     Path.home() / ".codebuddy" / "bin" / "codex",
@@ -47,7 +54,7 @@ DEFAULT_ZPROFILE_PATH = Path.home() / ".zprofile"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.18"
+APP_VERSION = "0.2.19"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -58,6 +65,20 @@ COMPACT_THRESHOLD_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 MAX_CONTEXT_TOKENS_ENV = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
 DEFAULT_COMPACT_WINDOW_TOKENS = 220_000
 DEFAULT_COMPACT_THRESHOLD_PERCENT = 80
+DEFAULT_BRIDGE_PROVIDER_MODEL = "gpt-5.5"
+BRIDGE_MODEL_OPTIONS = (
+    {
+        "id": "gpt-5.5",
+        "name": "gpt-5.5",
+        "context_tokens": 272_000,
+        "max_output_tokens": 128_000,
+        "thinking_levels": ("low", "medium", "high", "xhigh"),
+    },
+    {"id": "gpt-5.4", "name": "gpt-5.4", "thinking_levels": ("low", "medium", "high", "xhigh")},
+    {"id": "gpt-5.4-mini", "name": "gpt-5.4 Mini", "thinking_levels": ("low", "medium", "high", "xhigh")},
+    {"id": "gpt-5.3-codex", "name": "gpt-5.3-codex"},
+    {"id": "gpt-5.3-codex-spark", "name": "gpt-5.3-codex-spark"},
+)
 MODEL_ENV_KEYS = (
     "ANTHROPIC_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -96,6 +117,21 @@ MANAGED_CODEX_PATH_START = "# >>> BridgeDeck codex shim >>>"
 MANAGED_CODEX_PATH_END = "# <<< BridgeDeck codex shim <<<"
 PROXY_DIAG_OPENAI_URL = "https://api.openai.com/v1/models"
 PROXY_DIAG_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_OAUTH_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
+CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_OAUTH_REDIRECT_URI = "http://localhost:1455/auth/callback"
+CODEX_OAUTH_CALLBACK_HOST = "127.0.0.1"
+CODEX_OAUTH_CALLBACK_PORT = 1455
+CODEX_OAUTH_SCOPE = "openid profile email offline_access"
+CODEX_DEVICE_SCOPE = "openid profile email"
+CODEX_DEVICE_USERCODE_URL = "https://auth.openai.com/api/accounts/deviceauth/usercode"
+CODEX_DEVICE_TOKEN_URL = "https://auth.openai.com/api/accounts/deviceauth/token"
+CODEX_DEVICE_VERIFY_URL = "https://auth.openai.com/codex/device"
+CODEX_DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
+CODEX_DEVICE_CODE_VERIFIER = "cc-switch-codex-oauth"
+CODEX_DEVICE_USER_AGENT = "cc-switch-codex-oauth"
+CODEX_OAUTH_FLOW_TTL_SECS = 10 * 60
 
 
 def now_ts() -> str:
@@ -227,6 +263,49 @@ def normalize_provider_model_env(env: dict[str, Any]) -> None:
             env[key] = normalize_openai_model_id(env[key])
 
 
+def bridge_model_option(model_id: str | None) -> dict[str, Any] | None:
+    normalized = normalize_openai_model_id(model_id)
+    for item in BRIDGE_MODEL_OPTIONS:
+        if item["id"] == normalized:
+            return item
+    return None
+
+
+def normalize_bridge_model_config(config: dict[str, Any] | None) -> dict[str, str]:
+    config = config if isinstance(config, dict) else {}
+    model = normalize_openai_model_id(config.get("model") or config.get("id") or DEFAULT_BRIDGE_PROVIDER_MODEL)
+    option = bridge_model_option(model)
+    if option is None and not re.match(r"(?i)^gpt-", model):
+        raise ValueError(f"不支持的模型: {model}")
+
+    context_raw = str(config.get("context_tokens") or config.get("context_length") or "").strip()
+    if not context_raw and option and option.get("context_tokens"):
+        context_raw = str(option["context_tokens"])
+    context_tokens = ""
+    if context_raw:
+        context_tokens = str(_parse_int_setting(context_raw, "模型上下文", min_value=10_000, max_value=2_000_000))
+
+    max_output_raw = str(config.get("max_output_tokens") or config.get("max_completion_tokens") or "").strip()
+    if not max_output_raw and option and option.get("max_output_tokens"):
+        max_output_raw = str(option["max_output_tokens"])
+    max_output_tokens = ""
+    if max_output_raw:
+        max_output_tokens = str(_parse_int_setting(max_output_raw, "最大输出", min_value=1_000, max_value=2_000_000))
+
+    return {"model": model, "context_tokens": context_tokens, "max_output_tokens": max_output_tokens}
+
+
+def apply_bridge_model_config_to_env(env: dict[str, Any], model_config: dict[str, Any] | None) -> dict[str, str]:
+    normalized = normalize_bridge_model_config(model_config)
+    env["ANTHROPIC_MODEL"] = normalized["model"]
+    if normalized["context_tokens"]:
+        env[MAX_CONTEXT_TOKENS_ENV] = normalized["context_tokens"]
+    else:
+        env.pop(MAX_CONTEXT_TOKENS_ENV, None)
+    normalize_provider_model_env(env)
+    return normalized
+
+
 def common_provider_env(env: dict[str, Any]) -> dict[str, Any]:
     common = {
         str(key): copy.deepcopy(value)
@@ -329,6 +408,165 @@ def jwt_identity(token: str | None) -> dict[str, Any]:
         "plan": auth_obj.get("chatgpt_plan_type") or "",
         "exp": payload.get("exp"),
     }
+
+
+def pkce_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def codex_oauth_authorize_url(state: str, challenge: str) -> str:
+    query = urllib.parse.urlencode(
+        {
+            "response_type": "code",
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+            "redirect_uri": CODEX_OAUTH_REDIRECT_URI,
+            "scope": CODEX_OAUTH_SCOPE,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+            "id_token_add_organizations": "true",
+            "codex_cli_simplified_flow": "true",
+            "originator": "bridgedeck",
+        }
+    )
+    return f"{CODEX_OAUTH_AUTHORIZE_URL}?{query}"
+
+
+def parse_oauth_code_input(value: str) -> dict[str, str]:
+    text = value.strip()
+    if not text:
+        return {}
+    try:
+        parsed = urllib.parse.urlsplit(text)
+        if parsed.query:
+            params = urllib.parse.parse_qs(parsed.query)
+            return {
+                "code": (params.get("code") or [""])[0],
+                "state": (params.get("state") or [""])[0],
+            }
+    except Exception:
+        pass
+    if "#" in text and "code=" not in text:
+        code, state = text.split("#", 1)
+        return {"code": code.strip(), "state": state.strip()}
+    if "code=" in text:
+        params = urllib.parse.parse_qs(text.lstrip("?"))
+        return {
+            "code": (params.get("code") or [""])[0],
+            "state": (params.get("state") or [""])[0],
+        }
+    return {"code": text, "state": ""}
+
+
+class CodexDeviceAuthorizationPending(RuntimeError):
+    pass
+
+
+def _openai_oauth_opener() -> urllib.request.OpenerDirector:
+    proxy_url, _ = detect_codex_proxy_url()
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+
+
+def _post_json_url(url: str, payload: dict[str, Any], *, user_agent: str) -> dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": user_agent,
+        },
+        method="POST",
+    )
+    try:
+        with _openai_oauth_opener().open(request, timeout=30) as response:
+            parsed = json.loads(response.read(MAX_REQUEST_BYTES).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1200).decode("utf-8", "replace")
+        try:
+            parsed_detail = json.loads(detail)
+            code = str(((parsed_detail.get("error") or {}) if isinstance(parsed_detail, dict) else {}).get("code") or "")
+        except Exception:
+            code = ""
+        if code == "deviceauth_authorization_unknown":
+            raise CodexDeviceAuthorizationPending("等待用户完成设备授权") from exc
+        raise RuntimeError(f"Device authorization failed: HTTP {exc.code} {truncate_log_text(detail)}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Device authorization failed: invalid response")
+    return parsed
+
+
+def request_codex_device_code() -> dict[str, Any]:
+    payload = _post_json_url(
+        CODEX_DEVICE_USERCODE_URL,
+        {"client_id": CODEX_OAUTH_CLIENT_ID, "scope": CODEX_DEVICE_SCOPE},
+        user_agent=CODEX_DEVICE_USER_AGENT,
+    )
+    if not payload.get("device_auth_id") or not payload.get("user_code"):
+        raise RuntimeError("Device authorization failed: missing user_code")
+    return payload
+
+
+def exchange_codex_device_auth(device_auth_id: str, user_code: str) -> dict[str, Any]:
+    payload = _post_json_url(
+        CODEX_DEVICE_TOKEN_URL,
+        {
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+            "device_auth_id": device_auth_id,
+            "user_code": user_code,
+        },
+        user_agent=CODEX_DEVICE_USER_AGENT,
+    )
+    if payload.get("access_token") and payload.get("refresh_token"):
+        return payload
+    code = str(payload.get("authorization_code") or payload.get("code") or "")
+    if not code:
+        raise RuntimeError("Device authorization failed: missing authorization code")
+    return exchange_codex_oauth_code(
+        code,
+        CODEX_DEVICE_CODE_VERIFIER,
+        redirect_uri=CODEX_DEVICE_REDIRECT_URI,
+    )
+
+
+def exchange_codex_oauth_code(
+    code: str,
+    verifier: str,
+    *,
+    redirect_uri: str = CODEX_OAUTH_REDIRECT_URI,
+) -> dict[str, Any]:
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "authorization_code",
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": redirect_uri,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        CODEX_OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "bridgedeck-codex-oauth",
+        },
+        method="POST",
+    )
+    try:
+        with _openai_oauth_opener().open(request, timeout=30) as response:
+            payload = json.loads(response.read(MAX_REQUEST_BYTES).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1200).decode("utf-8", "replace")
+        raise RuntimeError(f"OAuth token exchange failed: HTTP {exc.code} {truncate_log_text(detail)}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("OAuth token exchange failed: invalid response")
+    if not payload.get("access_token") or not payload.get("refresh_token"):
+        raise RuntimeError("OAuth token exchange failed: missing token fields")
+    return payload
 
 
 def classify_error_text(text: str | None) -> str:
@@ -473,6 +711,27 @@ def probe_remote_url(
         }
 
 
+def safe_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(result):
+        return default
+    return result
+
+
 def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dict[str, Any]:
     if not path.exists() or path.is_symlink():
         return {}
@@ -482,12 +741,66 @@ def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dic
         return {}
     if not isinstance(payload, dict):
         return {}
+    state: dict[str, Any] = {"updated_at": payload.get("updated_at")}
+    usage = payload.get("usage_metrics") if isinstance(payload.get("usage_metrics"), dict) else {}
+    if usage:
+        state["usage_metrics"] = {
+            "request_count": safe_int(usage.get("request_count"), 0),
+            "input_tokens": safe_int(usage.get("input_tokens"), 0),
+            "output_tokens": safe_int(usage.get("output_tokens"), 0),
+            "total_tokens": safe_int(usage.get("total_tokens"), 0),
+            "cached_tokens": safe_int(usage.get("cached_tokens"), 0),
+            "cache_creation_tokens": safe_int(usage.get("cache_creation_tokens"), 0),
+            "cache_miss_tokens": safe_int(usage.get("cache_miss_tokens"), 0),
+            "cache_hit_rate": safe_float(usage.get("cache_hit_rate"), 0.0),
+            "cache_miss_rate": safe_float(usage.get("cache_miss_rate"), 0.0),
+            "last_account_id": str(usage.get("last_account_id") or ""),
+            "last_model": str(usage.get("last_model") or ""),
+            "last_requested_model": str(usage.get("last_requested_model") or ""),
+            "last_request_type": str(usage.get("last_request_type") or ""),
+            "last_request_id": str(usage.get("last_request_id") or ""),
+            "last_duration_ms": safe_int(usage.get("last_duration_ms"), 0),
+            "last_status_code": safe_int(usage.get("last_status_code"), 0),
+            "last_bridge_port": safe_int(usage.get("last_bridge_port"), 0),
+            "last_client_label": str(usage.get("last_client_label") or ""),
+            "last_updated_at": usage.get("last_updated_at"),
+        }
+    events = payload.get("usage_events")
+    if isinstance(events, list):
+        state["usage_events"] = [
+            {
+                "at": safe_int(item.get("at"), 0),
+                "account_id": str(item.get("account_id") or ""),
+                "model": str(item.get("model") or ""),
+                "actual_model": str(item.get("actual_model") or item.get("model") or ""),
+                "requested_model": str(item.get("requested_model") or item.get("model") or ""),
+                "request_type": str(item.get("request_type") or ""),
+                "request_id": str(item.get("request_id") or ""),
+                "status_code": safe_int(item.get("status_code"), 0),
+                "source": str(item.get("source") or ""),
+                "route_path": str(item.get("route_path") or ""),
+                "bridge_port": safe_int(item.get("bridge_port"), 0),
+                "client_port": safe_int(item.get("client_port"), 0),
+                "client_label": str(item.get("client_label") or ""),
+                "desktop_route": bool(item.get("desktop_route")),
+                "duration_ms": safe_int(item.get("duration_ms"), 0),
+                "input_tokens": safe_int(item.get("input_tokens"), 0),
+                "output_tokens": safe_int(item.get("output_tokens"), 0),
+                "total_tokens": safe_int(item.get("total_tokens"), 0),
+                "cached_tokens": safe_int(item.get("cached_tokens"), 0),
+                "cache_creation_tokens": safe_int(item.get("cache_creation_tokens"), 0),
+                "cache_miss_tokens": safe_int(item.get("cache_miss_tokens"), 0),
+                "cache_hit_rate": safe_float(item.get("cache_hit_rate"), 0.0),
+                "cache_miss_rate": safe_float(item.get("cache_miss_rate"), 0.0),
+                "cost_usd": safe_float(item.get("cost_usd"), 0.0),
+            }
+            for item in events[-200:]
+            if isinstance(item, dict)
+        ]
     error = payload.get("last_stream_error")
     if not isinstance(error, dict):
-        return {}
-    return {
-        "updated_at": payload.get("updated_at"),
-        "last_stream_error": {
+        return state
+    state["last_stream_error"] = {
             "account_id": str(error.get("account_id") or ""),
             "model": str(error.get("model") or ""),
             "request_id": str(error.get("request_id") or ""),
@@ -495,8 +808,8 @@ def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dic
             "error_type": str(error.get("error_type") or ""),
             "error": str(error.get("error") or ""),
             "upstream_request_id": str(error.get("upstream_request_id") or ""),
-        },
     }
+    return state
 
 
 def mask_url_credentials(value: str) -> str:
@@ -629,10 +942,35 @@ class ManagerPaths:
     auth_store: Path
 
 
+@dataclass
+class CodexOAuthFlow:
+    flow_id: str
+    set_default: bool
+    created_at: float
+    state: str = ""
+    verifier: str = ""
+    auth_url: str = ""
+    status: str = "pending"
+    device_auth_id: str = ""
+    user_code: str = ""
+    verification_url: str = CODEX_DEVICE_VERIFY_URL
+    interval: int = 5
+    expires_at: str = ""
+    next_poll_at: float = 0.0
+    bridge_provider_exists: bool = False
+    account_id: str = ""
+    email: str = ""
+    error: str = ""
+
+
 class BridgeManager:
     def __init__(self, paths: ManagerPaths) -> None:
         self.paths = paths
         self._lock = threading.RLock()
+        self._oauth_lock = threading.RLock()
+        self._oauth_flows: dict[str, CodexOAuthFlow] = {}
+        self._oauth_callback_server: ThreadingHTTPServer | None = None
+        self._oauth_callback_thread: threading.Thread | None = None
 
     def _backup_file(self, path: Path, label: str) -> str | None:
         if not path.exists():
@@ -649,6 +987,307 @@ class BridgeManager:
         conn = sqlite3.connect(str(self.paths.db))
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _cleanup_oauth_flows(self) -> None:
+        cutoff = time.time() - CODEX_OAUTH_FLOW_TTL_SECS
+        expired = [
+            flow_id
+            for flow_id, flow in self._oauth_flows.items()
+            if flow.created_at < cutoff and flow.status == "pending"
+        ]
+        for flow_id in expired:
+            self._oauth_flows.pop(flow_id, None)
+
+    def _oauth_flow_payload(self, flow: CodexOAuthFlow) -> dict[str, Any]:
+        return {
+            "ok": flow.status != "error",
+            "flow_id": flow.flow_id,
+            "status": flow.status,
+            "auth_url": flow.auth_url,
+            "verification_url": flow.verification_url,
+            "user_code": flow.user_code,
+            "interval": flow.interval,
+            "expires_at": flow.expires_at,
+            "set_default": flow.set_default,
+            "bridge_provider_exists": flow.bridge_provider_exists,
+            "account_id": mask_id_value(flow.account_id),
+            "email": mask_email_value(flow.email),
+            "error": flow.error,
+        }
+
+    def _ensure_oauth_callback_server(self) -> dict[str, Any]:
+        with self._oauth_lock:
+            if self._oauth_callback_server:
+                return {"ok": True, "port": CODEX_OAUTH_CALLBACK_PORT}
+
+            manager = self
+
+            class OAuthCallbackHandler(BaseHTTPRequestHandler):
+                def do_GET(self) -> None:
+                    parsed = urllib.parse.urlsplit(self.path)
+                    if parsed.path != "/auth/callback":
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+                    params = urllib.parse.parse_qs(parsed.query)
+                    state = (params.get("state") or [""])[0]
+                    code = (params.get("code") or [""])[0]
+                    try:
+                        result = manager.complete_codex_oauth_callback(state, code)
+                        ok = bool(result.get("ok"))
+                        title = "BridgeDeck 授权完成" if ok else "BridgeDeck 授权失败"
+                        detail = str(result.get("message") or result.get("error") or "")
+                        status = 200 if ok else 400
+                    except Exception as exc:  # noqa: BLE001
+                        title = "BridgeDeck 授权失败"
+                        detail = str(exc)
+                        status = 400
+                    safe_title = html.escape(title)
+                    safe_detail = html.escape(detail)
+                    body = (
+                        "<!doctype html><meta charset='utf-8'>"
+                        f"<title>{safe_title}</title>"
+                        "<body style='font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
+                        "background:#0c0f14;color:#edf2fb;padding:32px'>"
+                        f"<h1>{safe_title}</h1><p>{safe_detail}</p><p>可以关闭这个窗口。</p></body>"
+                    ).encode("utf-8")
+                    self.send_response(status)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, fmt: str, *args: Any) -> None:
+                    return
+
+            try:
+                server = ThreadingHTTPServer((CODEX_OAUTH_CALLBACK_HOST, CODEX_OAUTH_CALLBACK_PORT), OAuthCallbackHandler)
+            except OSError as exc:
+                return {"ok": False, "port": CODEX_OAUTH_CALLBACK_PORT, "error": str(exc)}
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self._oauth_callback_server = server
+            self._oauth_callback_thread = thread
+            return {"ok": True, "port": CODEX_OAUTH_CALLBACK_PORT}
+
+    def start_codex_oauth(self, *, set_default: bool = False) -> dict[str, Any]:
+        device = request_codex_device_code()
+        interval_raw = str(device.get("interval") or "5")
+        try:
+            interval = max(2, min(30, int(float(interval_raw))))
+        except ValueError:
+            interval = 5
+        flow = CodexOAuthFlow(
+            flow_id=uuid.uuid4().hex,
+            set_default=bool(set_default),
+            created_at=time.time(),
+            auth_url=CODEX_DEVICE_VERIFY_URL,
+            device_auth_id=str(device.get("device_auth_id") or ""),
+            user_code=str(device.get("user_code") or ""),
+            verification_url=CODEX_DEVICE_VERIFY_URL,
+            interval=interval,
+            expires_at=str(device.get("expires_at") or ""),
+            next_poll_at=time.time() + interval,
+        )
+        with self._oauth_lock:
+            self._cleanup_oauth_flows()
+            self._oauth_flows[flow.flow_id] = flow
+        result = self._oauth_flow_payload(flow)
+        result.update(
+            {
+                "ok": True,
+                "callback_server": False,
+                "callback_port": 0,
+                "callback_error": "",
+                "message": "验证码已生成",
+            }
+        )
+        return result
+
+    def codex_oauth_status(self, flow_id: str) -> dict[str, Any]:
+        with self._oauth_lock:
+            self._cleanup_oauth_flows()
+            flow = self._oauth_flows.get(flow_id)
+            if not flow:
+                return {"ok": False, "status": "missing", "error": "授权流程不存在或已过期"}
+            should_poll = bool(flow.device_auth_id and flow.user_code and flow.status == "pending" and time.time() >= flow.next_poll_at)
+        if should_poll:
+            return self._complete_codex_device_flow(flow)
+        return self._oauth_flow_payload(flow)
+
+    def complete_codex_oauth(self, flow_id: str, code_input: str) -> dict[str, Any]:
+        parsed = parse_oauth_code_input(code_input)
+        code = parsed.get("code") or ""
+        incoming_state = parsed.get("state") or ""
+        if not code:
+            raise ValueError("缺少授权 code")
+        with self._oauth_lock:
+            flow = self._oauth_flows.get(flow_id)
+            if not flow:
+                raise ValueError("授权流程不存在或已过期")
+            if flow.device_auth_id and flow.user_code:
+                return self._complete_codex_device_flow(flow)
+            if incoming_state and incoming_state != flow.state:
+                flow.status = "error"
+                flow.error = "OAuth state 不一致"
+                raise ValueError(flow.error)
+        return self._complete_codex_oauth_flow(flow, code)
+
+    def complete_codex_oauth_callback(self, state: str, code: str) -> dict[str, Any]:
+        if not state or not code:
+            raise ValueError("缺少 OAuth state 或 code")
+        with self._oauth_lock:
+            flow = next((item for item in self._oauth_flows.values() if item.state == state), None)
+            if not flow:
+                raise ValueError("OAuth state 不存在或已过期")
+        return self._complete_codex_oauth_flow(flow, code)
+
+    def _bridge_provider_for_account(self, account_id: str) -> dict[str, Any] | None:
+        if not account_id:
+            return None
+        with self._connect() as conn:
+            row = self._select_existing_bridge_provider_for_account(conn, account_id)
+            if not row:
+                return None
+            return {"id": str(row["id"]), "name": str(row["name"])}
+
+    def apply_codex_oauth_bridge(self, flow_id: str) -> dict[str, Any]:
+        with self._oauth_lock:
+            flow = self._oauth_flows.get(flow_id)
+            if not flow:
+                raise ValueError("授权流程不存在或已过期")
+            if flow.status != "completed" or not flow.account_id:
+                raise ValueError("账号尚未完成授权")
+            account_id = flow.account_id
+
+        existing = self._bridge_provider_for_account(account_id)
+        snapshot = self.snapshot(include_secrets=False)
+        providers = [p for p in snapshot.get("providers", []) if isinstance(p, dict)]
+        existing_names = {str(provider.get("name") or "") for provider in providers}
+        quota: dict[str, Any] = {}
+        try:
+            quota_rows = self.quotas().get("quotas", [])
+            quota = next(
+                (
+                    item
+                    for item in quota_rows
+                    if isinstance(item, dict) and str(item.get("account_id") or "") == account_id
+                ),
+                {},
+            )
+        except Exception:
+            quota = {}
+
+        provider_name = str(existing.get("name") or "") if existing else self._provider_name_for_quota(account_id, quota, existing_names)
+        result = self.create_or_update_provider(account_id, provider_name, False)
+        mode = "updated" if existing else "created"
+        with self._oauth_lock:
+            flow.bridge_provider_exists = True
+        return {
+            "ok": True,
+            "mode": mode,
+            "provider_id": result.get("provider_id"),
+            "provider_name": result.get("provider_name") or provider_name,
+            "message": "已更新 CC Switch Local Bridge" if existing else "已加入 CC Switch Local Bridge",
+        }
+
+    def _complete_codex_device_flow(self, flow: CodexOAuthFlow) -> dict[str, Any]:
+        with self._oauth_lock:
+            if flow.status == "completed":
+                return {**self._oauth_flow_payload(flow), "message": "该账号已完成授权"}
+            if flow.status == "exchanging":
+                return {**self._oauth_flow_payload(flow), "message": "正在交换 token"}
+            flow.status = "exchanging"
+            flow.error = ""
+        try:
+            token_data = exchange_codex_device_auth(flow.device_auth_id, flow.user_code)
+            account_id = self._save_codex_oauth_account(token_data, set_default=flow.set_default)
+            identity = jwt_identity(str(token_data.get("access_token") or ""))
+            with self._oauth_lock:
+                flow.status = "completed"
+                flow.account_id = account_id
+                flow.email = str(identity.get("email") or "")
+                flow.bridge_provider_exists = self._bridge_provider_for_account(account_id) is not None
+                flow.error = ""
+                return {
+                    **self._oauth_flow_payload(flow),
+                    "message": f"授权完成：{mask_email_value(flow.email) or mask_id_value(account_id)}",
+                }
+        except CodexDeviceAuthorizationPending:
+            with self._oauth_lock:
+                flow.status = "pending"
+                flow.error = ""
+                flow.next_poll_at = time.time() + flow.interval
+                return {**self._oauth_flow_payload(flow), "message": "等待用户输入验证码并确认"}
+        except Exception as exc:  # noqa: BLE001
+            with self._oauth_lock:
+                flow.status = "error"
+                flow.error = str(exc)
+                return self._oauth_flow_payload(flow)
+
+    def _complete_codex_oauth_flow(self, flow: CodexOAuthFlow, code: str) -> dict[str, Any]:
+        with self._oauth_lock:
+            if flow.status == "completed":
+                return {**self._oauth_flow_payload(flow), "message": "该账号已完成授权"}
+            if flow.status == "exchanging":
+                return {**self._oauth_flow_payload(flow), "message": "正在交换 token"}
+            flow.status = "exchanging"
+            flow.error = ""
+        try:
+            token_data = exchange_codex_oauth_code(code, flow.verifier)
+            account_id = self._save_codex_oauth_account(token_data, set_default=flow.set_default)
+            identity = jwt_identity(str(token_data.get("access_token") or ""))
+            with self._oauth_lock:
+                flow.status = "completed"
+                flow.account_id = account_id
+                flow.email = str(identity.get("email") or "")
+                flow.bridge_provider_exists = self._bridge_provider_for_account(account_id) is not None
+                flow.error = ""
+                return {
+                    **self._oauth_flow_payload(flow),
+                    "message": f"授权完成：{mask_email_value(flow.email) or mask_id_value(account_id)}",
+                }
+        except Exception as exc:  # noqa: BLE001
+            with self._oauth_lock:
+                flow.status = "error"
+                flow.error = str(exc)
+                return self._oauth_flow_payload(flow)
+
+    def _save_codex_oauth_account(self, token_data: dict[str, Any], *, set_default: bool) -> str:
+        access_token = str(token_data.get("access_token") or "")
+        refresh_token = str(token_data.get("refresh_token") or "")
+        if not access_token or not refresh_token:
+            raise RuntimeError("OAuth token response missing required fields")
+        identity = jwt_identity(access_token)
+        account_id = str(identity.get("account_id") or token_data.get("account_id") or "")
+        if not account_id:
+            raise RuntimeError("无法从 token 识别 ChatGPT account_id")
+        email = str(identity.get("email") or "")
+        with self._lock:
+            raw = load_json(self.paths.auth_store, {})
+            store = raw if isinstance(raw, dict) else {}
+            accounts = store.get("accounts") if isinstance(store.get("accounts"), dict) else {}
+            next_accounts = copy.deepcopy(accounts)
+            next_accounts[account_id] = {
+                "account_id": account_id,
+                "email": email,
+                "refresh_token": refresh_token,
+                "authenticated_at": int(time.time()),
+            }
+            default_account_id = str(store.get("default_account_id") or "")
+            if set_default or not default_account_id:
+                default_account_id = account_id
+            next_store = {
+                "version": 1,
+                "accounts": next_accounts,
+                "default_account_id": default_account_id,
+            }
+            before = json.dumps(store, ensure_ascii=False, sort_keys=True)
+            after = json.dumps(next_store, ensure_ascii=False, sort_keys=True)
+            if before != after:
+                self._backup_file(self.paths.auth_store, "codex-oauth")
+                dump_json(self.paths.auth_store, next_store)
+        return account_id
 
     def _provider_columns(self, conn: sqlite3.Connection) -> set[str]:
         rows = conn.execute("PRAGMA table_info(providers)").fetchall()
@@ -874,7 +1513,7 @@ class BridgeManager:
             "enabled": bool(config.get("enabled", False)),
             "claude": bool(config.get("claude", True)),
             "default_codex": bool(config.get("default_codex", False)),
-            "priority": ["plus", "pro", "pro20x"],
+            "priority": ["pro20x", "pro5x", "plus"],
             "last_result": config.get("last_result") if isinstance(config.get("last_result"), dict) else {},
         }
 
@@ -885,7 +1524,7 @@ class BridgeManager:
                 "enabled": bool(config.get("enabled", current["enabled"])),
                 "claude": bool(config.get("claude", current["claude"])),
                 "default_codex": bool(config.get("default_codex", current["default_codex"])),
-                "priority": ["plus", "pro", "pro20x"],
+                "priority": ["pro20x", "pro5x", "plus"],
                 "last_result": config.get("last_result", current.get("last_result", {})),
             }
         )
@@ -1100,6 +1739,7 @@ class BridgeManager:
         return data
 
     def _list_codex_providers(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        known_account_ids = {item["account_id"] for item in self._load_accounts()}
         rows = conn.execute(
             """
             SELECT id, name, provider_type, is_current, sort_index, meta, settings_config
@@ -1116,7 +1756,13 @@ class BridgeManager:
             auth = settings.get("auth") if isinstance(settings.get("auth"), dict) else {}
             tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
             meta_account = binding.get("accountId") if isinstance(binding.get("accountId"), str) else ""
-            token_account = tokens.get("account_id") if isinstance(tokens.get("account_id"), str) else ""
+            embedded_token_account = tokens.get("account_id") if isinstance(tokens.get("account_id"), str) else ""
+            uses_managed_auth_store = (
+                binding.get("source") == "managed_account"
+                and binding.get("authProvider") == "codex_oauth"
+                and meta_account in known_account_ids
+            )
+            token_account = meta_account if uses_managed_auth_store else embedded_token_account
             refresh_token = tokens.get("refresh_token") if isinstance(tokens.get("refresh_token"), str) else ""
             providers.append(
                 {
@@ -1128,6 +1774,14 @@ class BridgeManager:
                     "meta_provider_type": meta.get("providerType") if isinstance(meta.get("providerType"), str) else "",
                     "meta_account_id": meta_account,
                     "token_account_id": token_account,
+                    "embedded_token_account_id": embedded_token_account,
+                    "uses_managed_auth_store": uses_managed_auth_store,
+                    "embedded_token_stale": bool(
+                        uses_managed_auth_store
+                        and embedded_token_account
+                        and meta_account
+                        and embedded_token_account != meta_account
+                    ),
                     "refresh_sha12": sha12(refresh_token),
                     "token_mismatch": bool(meta_account and token_account and meta_account != token_account),
                 }
@@ -1662,19 +2316,30 @@ class BridgeManager:
     def _priority_rank(self, account_id: str, providers: list[dict[str, Any]], quota: dict[str, Any] | None = None) -> tuple[int, str]:
         names = " ".join(str(p.get("name") or "").lower() for p in providers if p.get("account_id") == account_id)
         plan_type = str((quota or {}).get("plan_type") or "").lower()
-        haystack = f"{plan_type} {names}"
-        if "20x" in haystack or "pro max" in haystack or "promax" in haystack:
-            return (2, haystack)
-        if "plus" in haystack:
+        # Provider names are user labels; prefer the quota payload plan whenever it exists.
+        haystack = plan_type or names
+        if "20x" in plan_type or "pro max" in plan_type or "promax" in plan_type or plan_type == "pro":
             return (0, haystack)
-        if "pro" in haystack:
+        if "pro_lite" in plan_type or "pro-lite" in plan_type or "pro lite" in plan_type or "prolite" in plan_type or "5x" in plan_type:
             return (1, haystack)
+        if "plus" in plan_type:
+            return (2, haystack)
+        if "20x" in haystack or "pro max" in haystack or "promax" in haystack:
+            return (0, haystack)
+        if "5x" in haystack or "pro_lite" in haystack or "pro-lite" in haystack or "pro lite" in haystack or "prolite" in haystack:
+            return (1, haystack)
+        if "plus" in haystack:
+            return (2, haystack)
+        if "pro" in haystack:
+            return (0, haystack)
         return (9, account_id)
 
     def _quota_capacity_factor(self, account_id: str, providers: list[dict[str, Any]], quota: dict[str, Any] | None = None) -> int:
         names = " ".join(str(p.get("name") or "").lower() for p in providers if p.get("account_id") == account_id)
         plan_type = str((quota or {}).get("plan_type") or "").lower()
-        return quota_capacity_factor_from_text(plan_type, names)
+        if plan_type:
+            return quota_capacity_factor_from_text(plan_type)
+        return quota_capacity_factor_from_text(names)
 
     def _quota_effective_remaining(self, account_id: str, providers: list[dict[str, Any]], quota: dict[str, Any]) -> float:
         return effective_remaining_units(
@@ -1766,10 +2431,12 @@ class BridgeManager:
         suffix = ""
         if "20x" in plan or "pro max" in plan or "promax" in plan:
             suffix = "Pro 20x"
+        elif "pro_lite" in plan or "pro-lite" in plan or "pro lite" in plan or "prolite" in plan or "5x" in plan:
+            suffix = "Pro 5x"
+        elif plan == "pro" or plan.startswith("pro_") or plan.startswith("pro-"):
+            suffix = "Pro 20x"
         elif "plus" in plan:
             suffix = "Plus"
-        elif "pro" in plan:
-            suffix = "Pro"
         if suffix:
             candidate = f"Local Codex Bridge - {suffix}"
             if candidate not in existing_names:
@@ -1949,6 +2616,7 @@ class BridgeManager:
         settings_config: dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
         compact_config: dict[str, Any] | None = None,
+        model_config: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         settings = copy.deepcopy(settings_config) if isinstance(settings_config, dict) else {}
         if not isinstance(settings, dict):
@@ -1958,10 +2626,13 @@ class BridgeManager:
             env = {}
         env["ANTHROPIC_BASE_URL"] = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}"
         env["ANTHROPIC_AUTH_TOKEN"] = "local-bridge"
-        env.setdefault("ANTHROPIC_MODEL", "gpt-5.4")
-        env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "gpt-5.4-mini")
+        if model_config is not None:
+            apply_bridge_model_config_to_env(env, model_config)
+        else:
+            env.setdefault("ANTHROPIC_MODEL", DEFAULT_BRIDGE_PROVIDER_MODEL)
+        env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "gpt-5.3-codex-spark")
         env.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", "gpt-5.3-codex")
-        env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "gpt-5.4")
+        env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "gpt-5.5")
         normalize_provider_model_env(env)
         if compact_config is not None:
             apply_compact_config_to_env(env, compact_config)
@@ -2017,6 +2688,7 @@ class BridgeManager:
             plugin_status = self.claude_plugin_sync_status()
         except Exception as exc:  # noqa: BLE001
             plugin_status = {"ok": False, "error": str(exc)}
+        local_bridge_state = read_local_bridge_state()
         data: dict[str, Any] = {
             "version": APP_VERSION,
             "paths": {
@@ -2041,6 +2713,8 @@ class BridgeManager:
             "codex_desktop": self._codex_desktop_status(),
             "current_codex_launcher": self._current_codex_launcher_status(),
             "omc_codex_shim": self._omc_codex_shim_status(),
+            "usage_metrics": local_bridge_state.get("usage_metrics", {}),
+            "usage_events": local_bridge_state.get("usage_events", []),
             "account_matrix": [],
             "current_provider_from_settings": self._current_provider_from_settings(),
             "auto_switch": self._load_auto_switch_config(),
@@ -2098,6 +2772,8 @@ class BridgeManager:
                         "api_format": meta.get("apiFormat") if isinstance(meta.get("apiFormat"), str) else "",
                         "account_id": account_id,
                         "base_url": env.get("ANTHROPIC_BASE_URL") if isinstance(env.get("ANTHROPIC_BASE_URL"), str) else "",
+                        "model": env.get("ANTHROPIC_MODEL") if isinstance(env.get("ANTHROPIC_MODEL"), str) else "",
+                        "max_context_tokens": env.get(MAX_CONTEXT_TOKENS_ENV) if isinstance(env.get(MAX_CONTEXT_TOKENS_ENV), str) else "",
                         "auth_token": auth_token if include_secrets else "",
                         "auth_token_masked": mask_token(auth_token),
                         "compact_enabled": bool(str(env.get(COMPACT_WINDOW_ENV) or "").strip()),
@@ -2152,6 +2828,7 @@ class BridgeManager:
         provider_name: str,
         set_current: bool,
         compact_config: dict[str, Any] | None = None,
+        model_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not account_id.strip():
             raise ValueError("account_id 不能为空")
@@ -2190,6 +2867,7 @@ class BridgeManager:
                     settings_config=current_settings,
                     meta=current_meta,
                     compact_config=compact_config,
+                    model_config=model_config,
                 )
                 settings_text = json.dumps(new_settings, ensure_ascii=False)
                 meta_text = json.dumps(new_meta, ensure_ascii=False)
@@ -2314,7 +2992,12 @@ class BridgeManager:
                 "backups": [db_bak],
             }
 
-    def update_provider_compact(self, provider_id: str, compact_config: dict[str, Any] | None) -> dict[str, Any]:
+    def update_provider_compact(
+        self,
+        provider_id: str,
+        compact_config: dict[str, Any] | None,
+        model_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not provider_id.strip():
             raise ValueError("provider_id 不能为空")
 
@@ -2338,6 +3021,7 @@ class BridgeManager:
                 base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
                 if not base_url.startswith(f"{LOCAL_BRIDGE_BASE_URL}/accounts/"):
                     raise ValueError("仅支持 Local Codex Bridge provider")
+                normalized_model = apply_bridge_model_config_to_env(env, model_config) if model_config is not None else None
                 normalized = apply_compact_config_to_env(env, compact_config)
                 settings["env"] = env
                 conn.execute(
@@ -2351,6 +3035,7 @@ class BridgeManager:
                 "message": "上下文配置已保存",
                 "provider_id": provider_id,
                 "compact_config": normalized,
+                "model_config": normalized_model,
                 "backups": [db_bak],
             }
 
@@ -2959,13 +3644,23 @@ def summarize_rate_limit_windows(rate_limit: dict[str, Any]) -> tuple[list[dict[
 
 
 def quota_capacity_factor_from_text(*values: Any) -> int:
-    haystack = " ".join(str(value or "").lower() for value in values)
-    if "20x" in haystack or "pro max" in haystack or "promax" in haystack:
+    parts = [str(value or "").lower().strip() for value in values if str(value or "").strip()]
+    plan_type = parts[0] if parts else ""
+    haystack = " ".join(parts)
+    if "20x" in plan_type or "pro max" in plan_type or "promax" in plan_type:
         return 20
-    if "pro" in haystack:
+    if "pro_lite" in plan_type or "pro-lite" in plan_type or "pro lite" in plan_type or "prolite" in plan_type or "5x" in plan_type:
         return 5
     if "plus" in haystack:
         return 1
+    if plan_type == "pro" or plan_type.startswith("pro_") or plan_type.startswith("pro-"):
+        return 20
+    if "20x" in haystack or "pro max" in haystack or "promax" in haystack:
+        return 20
+    if "pro_lite" in haystack or "pro-lite" in haystack or "pro lite" in haystack or "prolite" in haystack or "5x" in haystack:
+        return 5
+    if "pro" in haystack:
+        return 20
     return 1
 
 
@@ -3062,6 +3757,7 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(provider, dict):
             provider["meta_account_id"] = mask_id_value(provider.get("meta_account_id"))
             provider["token_account_id"] = mask_id_value(provider.get("token_account_id"))
+            provider["embedded_token_account_id"] = mask_id_value(provider.get("embedded_token_account_id"))
     for home in redacted.get("cli_homes", []):
         if isinstance(home, dict):
             home["path"] = redact_path_value(home.get("path"))
@@ -3130,6 +3826,12 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             stream_error = service.get("last_stream_error")
             if isinstance(stream_error, dict):
                 stream_error["account_id"] = mask_id_value(stream_error.get("account_id"))
+    usage_metrics = redacted.get("usage_metrics")
+    if isinstance(usage_metrics, dict):
+        usage_metrics["last_account_id"] = mask_id_value(usage_metrics.get("last_account_id"))
+    for event in redacted.get("usage_events", []):
+        if isinstance(event, dict):
+            event["account_id"] = mask_id_value(event.get("account_id"))
     codex_auth = redacted.get("codex_auth")
     if isinstance(codex_auth, dict):
         codex_auth.pop("path", None)
@@ -3177,488 +3879,815 @@ INDEX_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>BridgeDeck</title>
   <style nonce="__CSP_NONCE__">
-    :root { --bg:#0f1115; --panel:#171a21; --line:#2a3040; --text:#e8ecf5; --muted:#9aa4b5; --ok:#39c980; --warn:#f0b429; --bad:#ff6b6b; --brand:#56a8ff; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
-    .wrap { max-width: 1280px; margin: 24px auto; padding: 0 16px; }
-    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:14px; }
-    .sectionHint { color:var(--muted); font-size:12px; margin:-4px 0 12px; line-height:1.5; }
-    .layout { display:grid; grid-template-columns: 320px minmax(0, 1fr); gap:14px; align-items:start; }
-    .sidebar { position: sticky; top: 16px; }
-    .main { min-width:0; }
-    h1 { margin:0 0 12px; font-size:20px; }
-    h2 { margin:0 0 10px; font-size:16px; }
-    .muted { color: var(--muted); font-size: 12px; }
-    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:8px; }
-    input, select, button, textarea { border-radius:8px; border:1px solid var(--line); background:#0f1320; color:var(--text); padding:8px 10px; }
-    input, select { min-width: 220px; }
-    button { cursor:pointer; background:#1d2535; }
+    :root {
+      --bg:#0c0f14; --surface:#111722; --panel:#151c29; --panel2:#101621; --line:#263244;
+      --text:#edf2fb; --muted:#9aa7ba; --soft:#c6d0df; --ok:#2ec27e; --warn:#f5b642;
+      --bad:#ff6f6f; --brand:#59a7ff; --brand2:#8cc6ff; --focus:#213756;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+    .wrap { min-height:100vh; }
+    .appShell { display:grid; grid-template-columns:260px minmax(0, 1fr); min-height:100vh; }
+    .appSidebar { position:sticky; top:0; height:100vh; padding:18px 14px; border-right:1px solid var(--line); background:#0a0d12; display:flex; flex-direction:column; gap:14px; }
+    .brand { display:grid; gap:4px; padding:4px 6px 12px; border-bottom:1px solid var(--line); }
+    .brandName { font-size:19px; font-weight:850; }
+    .brandSub { color:var(--muted); font-size:12px; }
+    .sideNav { display:grid; gap:6px; }
+    .navItem { width:100%; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; border:1px solid transparent; border-radius:8px; background:transparent; color:var(--soft); text-align:left; font-weight:700; }
+    .navItem:hover, .navItem.active { background:var(--focus); border-color:#315077; color:var(--text); }
+    .navHint { color:var(--muted); font-size:11px; font-weight:600; }
+    .sidePanel { margin-top:auto; border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--panel2); }
+    .workspace { width:100%; min-width:0; box-sizing:border-box; padding:20px; display:grid; grid-template-columns:minmax(0, 1fr) 300px; gap:16px; align-items:start; align-content:start; }
+    .topBar { grid-column:1 / -1; grid-row:1; justify-self:stretch; width:100%; display:flex; justify-content:space-between; gap:16px; align-items:flex-start; padding:16px; border:1px solid var(--line); border-radius:8px; background:var(--surface); }
+    .topBar h1 { margin:0; font-size:24px; }
+    .topBar p { margin:6px 0 0; color:var(--muted); font-size:13px; }
+    .topActions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+    .pageStack { grid-column:1; grid-row:2; justify-self:stretch; width:100%; min-width:0; }
+    .deckPage { display:none; }
+    .deckPage.active { display:block; }
+    .guideDock { grid-column:2; grid-row:2; justify-self:stretch; width:100%; position:sticky; top:20px; }
+    body.usageMode .workspace { grid-template-columns:minmax(0, 1fr); }
+    body.usageMode .guideDock { display:none; }
+    .card, .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:14px; }
+    .panel.subtle { background:var(--panel2); }
+    .pageHeader { display:flex; justify-content:space-between; gap:14px; align-items:flex-start; margin-bottom:14px; }
+    .pageTitle { margin:0; font-size:21px; font-weight:850; }
+    .pageDesc { margin:5px 0 0; color:var(--muted); font-size:13px; line-height:1.5; }
+    h1, h2 { margin:0 0 10px; }
+    h2 { font-size:16px; }
+    .sectionHint { color:var(--muted); font-size:12px; margin:-2px 0 12px; line-height:1.5; }
+    .muted { color:var(--muted); font-size:12px; }
+    .row, .toggleLine, .apiEnvActions { display:flex; gap:9px; flex-wrap:wrap; align-items:center; margin-top:10px; }
+    input, select, button, textarea { border-radius:8px; border:1px solid var(--line); background:#0d1320; color:var(--text); padding:8px 10px; font:inherit; }
+    input, select { min-width:220px; }
+    input[type="checkbox"], input[type="radio"] { min-width:0; }
+    button { cursor:pointer; background:#1a2332; }
+    button:hover { border-color:#3f5676; }
     button:disabled { opacity:.55; cursor:default; }
-    button.primary { background: var(--brand); border-color: #3d8ce0; color: #041122; font-weight:700; }
-    button.warn { background:#3a2b12; border-color:#6d4f1a; color:#ffd68a; }
-    .tableWrap { width:100%; overflow-x:hidden; border-radius:10px; }
-    table { width:100%; min-width:0; border-collapse: collapse; font-size:12px; table-layout: fixed; }
+    button.primary { background:var(--brand); border-color:#3d8ce0; color:#041122; font-weight:800; }
+    button.warn { background:#36260e; border-color:#745018; color:#ffd98f; }
+    .miniBtn { padding:6px 9px; font-size:12px; }
+    .mt10 { margin-top:10px; }
+    .ok { color:var(--ok); }
+    .bad { color:var(--bad); }
+    .warnText { color:var(--warn); }
+    .cmd, .mono, .paths, .apiEnvValue { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:anywhere; word-break:break-word; }
+    .paths { color:var(--muted); font-size:11px; line-height:1.45; white-space:pre-wrap; }
+    .mono, .cmd { color:#b7d8ff; }
+    .topGrid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:10px; }
+    .tile { border:1px solid var(--line); border-radius:8px; padding:12px; background:var(--panel2); min-height:76px; }
+    .tileLabel { color:var(--muted); font-size:12px; margin-bottom:6px; }
+    .tileValue { font-size:24px; font-weight:850; }
+    .metricGrid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; margin-top:12px; }
+    .metricCard { border:1px solid var(--line); border-radius:8px; padding:16px; min-height:148px; background:linear-gradient(180deg, #171a21 0%, #121722 100%); display:grid; align-content:space-between; gap:12px; }
+    .metricHead { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--muted); font-size:15px; font-weight:850; }
+    .metricIcon { width:34px; height:34px; border-radius:12px; display:grid; place-items:center; font-size:18px; background:#18263a; color:var(--brand2); }
+    .metricIcon.ok { background:#132b21; color:#53e5a0; }
+    .metricIcon.warn { background:#352711; color:#ffd070; }
+    .metricIcon.bad { background:#351717; color:#ff8e8e; }
+    .metricValue { font-size:32px; line-height:1; font-weight:900; letter-spacing:0; }
+    .metricSub { border-top:1px solid var(--line); padding-top:10px; display:grid; gap:5px; color:var(--muted); font-size:12px; }
+    .metricLine { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
+    .metricLine span { flex:0 0 auto; white-space:nowrap; }
+    .metricLine strong { flex:1 1 auto; min-width:0; text-align:right; overflow-wrap:anywhere; }
+    .metricEllipsis { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; overflow-wrap:normal; }
+    .hudPanel { border:1px solid var(--line); border-radius:8px; padding:16px; background:#101720; display:grid; grid-template-columns:340px minmax(0, 1fr); gap:16px; align-items:center; }
+    .hudDial { position:relative; min-height:230px; display:grid; place-items:center; }
+    .hudDial::before { content:""; width:220px; height:220px; border-radius:50%; background:
+      conic-gradient(from 225deg, var(--ok) 0 var(--hit-angle, 0deg), #2b3545 var(--hit-angle, 0deg) 270deg, transparent 270deg 360deg);
+      mask:radial-gradient(circle, transparent 0 63px, #000 64px 100px, transparent 101px);
+      -webkit-mask:radial-gradient(circle, transparent 0 63px, #000 64px 100px, transparent 101px);
+      transform:rotate(45deg);
+    }
+    .hudDial::after { content:""; position:absolute; width:156px; height:156px; border-radius:50%; border:1px solid var(--line); background:#0d121b; }
+    .hudCenter { position:absolute; z-index:1; text-align:center; display:grid; gap:6px; }
+    .hudValue { font-size:44px; line-height:1; font-weight:900; }
+    .hudLabel { color:var(--muted); font-size:12px; font-weight:850; }
+    .hudGrid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
+    .hudStat { border:1px solid var(--line); border-radius:8px; padding:12px; background:var(--panel2); min-height:82px; display:grid; align-content:space-between; gap:8px; }
+    .hudStatLabel { color:var(--muted); font-size:12px; font-weight:850; }
+    .hudStatValue { font-size:22px; font-weight:900; overflow-wrap:anywhere; }
+    .usageControls { display:flex; gap:8px; flex-wrap:wrap; justify-content:space-between; align-items:center; margin:12px 0; }
+    .usageTable table { min-width:0; }
+    .usageTimeCol { width:9%; }
+    .usageEntryCol { width:15%; }
+    .usageProviderCol { width:15%; }
+    .usageModelCol { width:17%; }
+    .usageNumCol { width:6.2%; }
+    .usageStatusCol { width:7%; }
+    .usageEntryMain, .usageModelMain { display:block; color:var(--text); font-weight:850; line-height:1.25; }
+    .usageMeta { display:block; color:var(--muted); font-size:11px; line-height:1.35; margin-top:3px; overflow-wrap:anywhere; }
+    .usageTag { display:inline-flex; align-items:center; width:max-content; max-width:100%; border:1px solid var(--line); border-radius:999px; padding:2px 6px; margin-top:5px; color:var(--soft); background:#111827; font-size:10px; font-weight:850; line-height:1; }
+    .usageTag.desktop { border-color:#2f5f8f; background:#102033; color:#b9dcff; }
+    .usageTag.chat { border-color:#255c43; background:#0f2018; color:#a6f3c6; }
+    .overviewGrid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; margin-top:12px; }
+    .overviewCard { border:1px solid var(--line); border-radius:8px; padding:13px; background:var(--panel2); min-height:122px; display:grid; gap:8px; align-content:start; }
+    .overviewLabel { color:var(--muted); font-size:12px; font-weight:850; }
+    .overviewMain { font-size:16px; font-weight:850; overflow-wrap:anywhere; }
+    .overviewMeta { color:var(--muted); font-size:12px; line-height:1.45; overflow-wrap:anywhere; }
+    .taskList { display:grid; gap:8px; }
+    .taskItem { border:1px solid var(--line); border-radius:8px; padding:9px 10px; background:#0d1320; color:var(--soft); font-size:12px; line-height:1.45; }
+    .taskItem.bad { border-color:#743333; background:#241313; color:#ffc0c0; }
+    .taskItem.warn { border-color:#73551c; background:#21190d; color:#ffe0a3; }
+    .taskItem.ok { border-color:#245f43; background:#102318; color:#a6f3c6; }
+    .quickActions { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
+    .quickActions button { min-height:38px; font-weight:800; }
+    .summaryGrid, .splitGrid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; }
+    .recommend { margin-top:10px; padding:12px; border:1px solid var(--line); border-radius:8px; background:var(--panel2); line-height:1.55; }
+    .recommend.okState { border-color:#255c43; background:#0f2018; }
+    .recommend.warnState { border-color:#77571c; background:#21190d; }
+    .recommend.badState, .recommend.fail { border-color:#7a3030; background:#241313; }
+    .toolGrid, .apiMatrix, .apiExampleGrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }
+    .toolCard, .apiCard, .apiExample, .compactPanel, .serviceItem, .apiEnvLine { border:1px solid var(--line); border-radius:8px; background:var(--panel2); padding:12px; }
+    .toolCard { min-height:176px; display:flex; flex-direction:column; justify-content:space-between; gap:12px; }
+    .toolName, .apiCardTitle, .apiExampleTitle, .compactTitle, .serviceName { font-weight:850; }
+    .toolName { font-size:16px; margin-bottom:6px; }
+    .toolText, .apiCardMeta, .actualLine, .serviceMeta { color:var(--muted); font-size:12px; line-height:1.5; }
+    .toolSelect { display:grid; gap:6px; margin-top:10px; }
+    .toolSelect label, .apiEnvLabel { color:var(--muted); font-size:11px; }
+    .toolSelect select { width:100%; min-width:0; }
+    .oauthPanel { display:grid; gap:10px; }
+    .oauthActions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .oauthLinkBox { border:1px solid var(--line); border-radius:8px; background:#0d1320; padding:10px; display:grid; gap:8px; }
+    .oauthLinkBox a { color:#9fd0ff; overflow-wrap:anywhere; }
+    #oauthUserCode { width:max-content; max-width:100%; border:1px solid #2f4160; border-radius:8px; padding:8px 12px; font-size:22px; letter-spacing:0; color:#f6f8ff; background:#111b2e; }
+    #oauthExpiresAt { color:var(--muted); font-size:12px; }
+    .oauthPaste { width:100%; min-height:72px; }
+    .hidden { display:none !important; }
+    .actualRow { display:flex; gap:8px; align-items:flex-start; margin-top:8px; }
+    .actualLine { flex:1 1 auto; min-width:0; }
+    .actualLine strong { color:var(--text); }
+    .toolCard button { min-height:40px; font-weight:800; }
+    .toolCard .actualRow button { min-height:0; flex:0 0 auto; }
+    .apiEnvBox { margin-top:10px; display:grid; gap:8px; }
+    .apiEnvValue { color:#b7d8ff; font-size:12px; }
+    .simpleResult { margin-top:12px; padding:12px; border:1px solid var(--line); border-radius:8px; background:#0d1320; min-height:44px; color:var(--muted); font-size:13px; line-height:1.5; }
+    .quotaBar { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px; margin:12px 0; align-items:stretch; }
+    .quotaPill { border:1px solid var(--line); border-radius:8px; padding:13px; background:var(--panel2); display:grid; gap:10px; }
+    .quotaPill.current { border-color:#4c91d9; background:#102033; }
+    .quotaHead { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+    .quotaTitle { font-weight:850; font-size:14px; overflow-wrap:anywhere; }
+    .quotaMeta { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+    .badge { display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:999px; padding:3px 7px; font-size:11px; font-weight:800; line-height:1; }
+    .badge.ok { border-color:#245f43; background:#102318; color:#7ff0b5; }
+    .badge.warn { border-color:#75551a; background:#241a0d; color:#ffd680; }
+    .badge.bad { border-color:#733333; background:#261313; color:#ff9b9b; }
+    .quotaMeter { display:grid; gap:5px; }
+    .quotaMeterMeta { display:grid; grid-template-columns:1fr auto auto; gap:8px; align-items:center; font-size:12px; color:var(--muted); }
+    .quotaMeterMeta strong { color:var(--text); }
+    .quotaReset { color:#7f8ca0; }
+    .quotaProgress { width:100%; height:8px; appearance:none; border:0; border-radius:999px; overflow:hidden; background:#222a36; }
+    .quotaProgress::-webkit-progress-bar { background:#222a36; border-radius:999px; }
+    .quotaProgress::-webkit-progress-value { border-radius:999px; }
+    .quotaProgress.ok::-webkit-progress-value { background:var(--ok); }
+    .quotaProgress.warn::-webkit-progress-value { background:var(--warn); }
+    .quotaProgress.bad::-webkit-progress-value { background:var(--bad); }
+    .quotaProgress::-moz-progress-bar { border-radius:999px; background:var(--ok); }
+    .quotaWindows { color:var(--muted); font-size:12px; line-height:1.5; }
+    .servicePanel { border-top:1px solid var(--line); margin-top:12px; padding-top:12px; }
+    .serviceGrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin-top:8px; }
+    .serviceItem { min-height:84px; }
+    .serviceMeta { overflow-wrap:anywhere; }
+    .formGrid { display:grid; grid-template-columns:repeat(2, minmax(240px, 1fr)); gap:12px; align-items:end; }
+    .formGrid label { display:grid; gap:6px; color:var(--muted); font-size:12px; font-weight:700; }
+    .formGrid input, .formGrid select { width:100%; min-width:0; }
+    .tableWrap { width:100%; overflow:auto; border-radius:8px; border:1px solid var(--line); }
+    table { width:100%; min-width:min(760px, 100%); border-collapse:collapse; table-layout:fixed; font-size:12px; }
     th, td { border-bottom:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; overflow-wrap:anywhere; word-break:break-word; }
+    th { color:var(--muted); background:#111827; font-weight:800; }
+    tr:last-child td { border-bottom:0; }
     .nameCol { width:20%; }
     .smallCol { width:10%; }
     .accountCol { width:16%; }
     .urlCol { width:30%; }
     .tokenCol { width:12%; }
     .providerNameCell { display:flex; gap:8px; align-items:flex-start; min-width:0; }
-    .providerNameCell input { flex:0 0 auto; min-width:0; margin-top:3px; }
-    .providerNameText { min-width:0; overflow-wrap:anywhere; word-break:break-word; }
-    .ok { color: var(--ok); }
-    .bad { color: var(--bad); }
-    .warnText { color: var(--warn); }
-    .paths { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color: var(--muted); line-height:1.4; }
-    .cmd, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color:#b7d8ff; word-break: break-all; }
-    .steps { margin:0; padding-left:20px; color:var(--text); font-size:13px; line-height:1.65; }
-    .steps code { color:#b7d8ff; }
-    .stepNote { display:block; color:var(--muted); font-size:12px; margin-top:2px; }
-    .guideTarget { color:var(--muted); font-size:12px; margin-bottom:10px; }
-    .miniBtn { padding:5px 8px; font-size:12px; }
-    .mt10 { margin-top:10px; }
-    .topGrid { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:10px; margin-top:12px; }
-    .tile { border:1px solid var(--line); border-radius:8px; padding:10px; background:#101520; min-height:66px; }
-    .tileLabel { color:var(--muted); font-size:11px; margin-bottom:6px; }
-    .tileValue { font-size:18px; font-weight:700; }
-    .recommend { margin-top:10px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#111827; }
-    .recommend.okState { border-color:#265f43; background:#102018; }
-    .recommend.warnState { border-color:#7a5a1c; background:#211a0e; }
-    .recommend.badState { border-color:#7a3232; background:#251414; }
-    .quickbar { display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }
-    .simpleFlow { border-color:#35527d; background:#121a29; }
-    .simpleHeader { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; flex-wrap:wrap; margin-bottom:12px; }
-    .simpleTitle { font-size:22px; font-weight:800; margin-bottom:4px; }
-    .simpleSubtitle { color:var(--muted); font-size:13px; line-height:1.5; }
-    .bigSelectRow { display:grid; grid-template-columns: 140px minmax(260px, 520px); gap:12px; align-items:center; margin:12px 0 14px; }
-    .bigSelectRow label { font-weight:700; }
-    .bigSelectRow select { width:100%; min-height:42px; font-size:15px; }
-    .toolGrid { display:grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap:12px; }
-    .toolCard { border:1px solid var(--line); border-radius:10px; padding:14px; background:#101827; min-height:150px; display:flex; flex-direction:column; justify-content:space-between; gap:12px; }
-    .toolName { font-size:16px; font-weight:800; margin-bottom:6px; }
-    .toolText { color:var(--muted); font-size:13px; line-height:1.5; }
-    .toolSelect { margin-top:10px; display:grid; gap:6px; }
-    .toolSelect label { color:var(--muted); font-size:12px; }
-    .toolSelect select { width:100%; min-width:0; }
-    .actualRow { display:flex; gap:8px; align-items:flex-start; margin-top:8px; }
-    .actualLine { color:var(--muted); font-size:12px; line-height:1.45; flex:1 1 auto; min-width:0; }
-    .actualLine strong { color:var(--text); }
-    .toolCard button { min-height:42px; font-weight:700; }
-    .toolCard .actualRow button { min-height:0; padding:4px 8px; font-weight:600; flex:0 0 auto; }
-    .apiEnvBox { margin-top:10px; display:grid; gap:8px; }
-    .apiEnvLine { border:1px solid var(--line); border-radius:8px; padding:8px; background:#0f1320; }
-    .apiEnvLabel { color:var(--muted); font-size:11px; margin-bottom:4px; }
-    .apiEnvValue { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color:#b7d8ff; font-size:12px; overflow-wrap:anywhere; word-break:break-all; }
-    .apiEnvActions { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
-    .simpleResult { margin-top:12px; padding:10px; border:1px solid var(--line); border-radius:8px; background:#0f1320; min-height:42px; color:var(--muted); font-size:13px; line-height:1.5; }
-    .simpleResult strong { color:var(--text); }
-    .apiMatrix { display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin:12px 0; }
-    .apiCard { border:1px solid var(--line); border-radius:8px; background:#101827; padding:10px; min-height:110px; }
-    .apiCardTitle { font-weight:800; font-size:13px; margin-bottom:6px; }
-    .apiCardMeta { color:var(--muted); font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
-    .apiCard.ok { border-color:#265f43; }
-    .apiCard.warn { border-color:#7a5a1c; }
-    .apiExampleGrid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:10px; margin-top:10px; }
-    .apiExample { border:1px solid var(--line); border-radius:8px; background:#0f1320; padding:10px; }
-    .apiExampleTitle { font-weight:800; font-size:12px; margin-bottom:6px; }
-    .quotaBar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:10px 0; }
-    .quotaPill { border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:#101827; min-width:180px; }
-    .quotaPill.current { border-color:#2f6fb2; background:#102033; }
-    .quotaTitle { font-weight:800; font-size:13px; margin-bottom:4px; }
-    .quotaWindows { font-size:12px; color:var(--muted); line-height:1.5; }
-    .servicePanel { border-top:1px solid var(--line); margin-top:12px; padding-top:12px; }
-    .serviceGrid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:8px; margin-top:8px; }
-    .serviceItem { border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:#101827; }
-    .serviceName { font-weight:800; font-size:12px; margin-bottom:4px; }
-    .serviceMeta { color:var(--muted); font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
-    .toggleLine { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:10px; color:var(--muted); font-size:12px; }
-    .toggleLine label { display:flex; gap:6px; align-items:center; }
-    .toggleLine input { min-width:0; }
-    .advancedIntro { color:var(--muted); font-size:12px; margin-bottom:10px; }
-    .compactPanel { border:1px solid var(--line); border-radius:8px; padding:10px; margin:10px 0; background:#101827; }
-    .compactTitle { font-weight:800; font-size:13px; margin-bottom:8px; }
-    .compactPanel input[type="checkbox"] { min-width:0; }
-    .compactPanel input[type="number"] { min-width:120px; width:150px; }
-    summary { cursor:pointer; font-weight:700; }
+    .providerNameText { min-width:0; }
     details.card { padding:0; }
-    details.card > summary { padding:14px; list-style:none; }
+    details.card > summary { padding:14px; list-style:none; cursor:pointer; font-weight:850; }
     details.card > summary::-webkit-details-marker { display:none; }
     details.card > .detailsBody { padding:0 14px 14px; }
-    textarea { width:100%; min-height:120px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
-    @media (max-width: 900px) {
-      .layout { grid-template-columns: 1fr; }
-      .sidebar { position: static; }
-      .topGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .toolGrid { grid-template-columns: 1fr; }
-      .bigSelectRow { grid-template-columns: 1fr; }
+    .steps { margin:0; padding-left:18px; color:var(--soft); font-size:12px; line-height:1.65; }
+    .guideTarget { color:var(--muted); font-size:12px; margin-bottom:10px; }
+    textarea { width:100%; min-height:220px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
+    @media (max-width: 1180px) {
+      .workspace { grid-template-columns:minmax(0, 1fr); }
+      .topBar, .pageStack, .guideDock { grid-column:1; }
+      .topBar, .pageStack { grid-row:auto; }
+      .guideDock { grid-row:auto; position:static; }
+      .hudPanel { grid-template-columns:1fr; }
     }
-    @media (max-width: 560px) {
-      .topGrid { grid-template-columns: 1fr; }
+    @media (max-width: 900px) {
+      .appShell { grid-template-columns:1fr; }
+      .appSidebar { position:static; height:auto; }
+      .sideNav { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+      .topGrid, .metricGrid, .overviewGrid, .summaryGrid, .splitGrid, .formGrid, .quickActions { grid-template-columns:1fr; }
+      .hudGrid { grid-template-columns:1fr; }
+      .usageTable table { min-width:920px; }
+      .topBar { flex-direction:column; }
+      input, select { min-width:0; width:100%; }
     }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      <h1>BridgeDeck</h1>
-      <div id="status" class="muted">加载中...</div>
-      <div class="topGrid">
-        <div class="tile"><div class="tileLabel">账号</div><div id="tileAccounts" class="tileValue">-</div></div>
-        <div class="tile"><div class="tileLabel">Claude 配置</div><div id="tileProviders" class="tileValue">-</div></div>
-        <div class="tile"><div class="tileLabel">账号不一致</div><div id="tileMismatches" class="tileValue">-</div></div>
-        <div class="tile"><div class="tileLabel">CLI 配置</div><div id="tileCliHomes" class="tileValue">-</div></div>
-      </div>
-      <div id="recommendation" class="recommend">加载中...</div>
-      <div class="recommend">
-        <b>Claude 插件启用态</b>
-        <div id="pluginSyncStatus" class="sectionHint">插件同步检测中...</div>
-        <div class="toggleLine">
-          <button class="miniBtn" data-action="extract-safe-common-config">安全提取通用配置</button>
-          <button class="miniBtn" data-action="sync-claude-plugins">一键同步插件启用态</button>
+    <div class="appShell">
+      <aside class="appSidebar">
+        <div class="brand">
+          <div class="brandName">BridgeDeck</div>
+          <div class="brandSub">Local Codex / Claude 控制台</div>
         </div>
-      </div>
-      <div class="recommend">
-        <b>OpenAI 额度与自动切换</b>
-        <div class="sectionHint">只接管 Local Codex Bridge。你切到 MiniMax、Nvidia、SSSAiCode 等第三方供应商时不会自动改回 OpenAI。</div>
-        <div id="actualCurrentAccounts" class="actualLine">实际当前使用：检测中...</div>
-        <div id="quotaBoard" class="quotaBar">额度加载中...</div>
-        <div class="toggleLine">
-          <label><input type="checkbox" id="autoSwitchEnabled"> OpenAI 自动切换</label>
-          <label><input type="checkbox" id="autoSwitchClaude" checked> 自动切 Claude Code</label>
-          <label><input type="checkbox" id="autoSwitchDefaultCodex"> 自动切全局 Codex CLI</label>
-          <button class="miniBtn" data-action="save-auto-switch">保存</button>
-          <button class="miniBtn" data-action="run-auto-switch">立即检查并切换</button>
-          <button class="miniBtn" data-action="create-missing-bridges">为新账号创建 Local Codex Bridge</button>
-          <button class="miniBtn" data-action="preview-bridge-dedupe">预览重复 Local Bridge</button>
-          <button class="miniBtn warn" data-action="apply-bridge-dedupe">清理重复 Local Bridge</button>
-        </div>
-        <div id="missingBridgeStatus" class="muted mt10">新账号检测中...</div>
-        <div id="autoSwitchStatus" class="muted mt10">未运行</div>
-        <div class="servicePanel">
-          <b>本地服务</b>
-          <div id="serviceStatus" class="serviceGrid">服务状态加载中...</div>
-          <div class="toggleLine">
-            <button class="miniBtn" data-action="refresh-services">刷新服务</button>
-            <button class="miniBtn" data-action="proxy-diagnosis">诊断代理链路</button>
-            <button class="miniBtn" data-action="repair-quota-query">一键修复额度查询</button>
-            <button class="miniBtn" data-action="start-local-bridge">启动 Local Bridge</button>
-            <button class="miniBtn" data-action="restart-local-bridge">重启 Local Bridge</button>
-            <button class="miniBtn warn" data-action="stop-local-bridge">停止 Local Bridge</button>
-          </div>
-          <div id="serviceMessage" class="muted mt10">未操作</div>
-          <div id="proxyDiagnosis" class="sectionHint">未诊断</div>
-        </div>
-      </div>
-      <details>
-        <summary>技术信息</summary>
-        <div class="paths" id="paths"></div>
-      </details>
-    </div>
-
-    <div class="card simpleFlow guideSection" id="simpleFlowCard" data-guide="simpleFlow">
-      <div class="simpleHeader">
-        <div>
-          <div class="simpleTitle">Claude Code、单独 Codex CLI、全局 Codex CLI 分开选</div>
-          <div class="simpleSubtitle">Claude Code 是当前 Claude 账号；单独 Codex CLI 是独立窗口；全局 Codex CLI 给 Paperclip、桌面版、直接运行 codex 用。</div>
-        </div>
-        <button data-action="refresh">刷新状态</button>
-      </div>
-      <div class="toolGrid">
-        <div class="toolCard">
-          <div>
-            <div class="toolName">Claude Code</div>
-            <div class="toolText">切换 Claude Code 当前使用的账号。</div>
-            <div class="toolSelect">
-              <label for="simpleClaudeAccount">Claude Code 用哪个账号</label>
-              <select id="simpleClaudeAccount"></select>
-            </div>
-            <div class="actualRow">
-              <div class="actualLine" id="simpleClaudeActual">当前实际：检测中...</div>
-              <button class="miniBtn" data-action="refresh">刷新</button>
-            </div>
-          </div>
-          <button class="primary" data-action="simple-claude">应用到 Claude Code</button>
-        </div>
-        <div class="toolCard">
-          <div>
-            <div class="toolName">单独 Codex CLI</div>
-            <div class="toolText">只为这个账号准备独立启动器，可和其它账号同时开，不改变全局默认。</div>
-            <div class="toolSelect">
-              <label for="simpleCliAccount">单独 Codex CLI 用哪个账号</label>
-              <select id="simpleCliAccount"></select>
-            </div>
-            <div class="actualRow">
-              <div class="actualLine" id="simpleCliActual">当前实际：检测中...</div>
-              <button class="miniBtn" data-action="refresh">刷新</button>
-            </div>
-          </div>
-          <button class="primary" data-action="simple-cli">准备单独 Codex CLI</button>
-        </div>
-        <div class="toolCard">
-          <div>
-            <div class="toolName">通用 API 接入</div>
-            <div class="toolText">给支持 OpenAI Base URL 或 Claude/Anthropic 环境变量的项目复制本地配置。key 是占位符，不是真实 token。</div>
-            <div class="toolSelect">
-              <label for="simpleApiAccount">API 用哪个账号</label>
-              <select id="simpleApiAccount"></select>
-            </div>
-            <div class="apiEnvBox">
-              <div class="apiEnvLine">
-                <div class="apiEnvLabel">OPENAI_API_KEY</div>
-                <div class="apiEnvValue" id="apiAccessKey">sk-bridgedeck-local-placeholder</div>
-              </div>
-              <div class="apiEnvLine">
-                <div class="apiEnvLabel">OPENAI_BASE_URL</div>
-                <div class="apiEnvValue" id="apiAccessBaseUrl">选择账号后生成</div>
-              </div>
-              <div class="apiEnvLine">
-                <div class="apiEnvLabel">ANTHROPIC_AUTH_TOKEN</div>
-                <div class="apiEnvValue" id="anthropicAccessToken">local-bridge</div>
-              </div>
-              <div class="apiEnvLine">
-                <div class="apiEnvLabel">ANTHROPIC_BASE_URL</div>
-                <div class="apiEnvValue" id="anthropicAccessBaseUrl">选择账号后生成</div>
-              </div>
-            </div>
-            <div class="apiEnvActions">
-              <button class="miniBtn" data-action="copy-api-key">复制 API key</button>
-              <button class="miniBtn" data-action="copy-api-base-url">复制 Base URL</button>
-              <button class="miniBtn" data-action="copy-api-env">复制 .env</button>
-              <button class="miniBtn" data-action="copy-anthropic-token">复制 Anthropic token</button>
-              <button class="miniBtn" data-action="copy-anthropic-base-url">复制 Anthropic URL</button>
-              <button class="miniBtn" data-action="copy-anthropic-env">复制 Anthropic .env</button>
-            </div>
-            <div class="actualLine mt10" id="simpleApiActual">当前实际：选择账号后可用。</div>
-          </div>
-        </div>
-        <div class="toolCard">
-          <div>
-            <div class="toolName">Codex Desktop</div>
-            <div class="toolText">桌面版不由 BridgeDeck 接管。这里帮你看它当前是否正常。</div>
-            <div class="actualRow">
-              <div class="actualLine" id="simpleDesktopActual">当前实际：检测中...</div>
-              <button class="miniBtn" data-action="refresh">刷新</button>
-            </div>
-          </div>
-          <button data-action="scroll" data-target="statusCard">查看桌面版状态</button>
-        </div>
-        <div class="toolCard">
-          <div>
-            <div class="toolName">全局 Codex CLI</div>
-            <div class="toolText">给 Paperclip、Codex Desktop、OMC/tmux 用。会一起写全局配置、固定入口和 codex 包装器。</div>
-            <div class="toolSelect">
-              <label for="simpleDefaultAccount">全局 Codex CLI 用哪个账号</label>
-              <select id="simpleDefaultAccount"></select>
-            </div>
-            <div class="actualRow">
-              <div class="actualLine" id="simpleDefaultActual">当前实际：检测中...</div>
-              <button class="miniBtn" data-action="refresh">刷新</button>
-            </div>
-          </div>
-          <button class="warn" data-action="simple-default-codex">设为全局 Codex CLI</button>
-        </div>
-      </div>
-      <div class="simpleResult" id="simpleResult">三种入口可以选择不同账号。</div>
-    </div>
-
-    <div class="card guideSection" id="apiAccessCard" data-guide="apiAccess">
-      <h2>通用 API 接入</h2>
-      <div class="sectionHint">只展示可复制配置和 endpoint 能力，不写 provider、不改 Claude Desktop。API key 使用占位值，真实 OAuth token 不会显示。</div>
-      <div class="row">
-        <label>账号</label>
-        <span class="muted" id="apiAccessGuideAccount">沿用上方通用 API 接入选择</span>
-        <button class="miniBtn" data-action="copy-api-base-url">复制 BASE_URL</button>
-        <button class="miniBtn" data-action="copy-api-env">复制 OpenAI env</button>
-        <button class="miniBtn" data-action="copy-claude-env">复制 Claude Desktop env</button>
-      </div>
-      <div class="paths" id="apiAccessGuideBaseUrl"></div>
-      <div class="apiMatrix">
-        <div class="apiCard ok">
-          <div class="apiCardTitle">OpenAI Responses</div>
-          <div class="apiCardMeta"><span class="mono">POST /v1/responses</span><br />Codex bridge 主路径，支持流式 reasoning keepalive。</div>
-        </div>
-        <div class="apiCard ok">
-          <div class="apiCardTitle">Anthropic Messages</div>
-          <div class="apiCardMeta"><span class="mono">POST /v1/messages</span><br />Claude Desktop 3P gateway 最小兼容路径，映射到 Responses。</div>
-        </div>
-        <div class="apiCard ok">
-          <div class="apiCardTitle">Chat Completions</div>
-          <div class="apiCardMeta"><span class="mono">POST /v1/chat/completions</span><br />OpenAI 旧式工具接入路径，非流式和 SSE 都走 Responses。</div>
-        </div>
-        <div class="apiCard ok">
-          <div class="apiCardTitle">Scoped Models</div>
-          <div class="apiCardMeta"><span class="mono">GET /v1/models</span><br />返回 account-scoped 模型能力；gpt-5.5 为 272k context / 128k max output。</div>
-        </div>
-      </div>
-      <div class="apiExampleGrid">
-        <div class="apiExample">
-          <div class="apiExampleTitle">OpenAI-compatible</div>
-          <div class="paths" id="apiOpenAiExample"></div>
-        </div>
-        <div class="apiExample">
-          <div class="apiExampleTitle">Claude Desktop 3P</div>
-          <div class="paths" id="apiClaudeExample"></div>
-        </div>
-      </div>
-      <div class="muted mt10">gpt-5.5 thinking levels: low / medium / high / xhigh。minimal 不作为可选级别展示。</div>
-    </div>
-
-    <div class="layout">
-      <aside class="sidebar">
-        <div class="card">
-          <h2 id="guideTitle">当前操作</h2>
-          <div id="guideTarget" class="guideTarget">随右侧当前板块自动切换</div>
-          <ol id="guideSteps" class="steps"></ol>
+        <nav class="sideNav" aria-label="BridgeDeck sections">
+          <button class="navItem active" data-page="overview">总览 <span class="navHint">状态</span></button>
+          <button class="navItem" data-page="usage">使用详情 <span class="navHint">Token</span></button>
+          <button class="navItem" data-page="switching">入口切换 <span class="navHint">账号</span></button>
+          <button class="navItem" data-page="quota">额度与自动切换 <span class="navHint">OpenAI</span></button>
+          <button class="navItem" data-page="claude">Claude Code <span class="navHint">桥接</span></button>
+          <button class="navItem" data-page="codex">Codex CLI <span class="navHint">启动器</span></button>
+          <button class="navItem" data-page="api">通用 API <span class="navHint">复制</span></button>
+          <button class="navItem" data-page="services">本地服务 <span class="navHint">8876</span></button>
+          <button class="navItem" data-page="diagnostics">诊断日志 <span class="navHint">排查</span></button>
+        </nav>
+        <div class="sidePanel">
+          <div id="status" class="muted">加载中...</div>
+          <details class="mt10">
+            <summary>技术信息</summary>
+            <div class="paths mt10" id="paths"></div>
+          </details>
         </div>
       </aside>
 
-      <main class="main">
-        <details class="card guideSection" id="providerCreateCard" data-guide="providerCreate">
-          <summary>高级：Claude 桥接账号</summary>
-          <div class="detailsBody">
-          <h2>Claude 桥接账号</h2>
-          <div class="sectionHint">把某个 ChatGPT 账号接到 Claude Code。通常只需要选账号，然后创建并设为当前。</div>
-          <div class="row">
-            <label>ChatGPT 账号</label>
-            <select id="account"></select>
-            <label>显示名称</label>
-            <input id="providerName" placeholder="Local Codex Bridge - xxx" />
-            <label><input type="checkbox" id="setCurrent" checked /> 设为当前</label>
-            <button class="primary" data-action="create-provider">创建/更新 Claude 桥接</button>
+      <main class="workspace">
+        <header class="topBar">
+          <div>
+            <h1>BridgeDeck 控制台</h1>
+            <p>把账户、额度、Claude、Codex CLI、API 接入和本地服务拆开管理。</p>
           </div>
-          <div class="compactPanel">
-            <div class="compactTitle">Claude Code 自动压缩</div>
-            <div class="row">
-              <label><input type="checkbox" id="compactEnabled" checked /> 启用</label>
-              <label>窗口 tokens</label>
-              <input id="compactWindow" type="number" min="10000" max="2000000" step="1000" value="220000" />
-              <label>阈值 %</label>
-              <input id="compactPct" type="number" min="1" max="100" step="1" value="80" />
-              <button class="miniBtn" data-action="compact-preset-220k">220k</button>
-              <button class="miniBtn" data-action="compact-preset-1m">1m</button>
-              <button class="miniBtn" data-action="compact-off">关闭</button>
-              <button class="miniBtn" data-action="save-compact-selected">保存到选中 provider</button>
-              <button class="miniBtn" data-action="sync-common-env-selected">同步通用 env 到全部</button>
+          <div class="topActions">
+            <button data-action="refresh">刷新状态</button>
+            <button data-page="services">本地服务</button>
+            <button class="warn" data-action="stop-bridgedeck-ui">关闭 UI</button>
+          </div>
+        </header>
+
+        <div class="pageStack">
+          <section class="deckPage active" id="page-overview">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">总览</h2>
+                <p class="pageDesc">只显示当前能否用、哪里不一致、下一步该点哪个入口。</p>
+              </div>
+              <button class="primary" data-page="switching">选择账号入口</button>
             </div>
-            <div class="muted">220000 适合实际窗口偏小的 GPT；1000000 适合 1m 模型。</div>
-          </div>
-          <div class="muted">工具会自动写入本地 bridge 配置，不需要手动编辑 URL/token。</div>
-          </div>
-        </details>
+            <div class="topGrid">
+              <div class="tile"><div class="tileLabel">账号</div><div id="tileAccounts" class="tileValue">-</div></div>
+              <div class="tile"><div class="tileLabel">Claude 配置</div><div id="tileProviders" class="tileValue">-</div></div>
+              <div class="tile"><div class="tileLabel">账号不一致</div><div id="tileMismatches" class="tileValue">-</div></div>
+              <div class="tile"><div class="tileLabel">CLI 配置</div><div id="tileCliHomes" class="tileValue">-</div></div>
+            </div>
+            <div class="metricGrid">
+              <div class="metricCard">
+                <div class="metricHead"><span>Provider 匹配</span><span id="metricAccountIcon" class="metricIcon ok">✓</span></div>
+                <div id="metricAccountValue" class="metricValue">-</div>
+                <div class="metricSub">
+                  <div class="metricLine"><span>匹配</span><strong id="metricAccountOk">-</strong></div>
+                  <div class="metricLine"><span>错配</span><strong id="metricAccountRisk">-</strong></div>
+                </div>
+              </div>
+              <div class="metricCard">
+                <div class="metricHead"><span>额度消耗</span><span id="metricQuotaIcon" class="metricIcon">▣</span></div>
+                <div id="metricQuotaValue" class="metricValue">-</div>
+                <div class="metricSub">
+                  <div class="metricLine"><span>账号</span><strong id="metricQuotaAccount" class="metricEllipsis">-</strong></div>
+                  <div class="metricLine"><span>剩余</span><strong id="metricQuotaRemaining">-</strong></div>
+                </div>
+              </div>
+              <div class="metricCard">
+                <div class="metricHead"><span>Token 用量</span><span class="metricIcon">◇</span></div>
+                <div id="metricTokenValue" class="metricValue">未采集</div>
+                <div class="metricSub">
+                  <div class="metricLine"><span>Input</span><strong id="metricTokenInput">-</strong></div>
+                  <div class="metricLine"><span>Output</span><strong id="metricTokenOutput">-</strong></div>
+                </div>
+              </div>
+              <div class="metricCard">
+                <div class="metricHead"><span>缓存 Token</span><span class="metricIcon warn">◎</span></div>
+                <div id="metricCacheValue" class="metricValue">未采集</div>
+                <div class="metricSub">
+                  <div class="metricLine"><span>创建</span><strong id="metricCacheCreate">-</strong></div>
+                  <div class="metricLine"><span>命中</span><strong id="metricCacheHit">-</strong></div>
+                </div>
+              </div>
+            </div>
+            <div class="overviewGrid">
+              <div class="overviewCard">
+                <div class="overviewLabel">Claude Code</div>
+                <div id="overviewClaudeMain" class="overviewMain">检测中...</div>
+                <div id="overviewClaudeMeta" class="overviewMeta">-</div>
+              </div>
+              <div class="overviewCard">
+                <div class="overviewLabel">全局 Codex CLI / Desktop</div>
+                <div id="overviewDesktopMain" class="overviewMain">检测中...</div>
+                <div id="overviewDesktopMeta" class="overviewMeta">-</div>
+              </div>
+              <div class="overviewCard">
+                <div class="overviewLabel">OMC / tmux 固定入口</div>
+                <div id="overviewOmniMain" class="overviewMain">检测中...</div>
+                <div id="overviewOmniMeta" class="overviewMeta">-</div>
+              </div>
+            </div>
+            <div id="recommendation" class="recommend">加载中...</div>
+            <div class="summaryGrid mt10">
+              <div class="panel">
+                <h2>待处理事项</h2>
+                <div id="overviewTasks" class="taskList"><div class="taskItem">检测中...</div></div>
+              </div>
+              <div class="panel">
+                <h2>快捷动作</h2>
+                <div class="quickActions">
+                  <button class="miniBtn" data-page="switching">入口切换</button>
+                  <button class="miniBtn" data-page="quota">额度详情</button>
+                  <button class="miniBtn" data-page="diagnostics">账号矩阵</button>
+                  <button class="miniBtn" data-page="services">服务状态</button>
+                </div>
+              </div>
+            </div>
+            <div class="summaryGrid mt10">
+              <div class="panel guideSection" data-guide="simpleFlow">
+                <h2>当前实际使用</h2>
+                <div id="actualCurrentAccounts" class="actualLine">实际当前使用：检测中...</div>
+                <div class="row">
+                  <button class="miniBtn" data-page="switching">入口切换</button>
+                  <button class="miniBtn" data-page="quota">查看额度</button>
+                  <button class="miniBtn" data-page="diagnostics">状态矩阵</button>
+                </div>
+              </div>
+              <div class="panel">
+                <h2>Claude 插件启用态</h2>
+                <div id="pluginSyncStatus" class="sectionHint">插件同步检测中...</div>
+                <div class="row">
+                  <button class="miniBtn" data-action="extract-safe-common-config">安全提取通用配置</button>
+                  <button class="miniBtn" data-action="sync-claude-plugins">一键同步插件启用态</button>
+                </div>
+              </div>
+            </div>
+          </section>
 
-        <details class="card guideSection" id="cliHomeCard" data-guide="cliHome">
-          <summary>高级：Codex CLI 启动器</summary>
-          <div class="detailsBody">
-          <h2>单独 Codex CLI</h2>
-          <div class="sectionHint">生成 launcher-only 启动器：只设置 <code>CODEX_HOME</code>、<code>OPENAI_API_KEY</code> 和账号路由，不复制 OpenAI token，不改默认 <code>~/.codex</code>。</div>
-          <div class="row">
-            <label>账号</label>
-            <select id="cliAccount"></select>
-            <label>保存目录</label>
-            <input id="cliHome" placeholder="~/.codex-cli-pro20x" />
-            <label>启动器名称</label>
-            <input id="cliProfileName" placeholder="pro20x" />
-            <button class="primary" data-action="create-cli-home">生成启动器</button>
-            <button data-action="migrate-cli-home">迁移旧 CLI 目录</button>
-          </div>
-          <div class="muted">单独 Codex CLI = 使用对应启动脚本打开新的 Codex CLI，可多个账号同时运行，不改变全局默认。</div>
-          <div class="paths" id="cliCommand"></div>
-          <div class="muted mt10">可用账号：点“选用”自动填入推荐目录。</div>
-          <div class="tableWrap">
-            <table id="cliAccountsTable">
-              <thead>
-                <tr>
-                  <th class="nameCol">账号名</th>
-                  <th class="urlCol">email</th>
-                  <th class="accountCol">account_id</th>
-                  <th class="urlCol">推荐 CLI Home</th>
-                  <th class="smallCol">操作</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          </div>
-        </details>
+          <section class="deckPage" id="page-usage">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">使用详情</h2>
+                <p class="pageDesc">查看 Local Codex Bridge 请求、Token、缓存写入、缓存命中和未命中。</p>
+              </div>
+              <button data-action="refresh">刷新使用详情</button>
+            </div>
+            <div class="hudPanel guideSection" data-guide="usage">
+              <div id="usageHudDial" class="hudDial">
+                <div class="hudCenter">
+                  <div id="usageHudHitRate" class="hudValue">-</div>
+                  <div class="hudLabel">缓存命中率</div>
+                </div>
+              </div>
+              <div class="hudGrid">
+                <div class="hudStat"><div class="hudStatLabel">总请求数</div><div id="usageHudRequests" class="hudStatValue">-</div></div>
+                <div class="hudStat"><div class="hudStatLabel">总 Token</div><div id="usageHudTokens" class="hudStatValue">-</div></div>
+                <div class="hudStat"><div class="hudStatLabel">输入 / 输出</div><div id="usageHudInOut" class="hudStatValue">-</div></div>
+                <div class="hudStat"><div class="hudStatLabel">缓存写入</div><div id="usageHudCacheWrite" class="hudStatValue">-</div></div>
+                <div class="hudStat"><div class="hudStatLabel">命中缓存</div><div id="usageHudCacheRead" class="hudStatValue">-</div></div>
+                <div class="hudStat"><div class="hudStatLabel">未命中缓存</div><div id="usageHudCacheMiss" class="hudStatValue">-</div></div>
+              </div>
+            </div>
+            <div class="usageControls">
+              <div class="sectionHint">明细只保留最近 200 条；账号显示会按当前本机配置做脱敏。</div>
+              <div class="row">
+                <button class="miniBtn" data-page="services">服务状态</button>
+                <button class="miniBtn" data-page="diagnostics">诊断日志</button>
+              </div>
+            </div>
+            <div class="tableWrap usageTable">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="usageTimeCol">时间</th>
+                    <th class="usageEntryCol">入口</th>
+                    <th class="usageProviderCol">供应商</th>
+                    <th class="usageModelCol">模型</th>
+                    <th class="usageNumCol">输入</th>
+                    <th class="usageNumCol">输出</th>
+                    <th class="usageNumCol">缓存写入</th>
+                    <th class="usageNumCol">命中缓存</th>
+                    <th class="usageNumCol">未命中</th>
+                    <th class="usageNumCol">命中率</th>
+                    <th class="usageStatusCol">状态</th>
+                  </tr>
+                </thead>
+                <tbody id="usageRows">
+                  <tr><td colspan="11">加载中...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
 
-        <details class="card guideSection" id="providerManageCard" data-guide="providerManage">
-          <summary>高级：Claude Provider 管理</summary>
-          <div class="detailsBody">
-          <div class="sectionHint">只在需要切换、修复、排查 token 时使用。日常只看“当前”和“账号”。</div>
-          <div class="row">
-            <button data-action="refresh">刷新</button>
-            <button class="miniBtn" id="tokenToggle" data-action="toggle-tokens">显示 token</button>
-            <button data-action="set-current-selected">设选中为当前</button>
-            <button data-action="patch-selected">修复选中桥接</button>
-            <button class="warn" data-action="repair-plus-pro">修复 Plus/Pro</button>
-          </div>
-          <div class="tableWrap">
-            <table id="providersTable">
-              <thead>
-                <tr>
-                  <th class="nameCol">name</th>
-                  <th class="smallCol">当前</th>
-                  <th class="accountCol">account</th>
-                  <th class="urlCol">base_url</th>
-                  <th class="smallCol">compact</th>
-                  <th class="tokenCol">token</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          </div>
-        </details>
+          <section class="deckPage" id="page-switching">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">入口切换</h2>
+                <p class="pageDesc">Claude Code、单独 Codex CLI、全局 Codex CLI 分开选，避免一个操作影响全部。</p>
+              </div>
+              <button data-action="refresh">刷新状态</button>
+            </div>
+            <div class="panel guideSection oauthPanel" data-guide="oauth">
+              <div>
+                <h2>ChatGPT 授权</h2>
+                <div class="sectionHint">在 BridgeDeck 内新增或重新授权 ChatGPT 账号；完成后写入 CC Switch 使用的 OAuth 账号池。</div>
+              </div>
+              <div class="oauthActions">
+                <button class="primary" data-action="start-codex-oauth">生成授权验证码</button>
+                <label><input type="checkbox" id="oauthSetDefault"> 授权后设为默认账号</label>
+                <button class="miniBtn" data-action="refresh">刷新账号列表</button>
+              </div>
+              <div id="oauthResult" class="simpleResult">未开始授权。</div>
+              <div id="oauthUrlBox" class="oauthLinkBox hidden">
+                <div class="muted">打开 OpenAI 设备授权页，输入下方验证码。</div>
+                <div id="oauthUserCode" class="mono strong">-</div>
+                <div id="oauthExpiresAt">有效期：-</div>
+                <a id="oauthAuthLink" href="#" target="_blank" rel="noopener noreferrer">OpenAI 设备授权页</a>
+                <div class="oauthActions">
+                  <button class="miniBtn" data-action="check-codex-oauth">检查授权状态</button>
+                  <button class="miniBtn hidden" id="oauthApplyBridgeBtn" data-action="apply-codex-oauth-bridge">加入 CC Switch</button>
+                  <button class="miniBtn" data-action="hide-codex-oauth">隐藏验证码</button>
+                </div>
+              </div>
+            </div>
+            <div class="card guideSection" id="simpleFlowCard" data-guide="simpleFlow">
+              <div class="toolGrid">
+                <div class="toolCard">
+                  <div>
+                    <div class="toolName">Claude Code</div>
+                    <div class="toolText">切换 Claude Code 当前使用的账号。</div>
+                    <div class="toolSelect">
+                      <label for="simpleClaudeAccount">Claude Code 用哪个账号</label>
+                      <select id="simpleClaudeAccount"></select>
+                    </div>
+                    <div class="actualRow">
+                      <div class="actualLine" id="simpleClaudeActual">当前实际：检测中...</div>
+                      <button class="miniBtn" data-action="refresh">刷新</button>
+                    </div>
+                  </div>
+                  <button class="primary" data-action="simple-claude">应用到 Claude Code</button>
+                </div>
+                <div class="toolCard">
+                  <div>
+                    <div class="toolName">单独 Codex CLI</div>
+                    <div class="toolText">准备独立启动器，不改变全局默认。</div>
+                    <div class="toolSelect">
+                      <label for="simpleCliAccount">单独 Codex CLI 用哪个账号</label>
+                      <select id="simpleCliAccount"></select>
+                    </div>
+                    <div class="actualRow">
+                      <div class="actualLine" id="simpleCliActual">当前实际：检测中...</div>
+                      <button class="miniBtn" data-action="refresh">刷新</button>
+                    </div>
+                  </div>
+                  <button class="primary" data-action="simple-cli">准备单独 Codex CLI</button>
+                </div>
+                <div class="toolCard">
+                  <div>
+                    <div class="toolName">全局 Codex CLI</div>
+                    <div class="toolText">给 Paperclip、Codex Desktop、OMC/tmux 和直接运行 codex 使用。</div>
+                    <div class="toolSelect">
+                      <label for="simpleDefaultAccount">全局 Codex CLI 用哪个账号</label>
+                      <select id="simpleDefaultAccount"></select>
+                    </div>
+                    <div class="actualRow">
+                      <div class="actualLine" id="simpleDefaultActual">当前实际：检测中...</div>
+                      <button class="miniBtn" data-action="refresh">刷新</button>
+                    </div>
+                  </div>
+                  <button class="warn" data-action="simple-default-codex">设为全局 Codex CLI</button>
+                </div>
+                <div class="toolCard">
+                  <div>
+                    <div class="toolName">Codex Desktop</div>
+                    <div class="toolText">桌面版跟随全局 Codex CLI，这里只显示检测结果。</div>
+                    <div class="actualRow">
+                      <div class="actualLine" id="simpleDesktopActual">当前实际：检测中...</div>
+                      <button class="miniBtn" data-action="refresh">刷新</button>
+                    </div>
+                  </div>
+                  <button data-action="scroll" data-target="statusCard">查看桌面版状态</button>
+                </div>
+              </div>
+              <div class="simpleResult" id="simpleResult">三种入口可以选择不同账号。</div>
+            </div>
+          </section>
 
-        <details class="card guideSection" id="statusCard" data-guide="status" open>
-          <summary>账号状态检查</summary>
-          <div class="detailsBody">
-          <div class="sectionHint">自动检测 Claude Code、单独 Codex CLI、全局 Codex CLI 当前状态。Desktop 跟随全局 Codex CLI。</div>
-          <div class="tableWrap">
-            <table id="accountMatrixTable">
-              <thead>
-                <tr>
-                  <th class="nameCol">账号</th><th class="smallCol">Claude</th><th class="smallCol">CLI</th><th class="smallCol">Desktop</th><th class="smallCol">状态</th><th class="urlCol">建议</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <br />
-          <div class="muted">CC Switch Codex OAuth Provider：用于授权和额度检查；BridgeDeck 全局入口以上面 Desktop 列为准。</div>
-          <div class="tableWrap">
-            <table id="codexProvidersTable">
-              <thead>
-                <tr>
-                  <th class="nameCol">名称</th><th class="smallCol">当前</th><th class="accountCol">绑定账号</th><th class="accountCol">实际账号</th><th class="smallCol">状态</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <div id="diagnosis" class="recommend"></div>
-          <br />
-          <div class="muted">已配置 CLI 目录：这里只显示已经存在的 CODEX_HOME。</div>
-          <div class="tableWrap">
-            <table id="cliHomesTable">
-              <thead>
-                <tr>
-                  <th class="urlCol">CLI 目录</th><th class="urlCol">切换命令</th><th class="accountCol">账号</th><th class="urlCol">email</th><th class="smallCol">状态</th><th class="urlCol">更新时间</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          </div>
-        </details>
+          <section class="deckPage" id="page-quota">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">额度与自动切换</h2>
+                <p class="pageDesc">只接管 Local Codex Bridge。切到 MiniMax、Nvidia、SSSAiCode 时不会自动改回 OpenAI。</p>
+              </div>
+              <button class="primary" data-action="run-auto-switch">立即检查并切换</button>
+            </div>
+            <div class="card guideSection" data-guide="quota">
+              <div id="quotaBoard" class="quotaBar">额度加载中...</div>
+              <div class="toggleLine">
+                <label><input type="checkbox" id="autoSwitchEnabled"> OpenAI 自动切换</label>
+                <label><input type="checkbox" id="autoSwitchClaude" checked> 自动切 Claude Code</label>
+                <label><input type="checkbox" id="autoSwitchDefaultCodex"> 自动切全局 Codex CLI</label>
+              </div>
+              <div class="row">
+                <button class="miniBtn" data-action="save-auto-switch">保存</button>
+                <button class="miniBtn" data-action="run-auto-switch">立即检查并切换</button>
+                <button class="miniBtn" data-action="create-missing-bridges">为新账号创建 Local Codex Bridge</button>
+                <button class="miniBtn" data-action="preview-bridge-dedupe">预览重复 Local Bridge</button>
+                <button class="miniBtn warn" data-action="apply-bridge-dedupe">清理重复 Local Bridge</button>
+              </div>
+              <div id="missingBridgeStatus" class="muted mt10">新账号检测中...</div>
+              <div id="autoSwitchStatus" class="muted mt10">未运行</div>
+            </div>
+          </section>
 
-        <details class="card guideSection" data-guide="log">
-          <summary>执行日志</summary>
-          <div class="detailsBody">
-          <textarea id="log" readonly></textarea>
+          <section class="deckPage" id="page-claude">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">Claude Code</h2>
+                <p class="pageDesc">创建、切换和修复 Claude Provider，同时配置模型上下文和自动压缩。</p>
+              </div>
+              <button data-action="refresh">刷新</button>
+            </div>
+            <div class="card guideSection" id="providerCreateCard" data-guide="providerCreate">
+              <h2>Claude 桥接账号</h2>
+              <div class="sectionHint">选择账号、模型和上下文后创建/更新；勾选“设为当前”会同步 CC Switch 当前 Claude Provider。</div>
+              <div class="formGrid">
+                <label>ChatGPT 账号<select id="account"></select></label>
+                <label>显示名称<input id="providerName" placeholder="Local Codex Bridge - xxx" /></label>
+                <label>模型<select id="bridgeModel"></select></label>
+                <label>上下文 tokens<input id="modelContextTokens" type="number" min="10000" max="2000000" step="1000" value="272000" readonly /></label>
+              </div>
+              <div class="row">
+                <label><input type="checkbox" id="setCurrent" checked /> 设为当前</label>
+                <button class="primary" data-action="create-provider">创建/更新 Claude 桥接</button>
+              </div>
+              <div class="compactPanel">
+                <div class="compactTitle">Claude Code 自动压缩</div>
+                <div class="row">
+                  <label><input type="checkbox" id="compactEnabled" checked /> 启用</label>
+                  <label>窗口 tokens <input id="compactWindow" type="number" min="10000" max="2000000" step="1000" value="272000" /></label>
+                  <label>阈值 % <input id="compactPct" type="number" min="1" max="100" step="1" value="80" /></label>
+                  <button class="miniBtn" data-action="compact-preset-model">模型上下文</button>
+                  <button class="miniBtn" data-action="compact-preset-220k">220k</button>
+                  <button class="miniBtn" data-action="compact-preset-1m">1m</button>
+                  <button class="miniBtn" data-action="compact-off">关闭</button>
+                  <button class="miniBtn" data-action="save-compact-selected">保存模型/上下文到选中 provider</button>
+                  <button class="miniBtn" data-action="sync-common-env-selected">同步通用 env 到全部</button>
+                </div>
+                <div class="muted" id="bridgeModelMeta">gpt-5.5 = 272000 context tokens / 128000 max output。</div>
+              </div>
+            </div>
+            <div class="card guideSection" id="providerManageCard" data-guide="providerManage">
+              <h2>Claude Provider 管理</h2>
+              <div class="sectionHint">排查 token、当前项和 base_url。默认隐藏真实 token。</div>
+              <div class="row">
+                <button data-action="refresh">刷新</button>
+                <button class="miniBtn" id="tokenToggle" data-action="toggle-tokens">显示 token</button>
+                <button data-action="set-current-selected">设选中为当前</button>
+                <button data-action="patch-selected">修复选中桥接</button>
+                <button class="warn" data-action="repair-plus-pro">修复 Plus/Pro</button>
+              </div>
+              <div class="tableWrap">
+                <table id="providersTable">
+                  <thead>
+                    <tr>
+                      <th class="nameCol">name</th>
+                      <th class="smallCol">当前</th>
+                      <th class="accountCol">account</th>
+                      <th class="urlCol">base_url</th>
+                      <th class="smallCol">model</th>
+                      <th class="smallCol">压缩</th>
+                      <th class="tokenCol">token</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section class="deckPage" id="page-codex">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">Codex CLI</h2>
+                <p class="pageDesc">生成 launcher-only 启动器，不复制 OpenAI token，不改默认 ~/.codex。</p>
+              </div>
+              <button data-action="refresh">刷新</button>
+            </div>
+            <div class="card guideSection" id="cliHomeCard" data-guide="cliHome">
+              <h2>单独 Codex CLI 启动器</h2>
+              <div class="formGrid">
+                <label>账号<select id="cliAccount"></select></label>
+                <label>保存目录<input id="cliHome" placeholder="~/.codex-cli-pro20x" /></label>
+                <label>启动器名称<input id="cliProfileName" placeholder="pro20x" /></label>
+              </div>
+              <div class="row">
+                <button class="primary" data-action="create-cli-home">生成启动器</button>
+                <button data-action="migrate-cli-home">迁移旧 CLI 目录</button>
+              </div>
+              <div class="paths" id="cliCommand"></div>
+              <div class="muted mt10">可用账号：点“选用”自动填入推荐目录。</div>
+              <div class="tableWrap mt10">
+                <table id="cliAccountsTable">
+                  <thead>
+                    <tr>
+                      <th class="nameCol">账号名</th>
+                      <th class="urlCol">email</th>
+                      <th class="accountCol">account_id</th>
+                      <th class="urlCol">推荐 CLI Home</th>
+                      <th class="smallCol">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section class="deckPage" id="page-api">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">通用 API 接入</h2>
+                <p class="pageDesc">复制 OpenAI Base URL 或 Claude/Anthropic 环境变量；API key 是占位符，不显示真实 OAuth token。</p>
+              </div>
+            </div>
+            <div class="card guideSection" id="apiAccessCard" data-guide="apiAccess">
+              <div class="toolGrid">
+                <div class="toolCard">
+                  <div>
+                    <div class="toolName">本地 API 配置</div>
+                    <div class="toolText">选择要暴露给外部工具的 ChatGPT 账号。</div>
+                    <div class="toolSelect">
+                      <label for="simpleApiAccount">API 用哪个账号</label>
+                      <select id="simpleApiAccount"></select>
+                    </div>
+                    <div class="apiEnvBox">
+                      <div class="apiEnvLine">
+                        <div class="apiEnvLabel">OPENAI_API_KEY</div>
+                        <div class="apiEnvValue" id="apiAccessKey">sk-bridgedeck-local-placeholder</div>
+                      </div>
+                      <div class="apiEnvLine">
+                        <div class="apiEnvLabel">OPENAI_BASE_URL</div>
+                        <div class="apiEnvValue" id="apiAccessBaseUrl">选择账号后生成</div>
+                      </div>
+                      <div class="apiEnvLine">
+                        <div class="apiEnvLabel">ANTHROPIC_AUTH_TOKEN</div>
+                        <div class="apiEnvValue" id="anthropicAccessToken">local-bridge</div>
+                      </div>
+                      <div class="apiEnvLine">
+                        <div class="apiEnvLabel">ANTHROPIC_BASE_URL</div>
+                        <div class="apiEnvValue" id="anthropicAccessBaseUrl">选择账号后生成</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="apiEnvActions">
+                    <button class="miniBtn" data-action="copy-api-key">复制 API key</button>
+                    <button class="miniBtn" data-action="copy-api-base-url">复制 Base URL</button>
+                    <button class="miniBtn" data-action="copy-api-env">复制 .env</button>
+                    <button class="miniBtn" data-action="copy-anthropic-token">复制 Anthropic token</button>
+                    <button class="miniBtn" data-action="copy-anthropic-base-url">复制 Anthropic URL</button>
+                    <button class="miniBtn" data-action="copy-anthropic-env">复制 Anthropic .env</button>
+                  </div>
+                  <div class="actualLine mt10" id="simpleApiActual">当前实际：选择账号后可用。</div>
+                </div>
+                <div class="toolCard">
+                  <div>
+                    <div class="toolName">复制指南</div>
+                    <div class="toolText" id="apiAccessGuideAccount">沿用左侧 API 账号选择</div>
+                    <div class="paths mt10" id="apiAccessGuideBaseUrl"></div>
+                  </div>
+                  <div class="apiEnvActions">
+                    <button class="miniBtn" data-action="copy-api-base-url">复制 BASE_URL</button>
+                    <button class="miniBtn" data-action="copy-api-env">复制 OpenAI env</button>
+                    <button class="miniBtn" data-action="copy-claude-env">复制 Desktop Gateway</button>
+                  </div>
+                </div>
+              </div>
+              <div class="apiMatrix">
+                <div class="apiCard ok">
+                  <div class="apiCardTitle">OpenAI Responses</div>
+                  <div class="apiCardMeta"><span class="mono">POST /v1/responses</span><br />Codex bridge 主路径，支持流式 reasoning keepalive。</div>
+                </div>
+                <div class="apiCard ok">
+                  <div class="apiCardTitle">Anthropic Messages</div>
+                  <div class="apiCardMeta"><span class="mono">POST /v1/messages</span><br />Claude Desktop 3P 使用 Claude-safe 路由名，BridgeDeck 映射到 GPT。</div>
+                </div>
+                <div class="apiCard ok">
+                  <div class="apiCardTitle">Chat Completions</div>
+                  <div class="apiCardMeta"><span class="mono">POST /v1/chat/completions</span><br />OpenAI 旧式工具接入路径，非流式和 SSE 都走 Responses。</div>
+                </div>
+                <div class="apiCard ok">
+                  <div class="apiCardTitle">Scoped Models</div>
+                  <div class="apiCardMeta"><span class="mono">GET /v1/models</span><br />同时返回 gpt-* 和 claude-* Desktop 路由；gpt-5.5 为 272k context / 128k max output。</div>
+                </div>
+              </div>
+              <div class="apiExampleGrid">
+                <div class="apiExample">
+                  <div class="apiExampleTitle">OpenAI-compatible</div>
+                  <div class="paths" id="apiOpenAiExample"></div>
+                </div>
+                <div class="apiExample">
+                  <div class="apiExampleTitle">Claude Desktop 3P</div>
+                  <div class="paths" id="apiClaudeExample"></div>
+                </div>
+              </div>
+              <div class="muted mt10">gpt-5.5 thinking levels: low / medium / high / xhigh。minimal 不作为可选级别展示。</div>
+            </div>
+          </section>
+
+          <section class="deckPage" id="page-services">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">本地服务</h2>
+                <p class="pageDesc">UI 8899 和 Local Bridge 8876 分开控制；关闭 UI 不影响 8876。</p>
+              </div>
+              <button class="primary" data-action="refresh-services">刷新服务</button>
+            </div>
+            <div class="card guideSection" data-guide="services">
+              <h2>服务状态</h2>
+              <div id="serviceStatus" class="serviceGrid">服务状态加载中...</div>
+              <div class="row">
+                <button class="miniBtn" data-action="refresh-services">刷新服务</button>
+                <button class="miniBtn" data-action="proxy-diagnosis">诊断代理链路</button>
+                <button class="miniBtn" data-action="repair-quota-query">一键修复额度查询</button>
+                <button class="miniBtn" data-action="start-local-bridge">启动 Local Bridge</button>
+                <button class="miniBtn" data-action="restart-local-bridge">重启 Local Bridge</button>
+                <button class="miniBtn warn" data-action="stop-local-bridge">停止 Local Bridge</button>
+                <button class="miniBtn warn" data-action="stop-bridgedeck-ui">关闭 BridgeDeck UI</button>
+              </div>
+              <div id="serviceMessage" class="muted mt10">关闭 BridgeDeck UI 只停 8899，不影响 8876 Local Bridge。</div>
+              <div id="proxyDiagnosis" class="recommend">未诊断</div>
+            </div>
+          </section>
+
+          <section class="deckPage" id="page-diagnostics">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">诊断日志</h2>
+                <p class="pageDesc">账号矩阵、Codex Provider、CLI Home 和执行日志集中排查。</p>
+              </div>
+              <button data-action="refresh">刷新</button>
+            </div>
+            <div class="card guideSection" id="statusCard" data-guide="status">
+              <h2>账号状态检查</h2>
+              <div class="sectionHint">自动检测 Claude Code、单独 Codex CLI、全局 Codex CLI 当前状态。Desktop 跟随全局 Codex CLI。</div>
+              <div class="tableWrap">
+                <table id="accountMatrixTable">
+                  <thead>
+                    <tr>
+                      <th class="nameCol">账号</th><th class="smallCol">Claude</th><th class="smallCol">CLI</th><th class="smallCol">Desktop</th><th class="smallCol">状态</th><th class="urlCol">建议</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+              <div class="muted mt10">CC Switch Codex OAuth Provider：用于授权和额度检查；BridgeDeck 全局入口以上面 Desktop 列为准。</div>
+              <div class="tableWrap mt10">
+                <table id="codexProvidersTable">
+                  <thead>
+                    <tr>
+                      <th class="nameCol">名称</th><th class="smallCol">当前</th><th class="accountCol">绑定账号</th><th class="accountCol">实际账号</th><th class="smallCol">状态</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+              <div id="diagnosis" class="recommend"></div>
+              <div class="muted mt10">已配置 CLI 目录：这里只显示已经存在的 CODEX_HOME。</div>
+              <div class="tableWrap mt10">
+                <table id="cliHomesTable">
+                  <thead>
+                    <tr>
+                      <th class="urlCol">CLI 目录</th><th class="urlCol">切换命令</th><th class="accountCol">账号</th><th class="urlCol">email</th><th class="smallCol">状态</th><th class="urlCol">更新时间</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="card guideSection" data-guide="log">
+              <h2>执行日志</h2>
+              <textarea id="log" readonly></textarea>
+            </div>
+          </section>
+        </div>
+
+        <aside class="guideDock">
+          <div class="card">
+            <h2 id="guideTitle">当前操作</h2>
+            <div id="guideTarget" class="guideTarget">随当前版面自动切换</div>
+            <ol id="guideSteps" class="steps"></ol>
           </div>
-        </details>
+        </aside>
       </main>
     </div>
   </div>
@@ -3668,12 +4697,34 @@ INDEX_HTML = """<!doctype html>
     let lastData = null;
     let tokenVisible = false;
     let lastAccounts = [];
-    const DEFAULT_COMPACT_WINDOW = '220000';
+    let activeOAuthFlowId = '';
+    let oauthPollTimer = null;
+    let oauthExpiryTimer = null;
+    let activeOAuthExpiresAt = '';
+    const BRIDGE_MODELS = __BRIDGE_MODELS_JSON__;
+    const DEFAULT_BRIDGE_MODEL = 'gpt-5.5';
+    const DEFAULT_COMPACT_WINDOW = '272000';
+    const CONSERVATIVE_COMPACT_WINDOW = '220000';
     const DEFAULT_COMPACT_PCT = '80';
     const LOCAL_BRIDGE_BASE_URL = "__LOCAL_BRIDGE_BASE_URL__";
     const LOCAL_API_KEY_PLACEHOLDER = 'sk-bridgedeck-local-placeholder';
     const LOCAL_ANTHROPIC_AUTH_TOKEN = 'local-bridge';
+    const CLAUDE_DESKTOP_ROUTES = [
+      ['claude-haiku-4-5', 'gpt-5.3-codex-spark'],
+      ['claude-sonnet-4-6', 'gpt-5.3-codex'],
+      ['claude-opus-4-7', 'gpt-5.5']
+    ];
     const GUIDES = {
+      oauth: {
+        title: 'ChatGPT 授权',
+        target: '入口切换：新增或重新授权账号',
+        steps: [
+          '点击“生成授权验证码”。',
+          '在打开的 OpenAI 设备授权页输入验证码。',
+          '确认授权后回到 BridgeDeck 检查状态。',
+          '授权完成后刷新账号列表，再选择入口使用。'
+        ]
+      },
       simpleFlow: {
         title: '日常模式',
         target: '上方板块：每个入口单独选账号',
@@ -3694,8 +4745,30 @@ INDEX_HTML = """<!doctype html>
           '选择要暴露给工具的 ChatGPT 账号。',
           'BASE_URL 使用账号级路径，不暴露真实 OAuth token。',
           'OpenAI-compatible 工具使用 placeholder API key。',
-          'Claude Desktop 3P 使用 ANTHROPIC_BASE_URL 指向同一账号路径。',
+          'Claude Desktop 3P 使用账号级 gateway，模型列表只暴露 claude-* 路由。',
           '这里只复制配置，不写入 provider，也不改变当前运行工具。'
+        ]
+      },
+      quota: {
+        title: '额度与自动切换',
+        target: '额度版面：OpenAI 账号额度和自动切换',
+        steps: [
+          '先看当前账号卡片是否标记“当前使用”。',
+          '5 小时和周额度任意一项接近阈值时，自动切换才有意义。',
+          '只勾选你希望 BridgeDeck 接管的入口。',
+          '保存后再点“立即检查并切换”。',
+          '新授权账号没有 Local Bridge 时，先创建桥接。'
+        ]
+      },
+      services: {
+        title: '本地服务',
+        target: '服务版面：8899 UI 和 8876 Local Bridge',
+        steps: [
+          '8876 Local Bridge 是 API 实际入口。',
+          '8899 BridgeDeck UI 只负责管理界面。',
+          '代理异常时先点“诊断代理链路”。',
+          '额度查询异常时点“一键修复额度查询”。',
+          '关闭 UI 不会停止 8876 Local Bridge。'
         ]
       },
       providerCreate: {
@@ -3750,6 +4823,17 @@ INDEX_HTML = """<!doctype html>
           '失败时先看这里的错误文本。',
           'refresh_token 失效时，回 CC Switch 重新登录该账号。',
           'stale_launcher 时，用“迁移旧 CLI 目录”。'
+        ]
+      },
+      usage: {
+        title: '使用详情',
+        target: '使用详情版面：HUD 仪表盘和请求列表',
+        steps: [
+          '上方 HUD 看缓存命中率和总 Token。',
+          '输入/输出、缓存写入、命中缓存、未命中缓存分开显示。',
+          '下方列表按最近请求倒序展示。',
+          '状态不是 200 时，切到本地服务或诊断日志排查。',
+          '这里只读本地 bridge 状态，不会切换账号或重启服务。'
         ]
       }
     };
@@ -3810,10 +4894,16 @@ INDEX_HTML = """<!doctype html>
       if (account) return accountLabel(account);
       return maskId(accountId || '');
     }
+    function desktopUnmappedText(desktop) {
+      const mode = statusText(desktop.managed_by || 'unknown');
+      if (!desktop.detected) return '未检测';
+      if (desktop.managed_by === 'default') return '默认配置 / 账号未映射';
+      return `${mode || '未知配置'} / 账号未映射`;
+    }
     function desktopAccountText(data) {
       const desktop = data.codex_desktop || {};
       if (desktop.account_id) return accountDisplay(desktop.account_id);
-      return statusText(desktop.managed_by || 'unknown');
+      return desktopUnmappedText(desktop);
     }
     function desktopModeText(data) {
       const desktop = data.codex_desktop || {};
@@ -3836,6 +4926,171 @@ INDEX_HTML = """<!doctype html>
     function omcShimText(data) {
       const shim = data.omc_codex_shim || {};
       return shim.active ? 'OMC/tmux 已接管 codex' : 'OMC/tmux 未接管 codex';
+    }
+    function fmtMetricNumber(value) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return '-';
+      return new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(num);
+    }
+    function fmtPercent(value) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return '-';
+      return `${Math.round(num * 100)}%`;
+    }
+    function fmtDuration(value) {
+      const ms = Number(value);
+      if (!Number.isFinite(ms) || ms <= 0) return '-';
+      return `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`;
+    }
+    function fmtDateTime(value) {
+      const seconds = Number(value);
+      if (!Number.isFinite(seconds) || seconds <= 0) return '-';
+      const date = new Date(seconds * 1000);
+      return date.toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    }
+    function providerNameForUsage(event, data) {
+      const accountId = event && event.account_id ? String(event.account_id) : '';
+      const providers = data.providers || [];
+      const codexProviders = data.codex_providers || [];
+      const current = providers.find((p) => p.is_current && p.account_id === accountId);
+      if (current) return current.name || 'Local Codex Bridge';
+      const provider = providers.find((p) => p.account_id === accountId);
+      if (provider) return provider.name || 'Local Codex Bridge';
+      const codex = codexProviders.find((p) => p.token_account_id === accountId || p.meta_account_id === accountId);
+      if (codex) return codex.name || 'Local Codex Bridge';
+      return accountId ? `Local Codex Bridge - ${maskId(accountId)}` : 'Local Codex Bridge';
+    }
+    function usageModelCell(event) {
+      const requested = String(event.requested_model || event.model || '').trim();
+      const actual = String(event.actual_model || event.model || requested || '').trim();
+      if (requested && actual && requested !== actual) {
+        const routeLabel = event.desktop_route ? 'Desktop 路由' : '映射到实际模型';
+        return `<span class="usageModelMain">${esc(requested)}</span><span class="usageMeta">-> ${esc(actual)}</span><span class="usageTag desktop">${esc(routeLabel)}</span>`;
+      }
+      return `<span class="usageModelMain">${esc(actual || '-')}</span><span class="usageTag chat">实际模型</span>`;
+    }
+    function usageEntryCell(event) {
+      const client = String(event.client_label || event.request_type || '未知入口').trim();
+      const port = Number(event.bridge_port || 0);
+      const route = String(event.request_type || event.route_path || '-').trim();
+      const source = String(event.source || 'proxy').trim();
+      const portText = port > 0 ? `:${port}` : '-';
+      return `<span class="usageEntryMain">${esc(client)}</span><span class="usageMeta">${esc(portText)} / ${esc(route)}</span><span class="usageTag">${esc(source)}</span>`;
+    }
+    function setMetricIcon(id, state) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.className = `metricIcon ${state || ''}`.trim();
+    }
+    function setText(id, value) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = value;
+    }
+    function renderOverviewDashboard(data) {
+      const codexProviders = data.codex_providers || [];
+      const mismatchedProviders = codexProviders.filter((provider) => provider.token_mismatch);
+      const matchedProviders = codexProviders.length - mismatchedProviders.length;
+      setText('metricAccountValue', codexProviders.length ? `${matchedProviders}/${codexProviders.length}` : '-');
+      setText('metricAccountOk', matchedProviders);
+      setText('metricAccountRisk', mismatchedProviders.length);
+      setMetricIcon('metricAccountIcon', mismatchedProviders.length ? 'bad' : 'ok');
+
+      const usage = data.usage_metrics || {};
+      const totalTokens = Number(usage.total_tokens);
+      const inputTokens = Number(usage.input_tokens);
+      const outputTokens = Number(usage.output_tokens);
+      setText('metricTokenValue', Number.isFinite(totalTokens) && totalTokens > 0 ? fmtMetricNumber(totalTokens) : '未采集');
+      setText('metricTokenInput', Number.isFinite(inputTokens) && inputTokens > 0 ? fmtMetricNumber(inputTokens) : '-');
+      setText('metricTokenOutput', Number.isFinite(outputTokens) && outputTokens > 0 ? fmtMetricNumber(outputTokens) : '-');
+      setText('metricCacheValue', Number.isFinite(Number(usage.cached_tokens)) && Number(usage.cached_tokens) > 0 ? fmtMetricNumber(usage.cached_tokens) : '未采集');
+      setText('metricCacheCreate', Number.isFinite(Number(usage.cache_creation_tokens)) && Number(usage.cache_creation_tokens) > 0 ? fmtMetricNumber(usage.cache_creation_tokens) : '-');
+      setText('metricCacheHit', Number.isFinite(Number(usage.cached_tokens)) && Number(usage.cached_tokens) > 0 ? fmtMetricNumber(usage.cached_tokens) : '-');
+
+      const provider = currentClaudeProvider(data);
+      const claudeAccount = provider && provider.account_id ? accountDisplay(provider.account_id) : '外部供应商/未检测到';
+      setText('overviewClaudeMain', claudeAccount);
+      setText('overviewClaudeMeta', provider ? `${provider.name || 'Claude Provider'} / ${provider.model || '未指定模型'}` : '未检测到当前 Claude Provider');
+      setText('overviewDesktopMain', desktopAccountText(data));
+      setText('overviewDesktopMeta', desktopModeText(data));
+      setText('overviewOmniMain', currentLauncherAccountText(data));
+      setText('overviewOmniMeta', `${currentLauncherModeText(data)}；${omcShimText(data)}`);
+
+      const tasks = [];
+      const mismatches = data.codex_providers.filter((p) => p.token_mismatch);
+      mismatches.forEach((p) => {
+        tasks.push({ cls: 'bad', text: `${p.name}: 绑定 ${maskId(p.meta_account_id || '')}，实际 ${maskId(p.token_account_id || '')}` });
+      });
+      const desktop = data.codex_desktop || {};
+      if (desktop.detected && !desktop.account_id) {
+        tasks.push({ cls: 'warn', text: `Desktop/默认 CLI：${desktopUnmappedText(desktop)}，固定入口仍可走 ${currentLauncherAccountText(data)}` });
+      }
+      if (!tasks.length) {
+        tasks.push({ cls: 'ok', text: '账号、入口和 provider 绑定未发现阻断项。' });
+      }
+      const taskBox = document.getElementById('overviewTasks');
+      if (taskBox) {
+        taskBox.innerHTML = tasks.map((item) => `<div class="taskItem ${item.cls}">${esc(item.text)}</div>`).join('');
+      }
+    }
+    function renderUsageDashboard(data) {
+      const usage = data.usage_metrics || {};
+      const events = Array.isArray(data.usage_events) ? [...data.usage_events].reverse() : [];
+      const hitRate = Number(usage.cache_hit_rate);
+      const hitRateValue = Number.isFinite(hitRate) ? Math.max(0, Math.min(1, hitRate)) : 0;
+      const dial = document.getElementById('usageHudDial');
+      if (dial) dial.style.setProperty('--hit-angle', `${hitRateValue * 270}deg`);
+      setText('usageHudHitRate', Number.isFinite(hitRate) ? fmtPercent(hitRate) : '-');
+      setText('usageHudRequests', fmtMetricNumber(usage.request_count || 0));
+      setText('usageHudTokens', fmtMetricNumber(usage.total_tokens || 0));
+      setText('usageHudInOut', `${fmtMetricNumber(usage.input_tokens || 0)} / ${fmtMetricNumber(usage.output_tokens || 0)}`);
+      setText('usageHudCacheWrite', fmtMetricNumber(usage.cache_creation_tokens || 0));
+      setText('usageHudCacheRead', fmtMetricNumber(usage.cached_tokens || 0));
+      setText('usageHudCacheMiss', `${fmtMetricNumber(usage.cache_miss_tokens || 0)} · ${fmtPercent(usage.cache_miss_rate || 0)}`);
+
+      const body = document.getElementById('usageRows');
+      if (!body) return;
+      if (!events.length) {
+        body.innerHTML = '<tr><td colspan="11">还没有采集到 Local Codex Bridge 使用详情。</td></tr>';
+        return;
+      }
+      body.innerHTML = events.map((event) => {
+        const status = Number(event.status_code || 0);
+        const statusClass = status >= 200 && status < 300 ? 'ok' : (status ? 'bad' : 'muted');
+        return `<tr>
+          <td>${esc(fmtDateTime(event.at))}</td>
+          <td>${usageEntryCell(event)}</td>
+          <td>${esc(providerNameForUsage(event, data))}</td>
+          <td class="mono">${usageModelCell(event)}</td>
+          <td>${esc(fmtMetricNumber(event.input_tokens || 0))}</td>
+          <td>${esc(fmtMetricNumber(event.output_tokens || 0))}</td>
+          <td>${esc(fmtMetricNumber(event.cache_creation_tokens || 0))}</td>
+          <td>${esc(fmtMetricNumber(event.cached_tokens || 0))}</td>
+          <td>${esc(fmtMetricNumber(event.cache_miss_tokens || 0))}</td>
+          <td>${esc(fmtPercent(event.cache_hit_rate || 0))}</td>
+          <td><span class="${statusClass}">${esc(status || '-')}</span><br><span class="muted">${esc(fmtDuration(event.duration_ms))}</span></td>
+        </tr>`;
+      }).join('');
+    }
+    function renderOverviewQuotaMetrics(payload) {
+      const quotas = payload && Array.isArray(payload.quotas) ? payload.quotas : [];
+      if (!quotas.length) {
+        setText('metricQuotaValue', '未返回');
+        setText('metricQuotaAccount', '-');
+        setText('metricQuotaRemaining', '-');
+        setMetricIcon('metricQuotaIcon', 'warn');
+        return;
+      }
+      const current = currentClaudeProvider(lastData || {});
+      const currentQuota = quotas.find((q) => current && q.account_id === current.account_id) || quotas[0];
+      const usedValues = (currentQuota.windows || [])
+        .map((w) => Number(w.used_percent))
+        .filter((value) => Number.isFinite(value));
+      const maxUsed = usedValues.length ? Math.max(...usedValues) : NaN;
+      setText('metricQuotaValue', Number.isFinite(maxUsed) ? `${fmtMetricNumber(maxUsed)}%` : '未返回');
+      setText('metricQuotaAccount', maskEmail(currentQuota.email || currentQuota.label || maskId(currentQuota.account_id || '')));
+      const remaining = Number(currentQuota.effective_remaining_units);
+      setText('metricQuotaRemaining', Number.isFinite(remaining) ? fmtMetricNumber(remaining) : '-');
+      setMetricIcon('metricQuotaIcon', currentQuota.quota_status === 'limit_reached' ? 'bad' : (currentQuota.quota_status === 'near_limit' ? 'warn' : 'ok'));
     }
     function renderActualCurrentAccounts(data) {
       const box = document.getElementById('actualCurrentAccounts');
@@ -3928,6 +5183,45 @@ INDEX_HTML = """<!doctype html>
       };
       return map[value] || value || '未知';
     }
+    function quotaStatusClass(value) {
+      return value === 'ok' ? 'ok' : (value === 'near_limit' ? 'warn' : 'bad');
+    }
+    function quotaPercentClass(value) {
+      const used = Number(value);
+      if (!Number.isFinite(used)) return 'bad';
+      return used >= 100 ? 'bad' : (used >= 80 ? 'warn' : 'ok');
+    }
+    function quotaWindowLabel(windowInfo) {
+      const seconds = Number(windowInfo?.window_seconds || windowInfo?.limit_window_seconds || 0);
+      if (seconds >= 600000) return '周限额';
+      if (seconds >= 17000 && seconds <= 19000) return '5 小时限额';
+      return windowInfo?.name || '额度';
+    }
+    function quotaResetText(windowInfo) {
+      const raw = Number(windowInfo?.reset_at || 0);
+      if (!Number.isFinite(raw) || raw <= 0) return '';
+      const date = new Date(raw > 1000000000000 ? raw : raw * 1000);
+      if (Number.isNaN(date.getTime())) return '';
+      return date.toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    }
+    function quotaMeter(windowInfo, labelPrefix='') {
+      const used = Math.max(0, Math.min(100, Number(windowInfo?.used_percent ?? 0)));
+      const cls = quotaPercentClass(used);
+      const label = `${labelPrefix}${quotaWindowLabel(windowInfo)}`;
+      const reset = quotaResetText(windowInfo);
+      return `<div class="quotaMeter">
+        <div class="quotaMeterMeta"><span>${esc(label)}</span><strong>${esc(used)}%</strong><span class="quotaReset">${esc(reset)}</span></div>
+        <progress class="quotaProgress ${cls}" value="${esc(used)}" max="100"></progress>
+      </div>`;
+    }
+    function quotaPlanLabel(q) {
+      const plan = String(q.plan_type || '').trim();
+      const factor = Number(q.capacity_factor || 0);
+      if (factor >= 20) return 'Pro 20x';
+      if (factor >= 5) return 'Pro 5x';
+      if (plan) return plan.charAt(0).toUpperCase() + plan.slice(1);
+      return '未知套餐';
+    }
     function renderQuotaBoard(payload) {
       const board = document.getElementById('quotaBoard');
       const quotas = payload.quotas || [];
@@ -3938,24 +5232,35 @@ INDEX_HTML = """<!doctype html>
       const current = currentClaudeProvider(lastData || {});
       board.innerHTML = quotas.map((q) => {
         const status = q.quota_status || 'unknown';
-        const cls = status === 'ok' ? 'ok' : (status === 'near_limit' ? 'warnText' : 'bad');
+        const cls = quotaStatusClass(status);
         const currentCls = current && current.account_id === q.account_id ? ' current' : '';
-        const windows = (q.windows || []).map((w) => `${esc(w.name)}: <span class="${Number(w.used_percent) >= 100 ? 'bad' : Number(w.used_percent) >= 80 ? 'warnText' : 'ok'}">${esc(w.used_percent)}%</span>`).join('  ');
+        const windows = (q.windows || []).map((w) => quotaMeter(w)).join('');
         const spark = (q.additional_limits || []).find((item) => {
           const label = `${item.limit_name || ''} ${item.metered_feature || ''}`.toLowerCase();
           return label.includes('spark') || label.includes('bengalfox') || label.includes('gpt-5.3-codex');
         });
         const sparkWindows = spark
-          ? (spark.windows || []).map((w) => `${esc(w.name)}: <span class="${Number(w.used_percent) >= 100 ? 'bad' : Number(w.used_percent) >= 80 ? 'warnText' : 'ok'}">${esc(w.used_percent)}%</span>`).join('  ')
+          ? (spark.windows || []).map((w) => quotaMeter(w, 'GPT-5.3-Codex-Spark ')).join('')
           : '';
         const remaining = Number(q.effective_remaining_units);
         const remainingText = Number.isFinite(remaining)
-          ? `<br><span class="muted">估算剩余：${esc(remaining)} 单位，容量系数 x${esc(q.capacity_factor || 1)}</span>`
+          ? `<span class="badge ok">剩余 ${esc(remaining)} 单位</span>`
           : '';
         return `<div class="quotaPill${currentCls}">
-          <div class="quotaTitle">${esc(maskEmail(q.email || q.label || maskId(q.account_id || '')))} ${q.plan_type ? `<span class="muted">(${esc(q.plan_type)})</span>` : ''}</div>
-          <div class="quotaWindows">主额度：<span class="${cls}">${esc(quotaStatusText(status))}</span>${windows ? '<br>' + windows : ''}${remainingText}</div>
-          <div class="quotaWindows">Spark：${spark ? `<span class="${spark.quota_status === 'ok' ? 'ok' : (spark.quota_status === 'near_limit' ? 'warnText' : 'bad')}">${esc(quotaStatusText(spark.quota_status))}</span>${sparkWindows ? '<br>' + sparkWindows : ''}` : '<span class="muted">未返回</span>'}</div>
+          <div class="quotaHead">
+            <div>
+              <div class="quotaTitle">${esc(maskEmail(q.email || q.label || maskId(q.account_id || '')))}</div>
+              <div class="quotaMeta">
+                <span class="badge warn">${esc(quotaPlanLabel(q))}</span>
+                <span class="badge ${cls}">${esc(quotaStatusText(status))}</span>
+                ${currentCls ? '<span class="badge ok">当前使用</span>' : ''}
+                ${remainingText}
+              </div>
+            </div>
+            <span class="muted">x${esc(q.capacity_factor || 1)}</span>
+          </div>
+          <div>${windows || '<div class="quotaWindows">主额度未返回</div>'}</div>
+          <div>${spark ? `${sparkWindows || '<div class="quotaWindows">Spark 额度未返回</div>'}` : '<div class="quotaWindows">Spark：未返回</div>'}</div>
         </div>`;
       }).join('');
     }
@@ -3974,9 +5279,14 @@ INDEX_HTML = """<!doctype html>
         const payload = await api('/api/quotas');
         renderQuotaBoard(payload);
         renderMissingBridgeStatus(payload);
+        renderOverviewQuotaMetrics(payload);
         return payload;
       } catch (e) {
         document.getElementById('quotaBoard').textContent = `额度查询失败: ${e.message}`;
+        setText('metricQuotaValue', '查询失败');
+        setText('metricQuotaAccount', '-');
+        setText('metricQuotaRemaining', '-');
+        setMetricIcon('metricQuotaIcon', 'bad');
         return null;
       }
     }
@@ -4076,6 +5386,17 @@ INDEX_HTML = """<!doctype html>
       await refreshQuotas();
       return res;
     }
+    async function stopBridgeDeckUi() {
+      if (!confirm('只关闭 BridgeDeck UI (8899)，Local Bridge (8876) 会继续运行。继续？')) return;
+      const res = await api('/api/ui-control', 'POST', { action: 'shutdown' });
+      const message = res.message || 'BridgeDeck UI 正在关闭；Local Bridge 保持运行。';
+      document.getElementById('serviceMessage').textContent = message;
+      log(message);
+      setTimeout(() => {
+        document.body.innerHTML = '<main class="wrap"><div class="card"><h1>BridgeDeck UI 已关闭</h1><p class="muted">8876 Local Bridge 继续运行。重新打开 BridgeDeck.app 可恢复 UI。</p></div></main>';
+      }, 250);
+      return res;
+    }
     async function repairQuotaQuery() {
       const res = await api('/api/repair-quota-query', 'POST', {});
       if (res.services) renderServices({ services: res.services });
@@ -4093,6 +5414,165 @@ INDEX_HTML = """<!doctype html>
       const cls = level === 'ok' ? 'ok' : (level === 'warn' ? 'warnText' : (level === 'bad' ? 'bad' : ''));
       box.innerHTML = cls ? `<strong class="${cls}">${esc(message)}</strong>` : esc(message);
     }
+    function setOAuthResult(message, level='') {
+      const box = document.getElementById('oauthResult');
+      if (!box) return;
+      const cls = level === 'ok' ? 'ok' : (level === 'warn' ? 'warnText' : (level === 'bad' ? 'bad' : ''));
+      box.innerHTML = cls ? `<strong class="${cls}">${esc(message)}</strong>` : esc(message);
+    }
+    function stopOAuthPolling() {
+      if (oauthPollTimer) clearInterval(oauthPollTimer);
+      oauthPollTimer = null;
+    }
+    function stopOAuthExpiryTimer() {
+      if (oauthExpiryTimer) clearInterval(oauthExpiryTimer);
+      oauthExpiryTimer = null;
+    }
+    function formatOAuthExpiry(expiresAt) {
+      if (!expiresAt) return '有效期：-';
+      const expires = new Date(expiresAt);
+      const ms = expires.getTime() - Date.now();
+      if (!Number.isFinite(expires.getTime())) return '有效期：-';
+      if (ms <= 0) return '有效期：已过期';
+      const totalSeconds = Math.ceil(ms / 1000);
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      const clock = expires.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      return `有效期至 ${clock}，剩余 ${minutes}:${String(seconds).padStart(2, '0')}`;
+    }
+    function updateOAuthExpiry() {
+      const box = document.getElementById('oauthExpiresAt');
+      if (!box) return;
+      box.textContent = formatOAuthExpiry(activeOAuthExpiresAt);
+      if (activeOAuthExpiresAt && Date.parse(activeOAuthExpiresAt) <= Date.now()) {
+        stopOAuthPolling();
+        stopOAuthExpiryTimer();
+        setOAuthResult('验证码已过期，请重新生成。', 'warn');
+      }
+    }
+    function setOAuthBridgeButton(result) {
+      const button = document.getElementById('oauthApplyBridgeBtn');
+      if (!button) return;
+      if (result && result.status === 'completed') {
+        button.classList.remove('hidden');
+        button.textContent = result.bridge_provider_exists ? '更新 CC Switch' : '加入 CC Switch';
+      } else {
+        button.classList.add('hidden');
+        button.textContent = '加入 CC Switch';
+      }
+    }
+    function hideCodexOAuth() {
+      stopOAuthPolling();
+      stopOAuthExpiryTimer();
+      activeOAuthFlowId = '';
+      activeOAuthExpiresAt = '';
+      const box = document.getElementById('oauthUrlBox');
+      if (box) box.classList.add('hidden');
+      setText('oauthUserCode', '-');
+      setText('oauthExpiresAt', '有效期：-');
+      setOAuthBridgeButton(null);
+      setOAuthResult('验证码已隐藏。需要授权时重新生成。');
+    }
+    async function checkCodexOAuthStatus() {
+      if (!activeOAuthFlowId) {
+        setOAuthResult('还没有进行中的授权流程。', 'warn');
+        return null;
+      }
+      const result = await api(`/api/codex-oauth/status?flow_id=${encodeURIComponent(activeOAuthFlowId)}`);
+      if (result.expires_at) {
+        activeOAuthExpiresAt = result.expires_at;
+        updateOAuthExpiry();
+      }
+      setOAuthBridgeButton(result);
+      if (result.status === 'completed') {
+        stopOAuthPolling();
+        stopOAuthExpiryTimer();
+        setOAuthResult(`授权完成：${result.email || result.account_id || '新账号'}`, 'ok');
+        await refreshData();
+      } else if (result.status === 'error') {
+        stopOAuthPolling();
+        stopOAuthExpiryTimer();
+        setOAuthResult(`授权失败：${result.error || '未知错误'}`, 'bad');
+      } else if (result.status === 'exchanging') {
+        setOAuthResult('已确认授权，正在交换 token...');
+      } else {
+        setOAuthResult('等待你在 OpenAI 页面输入验证码并确认...');
+      }
+      return result;
+    }
+    function startOAuthPolling() {
+      stopOAuthPolling();
+      oauthPollTimer = setInterval(() => {
+        checkCodexOAuthStatus().catch((error) => {
+          stopOAuthPolling();
+          setOAuthResult(`授权状态检查失败：${error.message}`, 'bad');
+        });
+      }, 1800);
+    }
+    async function startCodexOAuth() {
+      const setDefault = Boolean(document.getElementById('oauthSetDefault')?.checked);
+      const popup = window.open('about:blank', '_blank');
+      if (popup) popup.opener = null;
+      stopOAuthPolling();
+      stopOAuthExpiryTimer();
+      setOAuthBridgeButton(null);
+      const result = await api('/api/codex-oauth/start', 'POST', { set_default: setDefault });
+      activeOAuthFlowId = result.flow_id || '';
+      activeOAuthExpiresAt = result.expires_at || '';
+      const link = document.getElementById('oauthAuthLink');
+      const codeBox = document.getElementById('oauthUserCode');
+      const box = document.getElementById('oauthUrlBox');
+      if (link) {
+        link.href = result.verification_url || result.auth_url || '#';
+        link.textContent = result.verification_url || result.auth_url || '授权页生成失败';
+      }
+      if (codeBox) {
+        codeBox.textContent = result.user_code || '-';
+      }
+      updateOAuthExpiry();
+      if (box) box.classList.remove('hidden');
+      if (result.user_code) {
+        setOAuthResult(`验证码已生成：${result.user_code}。输入并确认后会自动写入账号池。`);
+      } else {
+        setOAuthResult(result.error || '验证码生成失败。', 'bad');
+      }
+      const authUrl = result.verification_url || result.auth_url || '';
+      if (popup && authUrl) {
+        popup.location.href = authUrl;
+      } else if (authUrl) {
+        window.open(authUrl, '_blank', 'noopener,noreferrer');
+      }
+      oauthExpiryTimer = setInterval(updateOAuthExpiry, 1000);
+      startOAuthPolling();
+    }
+    async function applyCodexOAuthBridge() {
+      if (!activeOAuthFlowId) {
+        setOAuthResult('没有可加入的已授权账号。', 'warn');
+        return null;
+      }
+      const result = await api('/api/codex-oauth/apply-bridge', 'POST', { flow_id: activeOAuthFlowId });
+      setOAuthResult(result.message || 'CC Switch 已更新。', 'ok');
+      const button = document.getElementById('oauthApplyBridgeBtn');
+      if (button) button.textContent = '更新 CC Switch';
+      await refreshData();
+      return result;
+    }
+    async function finishCodexOAuth() {
+      const input = document.getElementById('oauthManualInput');
+      const code = input ? input.value.trim() : '';
+      if (!activeOAuthFlowId || !code) {
+        setOAuthResult('缺少授权流程或 code。', 'warn');
+        return;
+      }
+      const result = await api('/api/codex-oauth/finish', 'POST', { flow_id: activeOAuthFlowId, code });
+      if (result.status === 'completed') {
+        stopOAuthPolling();
+        setOAuthResult(`授权完成：${result.email || result.account_id || '新账号'}`, 'ok');
+        await refreshData();
+      } else {
+        setOAuthResult(result.error || result.message || '授权未完成', result.ok === false ? 'bad' : '');
+      }
+    }
     function selectedProviderId() {
       const chosen = document.querySelector('input[name="providerPick"]:checked');
       return chosen ? chosen.value : '';
@@ -4101,9 +5581,39 @@ INDEX_HTML = """<!doctype html>
       const id = selectedProviderId();
       return id && lastData ? (lastData.providers || []).find((p) => p.id === id) : null;
     }
+    function pageIdForSection(section) {
+      const page = section ? section.closest('.deckPage') : null;
+      return page && page.id ? page.id.replace(/^page-/, '') : '';
+    }
+    function showPage(pageId, pushState=false) {
+      const target = document.getElementById(`page-${pageId}`);
+      if (!target) return;
+      document.querySelectorAll('.deckPage').forEach((page) => {
+        page.classList.toggle('active', page === target);
+      });
+      document.querySelectorAll('.navItem[data-page]').forEach((item) => {
+        item.classList.toggle('active', item.dataset.page === pageId);
+      });
+      document.body.classList.toggle('usageMode', pageId === 'usage');
+      if (pushState) sessionStorage.setItem('bridgedeckPage', pageId);
+      const guideSection = target.querySelector('.guideSection');
+      if (guideSection) setGuide(guideSection.dataset.guide || 'providerCreate');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+    function initPageNav() {
+      const saved = sessionStorage.getItem('bridgedeckPage') || 'overview';
+      showPage(saved, false);
+      document.addEventListener('click', (event) => {
+        const button = event.target.closest('[data-page]');
+        if (!button) return;
+        showPage(button.dataset.page, true);
+      });
+    }
     function scrollToSection(id) {
       const section = document.getElementById(id);
       if (!section) return;
+      const pageId = pageIdForSection(section);
+      if (pageId) showPage(pageId, true);
       if (section.tagName === 'DETAILS') section.open = true;
       section.scrollIntoView({ behavior: 'smooth', block: 'start' });
       setGuide(section.dataset.guide || 'providerCreate');
@@ -4117,7 +5627,8 @@ INDEX_HTML = """<!doctype html>
     function initGuideObserver() {
       const sections = Array.from(document.querySelectorAll('.guideSection'));
       if (!sections.length) return;
-      setGuide(sections[0].dataset.guide || 'providerCreate');
+      const activeSection = document.querySelector('.deckPage.active .guideSection') || sections[0];
+      setGuide(activeSection.dataset.guide || 'providerCreate');
       sections.forEach((section) => {
         section.addEventListener('mouseenter', () => setGuide(section.dataset.guide || 'providerCreate'));
         section.addEventListener('focusin', () => setGuide(section.dataset.guide || 'providerCreate'));
@@ -4161,20 +5672,28 @@ INDEX_HTML = """<!doctype html>
     function anthropicAccessBaseUrl(item) {
       return apiAccessBaseUrl(item);
     }
+    function claudeDesktopGatewayBaseUrl(item) {
+      return item && item.account_id ? `${LOCAL_BRIDGE_BASE_URL}/accounts/${encodeURIComponent(item.account_id)}` : '';
+    }
+    function claudeDesktopRoutesText() {
+      return CLAUDE_DESKTOP_ROUTES.map(([route, target]) => `${route} -> ${target}`).join('\\n');
+    }
     function apiAccessEnv(item) {
       const baseUrl = apiAccessBaseUrl(item);
       return baseUrl ? `OPENAI_API_KEY=${LOCAL_API_KEY_PLACEHOLDER}\nOPENAI_BASE_URL=${baseUrl}` : '';
     }
     function anthropicAccessEnv(item) {
       const baseUrl = anthropicAccessBaseUrl(item);
-      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_MODEL=gpt-5.5` : '';
+      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_MODEL=gpt-5.5\nANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark\nANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex\nANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` : '';
     }
     function apiOpenAiEnv(item) {
       const baseUrl = apiAccessBaseUrl(item);
       return baseUrl ? `OPENAI_API_KEY=${LOCAL_API_KEY_PLACEHOLDER}\nOPENAI_BASE_URL=${baseUrl}\nMODEL=gpt-5.5` : '';
     }
     function apiClaudeEnv(item) {
-      return anthropicAccessEnv(item);
+      const gatewayBase = claudeDesktopGatewayBaseUrl(item);
+      if (!gatewayBase) return '';
+      return `inferenceGatewayBaseUrl=${gatewayBase}\ninferenceGatewayApiKey=${LOCAL_ANTHROPIC_AUTH_TOKEN}\ninferenceGatewayAuthScheme=bearer\ninferenceModels=${CLAUDE_DESKTOP_ROUTES.map(([route]) => route).join(',')}\n${claudeDesktopRoutesText()}`;
     }
     async function copyText(value, label) {
       const text = String(value || '');
@@ -4212,7 +5731,7 @@ INDEX_HTML = """<!doctype html>
       const guideAccount = document.getElementById('apiAccessGuideAccount');
       const openaiExample = document.getElementById('apiOpenAiExample');
       const claudeExample = document.getElementById('apiClaudeExample');
-      if (guideBase) guideBase.textContent = apiAccessBaseUrl(item) ? `BASE_URL: ${apiAccessBaseUrl(item)}` : 'BASE_URL: 选择账号后生成';
+      if (guideBase) guideBase.textContent = apiAccessBaseUrl(item) ? `BASE_URL: ${apiAccessBaseUrl(item)}\nDesktop Gateway: ${claudeDesktopGatewayBaseUrl(item)}` : 'BASE_URL: 选择账号后生成';
       if (guideAccount) guideAccount.textContent = item ? accountLabel(item) : '沿用上方通用 API 接入选择';
       if (openaiExample) openaiExample.textContent = apiOpenAiEnv(item);
       if (claudeExample) claudeExample.textContent = apiClaudeEnv(item);
@@ -4245,6 +5764,65 @@ INDEX_HTML = """<!doctype html>
     function copyClaudeEnv() {
       return copyAnthropicEnv();
     }
+    function bridgeModelOption(modelId) {
+      const normalized = String(modelId || '').trim().toLowerCase();
+      return BRIDGE_MODELS.find((item) => item.id === normalized) || BRIDGE_MODELS[0] || null;
+    }
+    function bridgeModelContext(modelId) {
+      const option = bridgeModelOption(modelId);
+      return option && option.context_tokens ? String(option.context_tokens) : '';
+    }
+    function bridgeModelMaxOutput(modelId) {
+      const option = bridgeModelOption(modelId);
+      return option && option.max_output_tokens ? String(option.max_output_tokens) : '';
+    }
+    function bridgeModelRecommendedCompact(modelId) {
+      return bridgeModelContext(modelId) || CONSERVATIVE_COMPACT_WINDOW;
+    }
+    function selectedBridgeModel() {
+      const sel = document.getElementById('bridgeModel');
+      return sel && sel.value ? sel.value : DEFAULT_BRIDGE_MODEL;
+    }
+    function updateBridgeModelMeta() {
+      const model = selectedBridgeModel();
+      const context = bridgeModelContext(model);
+      const maxOutput = bridgeModelMaxOutput(model);
+      document.getElementById('modelContextTokens').value = context || '';
+      const outputText = maxOutput ? ` / ${maxOutput} max output` : '';
+      document.getElementById('bridgeModelMeta').textContent = context
+        ? `${model} = ${context} context tokens${outputText}。`
+        : `${model} 未探测到真实 context；自动压缩使用保守 ${CONSERVATIVE_COMPACT_WINDOW}，不会写 CLAUDE_CODE_MAX_CONTEXT_TOKENS。`;
+    }
+    function renderBridgeModels() {
+      const sel = document.getElementById('bridgeModel');
+      if (!sel) return;
+      sel.innerHTML = '';
+      BRIDGE_MODELS.forEach((item) => {
+        const opt = document.createElement('option');
+        opt.value = item.id;
+        const context = item.context_tokens ? ` · ${item.context_tokens}` : ' · context unknown';
+        opt.textContent = `${item.name || item.id}${context}`;
+        sel.appendChild(opt);
+      });
+      sel.value = DEFAULT_BRIDGE_MODEL;
+      sel.onchange = () => applyModelContextPreset();
+      updateBridgeModelMeta();
+    }
+    function setBridgeModel(modelId, applyContext = false) {
+      const sel = document.getElementById('bridgeModel');
+      const option = bridgeModelOption(modelId || DEFAULT_BRIDGE_MODEL);
+      if (sel && option) sel.value = option.id;
+      updateBridgeModelMeta();
+      if (applyContext) applyModelContextPreset();
+    }
+    function bridgeModelConfigPayload() {
+      const model = selectedBridgeModel();
+      return {
+        model,
+        context_tokens: bridgeModelContext(model),
+        max_output_tokens: bridgeModelMaxOutput(model)
+      };
+    }
     function setCompactFields(enabled, windowTokens, pct) {
       document.getElementById('compactEnabled').checked = Boolean(enabled);
       document.getElementById('compactWindow').value = windowTokens || '';
@@ -4260,6 +5838,11 @@ INDEX_HTML = """<!doctype html>
     function applyCompactPreset(windowTokens, pct = DEFAULT_COMPACT_PCT) {
       setCompactFields(Boolean(windowTokens), windowTokens, pct);
     }
+    function applyModelContextPreset() {
+      const context = bridgeModelRecommendedCompact(selectedBridgeModel());
+      updateBridgeModelMeta();
+      if (context) setCompactFields(true, context, DEFAULT_COMPACT_PCT);
+    }
     function providerCompactText(provider) {
       if (!provider || !provider.compact_enabled) return '关闭';
       const pct = provider.compact_threshold_percent || DEFAULT_COMPACT_PCT;
@@ -4267,6 +5850,7 @@ INDEX_HTML = """<!doctype html>
     }
     function applyCompactFromProvider(provider) {
       if (!provider) return;
+      setBridgeModel(provider.model || DEFAULT_BRIDGE_MODEL, false);
       if (provider.compact_enabled) {
         setCompactFields(true, provider.compact_window_tokens || DEFAULT_COMPACT_WINDOW, provider.compact_threshold_percent || DEFAULT_COMPACT_PCT);
       } else {
@@ -4305,9 +5889,33 @@ INDEX_HTML = """<!doctype html>
       const resp = await fetch(path, init);
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok || data.ok === false) {
-        throw new Error(data.error || data.message || `HTTP ${resp.status}`);
+        const err = new Error(data.error || data.message || `HTTP ${resp.status}`);
+        err.status = resp.status;
+        err.payload = data;
+        throw err;
       }
       return data;
+    }
+    function setInitState(message, cls='muted') {
+      const status = document.getElementById('status');
+      if (status) status.innerHTML = `<span class="${cls}">${esc(message)}</span>`;
+    }
+    function handleInitError(error) {
+      const message = error && error.message ? error.message : String(error || 'unknown');
+      const statusCode = error && error.status ? Number(error.status) : 0;
+      setInitState(`初始化失败：${message}`, 'bad');
+      const recommendation = document.getElementById('recommendation');
+      if (recommendation) {
+        recommendation.className = 'recommend fail';
+        recommendation.innerHTML = `<b>页面初始化失败</b><br>- ${esc(message)}<br>- 如果刚重启过 BridgeDeck，请刷新页面。`;
+      }
+      log(`初始化失败: ${message}`);
+      if ((statusCode === 403 || message.toLowerCase().includes('csrf')) && !sessionStorage.getItem('bridgedeckCsrfReloaded')) {
+        sessionStorage.setItem('bridgedeckCsrfReloaded', '1');
+        const next = new URL(window.location.href);
+        next.searchParams.set('t', String(Date.now()));
+        window.location.replace(next.toString());
+      }
     }
     function renderAccounts(data) {
       const accounts = data.accounts || [];
@@ -4428,6 +6036,7 @@ INDEX_HTML = """<!doctype html>
           <td>${p.is_current ? '<span class="ok">当前</span>' : '<span class="muted">未选</span>'} ${currentBySettings ? '<span class="ok">设置同步</span>' : ''}</td>
           <td class="mono">${esc(maskId(p.account_id || ''))}</td>
           <td class="mono">${esc(p.base_url || '')}</td>
+          <td class="mono">${esc(p.model || '')}${p.max_context_tokens ? '<br>' + esc(p.max_context_tokens) : ''}</td>
           <td class="mono">${esc(providerCompactText(p))}</td>
           <td class="mono">${esc(tokenText(p))}</td>
         `;
@@ -4459,7 +6068,12 @@ INDEX_HTML = """<!doctype html>
         unsupported_region: '地区受限',
         bridge_down: 'bridge 断开',
         proxy_down: 'CC Switch 断开',
-        stale_launcher: '旧 CLI token'
+        stale_launcher: '旧 CLI token',
+        default: '默认配置',
+        custom: '自定义配置',
+        cc_switch: 'CC Switch',
+        bridgedeck_or_local_bridge: 'BridgeDeck 本地桥',
+        unknown: '未知'
       };
       return map[value] || value || '';
     }
@@ -4468,7 +6082,7 @@ INDEX_HTML = """<!doctype html>
       body.innerHTML = '';
       const desktop = data.codex_desktop || {};
       const desktopAccount = desktop.account_id || '';
-      const desktopUnknown = desktop.detected ? '未识别' : '未检测';
+      const desktopUnknown = desktopUnmappedText(desktop);
       (data.account_matrix || []).forEach((row) => {
         const status = row.account_status || 'ok';
         const cls = status === 'ok' ? 'ok' : (status === 'stale_launcher' ? 'warnText' : 'bad');
@@ -4529,7 +6143,7 @@ INDEX_HTML = """<!doctype html>
         text = `发现 ${staleCount} 个旧 CLI tokenful profile。建议迁移为 launcher-only，避免 refresh_token 重复使用。`;
       } else if (mismatchCount > 0) {
         state = 'badState';
-        text = `发现 ${mismatchCount} 个 Codex Provider 账号不匹配。回 CC Switch 重新授权对应账号。`;
+        text = `当前有 ${accountCount} 个账号；${mismatchCount} 个 Codex Provider 的绑定账号与实际 token 账号不一致。回 CC Switch 重新授权红色 provider。`;
       } else if (providerCount === 0) {
         state = 'warnState';
         text = '还没有 Claude 配置。选择账号后点“Claude Code 用这个账号”。';
@@ -4597,6 +6211,8 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('status').innerHTML = `版本: <b>${esc(data.version || '')}</b> | 账号: <b>${data.accounts.length}</b> | Claude providers: <b>${data.providers.length}</b> | Codex mismatches: <b class="${mismatches ? 'bad' : 'ok'}">${mismatches}</b>`;
       document.getElementById('paths').textContent = `db: ${humanPath(data.paths.db)}\\nsettings: ${humanPath(data.paths.settings)}\\nauth_store: ${humanPath(data.paths.auth_store)}`;
       renderHealth(data);
+      renderOverviewDashboard(data);
+      renderUsageDashboard(data);
       renderAccounts(data);
       renderAccountMatrix(data);
       renderProviders(data);
@@ -4634,6 +6250,7 @@ INDEX_HTML = """<!doctype html>
         account_id: accountId,
         provider_name: providerName,
         set_current: setCurrent,
+        model_config: bridgeModelConfigPayload(),
         compact_config: compactConfigPayload()
       });
       log(`${res.message}: ${res.provider_name} (${res.provider_id})`);
@@ -4711,7 +6328,7 @@ INDEX_HTML = """<!doctype html>
     async function saveCompactSelected() {
       const id = selectedProviderId();
       if (!id) return log('请先选中一个 provider');
-      const res = await api('/api/provider-compact', 'POST', { provider_id: id, compact_config: compactConfigPayload() });
+      const res = await api('/api/provider-compact', 'POST', { provider_id: id, model_config: bridgeModelConfigPayload(), compact_config: compactConfigPayload() });
       log(`${res.message}: ${providerCompactText({ compact_enabled: res.compact_config.enabled, compact_window_tokens: res.compact_config.window_tokens, compact_threshold_percent: res.compact_config.threshold_percent })}`);
       await refreshData();
     }
@@ -4729,7 +6346,7 @@ INDEX_HTML = """<!doctype html>
       return copyText(apiOpenAiEnv(selectedAccount('simpleApiAccount')), 'OpenAI env');
     }
     async function copyClaudeEnv() {
-      return copyText(apiClaudeEnv(selectedAccount('simpleApiAccount')), 'Claude Desktop env');
+      return copyText(apiClaudeEnv(selectedAccount('simpleApiAccount')), 'Desktop Gateway');
     }
     async function syncClaudePlugins() {
       const res = await api('/api/sync-claude-plugins', 'POST', {});
@@ -4770,6 +6387,11 @@ INDEX_HTML = """<!doctype html>
         const run = async () => {
           if (action === 'scroll') return scrollToSection(button.dataset.target || '');
           if (action === 'refresh') return refreshData(true);
+          if (action === 'start-codex-oauth') return startCodexOAuth();
+          if (action === 'finish-codex-oauth') return finishCodexOAuth();
+          if (action === 'check-codex-oauth') return checkCodexOAuthStatus();
+          if (action === 'hide-codex-oauth') return hideCodexOAuth();
+          if (action === 'apply-codex-oauth-bridge') return applyCodexOAuthBridge();
           if (action === 'create-provider') return createProvider();
           if (action === 'create-cli-home') return createCliHome();
           if (action === 'simple-claude') return simpleClaude();
@@ -4786,7 +6408,8 @@ INDEX_HTML = """<!doctype html>
           if (action === 'set-current-selected') return setCurrentFromSelected();
           if (action === 'patch-selected') return patchSelected();
           if (action === 'repair-plus-pro') return repairPlusPro();
-          if (action === 'compact-preset-220k') return applyCompactPreset(DEFAULT_COMPACT_WINDOW);
+          if (action === 'compact-preset-model') return applyModelContextPreset();
+          if (action === 'compact-preset-220k') return applyCompactPreset(CONSERVATIVE_COMPACT_WINDOW);
           if (action === 'compact-preset-1m') return applyCompactPreset('1000000');
           if (action === 'compact-off') return applyCompactPreset('');
           if (action === 'save-compact-selected') return saveCompactSelected();
@@ -4807,6 +6430,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'start-local-bridge') return controlLocalBridge('start');
           if (action === 'stop-local-bridge') return controlLocalBridge('stop');
           if (action === 'restart-local-bridge') return controlLocalBridge('restart');
+          if (action === 'stop-bridgedeck-ui') return stopBridgeDeckUi();
           if (action === 'select-cli-account') return selectCliAccount(button.dataset.accountId || '');
         };
         const originalText = button.textContent;
@@ -4831,9 +6455,12 @@ INDEX_HTML = """<!doctype html>
         }
       });
     }
+    initPageNav();
     bindActions();
+    renderBridgeModels();
     initGuideObserver();
-    refreshData().catch((e) => log(`初始化失败: ${e.message}`));
+    setInitState('正在连接本地 UI 服务...');
+    refreshData().catch(handleInitError);
     setInterval(() => {
       if (document.getElementById('autoSwitchEnabled')?.checked) {
         runAutoSwitch(false, false).catch((e) => log(`自动切换失败: ${e.message}`));
@@ -4875,6 +6502,15 @@ def build_handler(
                 return True
             return site in {"same-origin", "same-site", "none"}
 
+        def _shutdown_server_later(self) -> None:
+            server = self.server
+
+            def stop() -> None:
+                time.sleep(0.2)
+                server.shutdown()
+
+            threading.Thread(target=stop, daemon=True).start()
+
         def do_GET(self) -> None:
             if not self._valid_host():
                 json_response(self, 403, {"ok": False, "error": "Invalid Host header"})
@@ -4885,6 +6521,7 @@ def build_handler(
                     INDEX_HTML.replace("__CSRF_TOKEN__", csrf_token)
                     .replace("__CSP_NONCE__", csp_nonce)
                     .replace("__LOCAL_BRIDGE_BASE_URL__", LOCAL_BRIDGE_BASE_URL)
+                    .replace("__BRIDGE_MODELS_JSON__", json.dumps(BRIDGE_MODEL_OPTIONS, ensure_ascii=False))
                     .encode("utf-8")
                 )
                 self.send_response(200)
@@ -4976,6 +6613,19 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
+            if parsed.path == "/api/codex-oauth/status":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    flow_id = (urllib.parse.parse_qs(parsed.query).get("flow_id") or [""])[0]
+                    json_response(self, 200, manager.codex_oauth_status(flow_id))
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
             json_response(self, 404, {"ok": False, "error": "Not Found"})
 
         def do_POST(self) -> None:
@@ -5021,7 +6671,14 @@ def build_handler(
                     provider_name = str(payload.get("provider_name") or "")
                     set_current = bool(payload.get("set_current", True))
                     compact_config = payload.get("compact_config") if isinstance(payload.get("compact_config"), dict) else None
-                    result = manager.create_or_update_provider(account_id, provider_name, set_current, compact_config=compact_config)
+                    model_config = payload.get("model_config") if isinstance(payload.get("model_config"), dict) else None
+                    result = manager.create_or_update_provider(
+                        account_id,
+                        provider_name,
+                        set_current,
+                        compact_config=compact_config,
+                        model_config=model_config,
+                    )
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/patch-provider":
@@ -5032,7 +6689,8 @@ def build_handler(
                 if self.path == "/api/provider-compact":
                     provider_id = str(payload.get("provider_id") or "")
                     compact_config = payload.get("compact_config") if isinstance(payload.get("compact_config"), dict) else {}
-                    result = manager.update_provider_compact(provider_id, compact_config)
+                    model_config = payload.get("model_config") if isinstance(payload.get("model_config"), dict) else None
+                    result = manager.update_provider_compact(provider_id, compact_config, model_config=model_config)
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/sync-common-env":
@@ -5090,9 +6748,39 @@ def build_handler(
                     result = manager.create_missing_bridge_providers()
                     json_response(self, 200, result)
                     return
+                if self.path == "/api/codex-oauth/start":
+                    result = manager.start_codex_oauth(set_default=bool(payload.get("set_default", False)))
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/codex-oauth/apply-bridge":
+                    flow_id = str(payload.get("flow_id") or "")
+                    result = manager.apply_codex_oauth_bridge(flow_id)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/codex-oauth/finish":
+                    flow_id = str(payload.get("flow_id") or "")
+                    code_input = str(payload.get("code") or payload.get("code_or_url") or "")
+                    result = manager.complete_codex_oauth(flow_id, code_input)
+                    json_response(self, 200 if result.get("ok", True) else 400, result)
+                    return
                 if self.path == "/api/local-bridge-control":
                     result = manager.control_local_bridge(str(payload.get("action") or ""))
                     json_response(self, 200 if result.get("ok") else 400, result)
+                    return
+                if self.path == "/api/ui-control":
+                    action = str(payload.get("action") or "")
+                    if action != "shutdown":
+                        json_response(self, 400, {"ok": False, "error": "Unsupported UI action"})
+                        return
+                    json_response(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "message": "BridgeDeck UI 正在关闭；Local Bridge 保持运行。重新打开 BridgeDeck.app 可恢复 UI。",
+                        },
+                    )
+                    self._shutdown_server_later()
                     return
                 if self.path == "/api/repair-quota-query":
                     result = manager.repair_quota_query()
@@ -5125,6 +6813,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow write APIs and token reveal when using --allow-remote. Use only on trusted networks.",
     )
+    parser.add_argument(
+        "--local-bridge",
+        choices=("start", "stop", "restart", "status"),
+        help="Control the 8876 Local Codex Bridge without starting the 8899 UI.",
+    )
     return parser.parse_args()
 
 
@@ -5142,6 +6835,12 @@ def main() -> int:
             auth_store=args.auth_store,
         )
     )
+    if args.local_bridge:
+        if args.local_bridge == "status":
+            print(json.dumps(manager.services().get("services", {}).get("local_bridge", {}), ensure_ascii=False))
+        else:
+            print(json.dumps(manager.control_local_bridge(args.local_bridge), ensure_ascii=False))
+        return 0
     allow_sensitive = host_is_loopback or bool(args.allow_remote_write)
     handler = build_handler(
         manager,

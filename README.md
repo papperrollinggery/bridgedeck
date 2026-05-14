@@ -55,7 +55,18 @@ chmod +x run-bridgedeck.command
 ./run-bridgedeck.command
 ```
 
-Open / 打开：
+The macOS launcher shows a native choice dialog:
+
+macOS 启动器会先显示原生选择框：
+
+- `打开 UI`: start/open the 8899 configuration page.
+- `只启动 Bridge`: start only the 8876 Local Codex Bridge.
+- `关闭 UI 保留 Bridge`: stop only the 8899 UI when it is running.
+- `打开 UI`：启动/打开 8899 配置页。
+- `只启动 Bridge`：只启动 8876 Local Codex Bridge。
+- `关闭 UI 保留 Bridge`：UI 已运行时只关闭 8899，保留 8876。
+
+Manual UI URL / 手动打开 UI：
 
 ```text
 http://127.0.0.1:8899
@@ -140,8 +151,9 @@ Claude Desktop 第三方 gateway 形式：
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8876/accounts/<account_id>/v1
-ANTHROPIC_AUTH_TOKEN=sk-bridgedeck-local-placeholder
+ANTHROPIC_AUTH_TOKEN=local-bridge
 ANTHROPIC_MODEL=gpt-5.5
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
 ```
 
 Supported local routes:
@@ -298,6 +310,7 @@ zsh -n package-bridgedeck-dmg.command
 --port PORT            listen port, default 8899
 --allow-remote         allow non-loopback bind; read-only and no secret reveal
 --allow-remote-write   allow write APIs and token reveal in remote mode
+--local-bridge ACTION  start/stop/restart/status 8876 without starting the UI
 ```
 
 ```text
@@ -308,6 +321,7 @@ zsh -n package-bridgedeck-dmg.command
 --port PORT            监听端口，默认 8899
 --allow-remote         允许非本机监听；默认只读且不能显示完整 token
 --allow-remote-write   允许远程模式写入和显示完整 token
+--local-bridge ACTION  不启动 UI，直接 start/stop/restart/status 8876
 ```
 
 ## Project Layout / 项目结构

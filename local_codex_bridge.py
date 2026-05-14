@@ -30,6 +30,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 TOKEN_REFRESH_BUFFER_SECS = 60
 ACCOUNT_ROUTE_RE = re.compile(r"^/accounts/([^/]+)(/.*)?$")
+MODELS_PATHS = {"/v1/models", "/models", "/v1/v1/models"}
+RESPONSES_PATHS = {"/v1/responses", "/responses", "/v1/v1/responses"}
+MESSAGES_PATHS = {"/v1/messages", "/messages", "/v1/v1/messages"}
+CHAT_COMPLETIONS_PATHS = {"/v1/chat/completions", "/chat/completions", "/v1/v1/chat/completions"}
 UPSTREAM_PROXY_ENV = "CODEX_BRIDGE_UPSTREAM_PROXY"
 ALLOW_REMOTE_ENV = "CODEX_BRIDGE_ALLOW_REMOTE"
 STREAM_MAX_RETRIES_ENV = "CODEX_BRIDGE_STREAM_MAX_RETRIES"
@@ -58,6 +62,7 @@ BRIDGE_STATE_PATH = Path(
         str(Path.home() / ".cc-switch" / "bridgedeck-local-bridge-state.json"),
     )
 )
+MAX_USAGE_EVENTS = 200
 
 
 @dataclass
@@ -141,6 +146,27 @@ BRIDGE_MODELS: tuple[BridgeModel, ...] = (
     BridgeModel(id="gpt-5.4-mini", display_name="GPT 5.4 Mini", thinking_levels=("low", "medium", "high", "xhigh")),
     BridgeModel(id="gpt-5.3-codex", display_name="GPT 5.3 Codex"),
     BridgeModel(id="gpt-5.3-codex-spark", display_name="GPT 5.3 Codex Spark"),
+)
+
+CLAUDE_DESKTOP_MODEL_ROUTES: tuple[dict[str, str], ...] = (
+    {
+        "id": "claude-haiku-4-5",
+        "display_name": "Claude Haiku 4.5",
+        "env": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "default": "gpt-5.3-codex-spark",
+    },
+    {
+        "id": "claude-sonnet-4-6",
+        "display_name": "Claude Sonnet 4.6",
+        "env": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "default": "gpt-5.3-codex",
+    },
+    {
+        "id": "claude-opus-4-7",
+        "display_name": "Claude Opus 4.7",
+        "env": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "default": "gpt-5.5",
+    },
 )
 
 
@@ -246,30 +272,85 @@ def redact_log_text(value: str | None) -> str | None:
     return redacted
 
 
+def normalize_bridge_model_id(value: Any) -> str:
+    model = str(value or "").strip()
+    if re.match(r"(?i)^gpt-", model):
+        return model.lower()
+    return model
+
+
+def bridge_model_by_id(model_id: str | None) -> BridgeModel | None:
+    normalized = normalize_bridge_model_id(model_id)
+    for model in BRIDGE_MODELS:
+        if model.id == normalized:
+            return model
+    return None
+
+
+def claude_desktop_model_route_map() -> dict[str, str]:
+    routes: dict[str, str] = {}
+    for route in CLAUDE_DESKTOP_MODEL_ROUTES:
+        source_model = normalize_bridge_model_id(os.environ.get(route["env"]) or route["default"])
+        if source_model:
+            routes[route["id"]] = source_model
+    return routes
+
+
+def map_claude_desktop_model(model_id: Any) -> Any:
+    if not isinstance(model_id, str):
+        return model_id
+    requested = model_id.strip()
+    if not requested:
+        return model_id
+    return claude_desktop_model_route_map().get(requested.lower(), model_id)
+
+
+def model_payload_item(
+    model: BridgeModel,
+    *,
+    model_id: str | None = None,
+    display_name: str | None = None,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "id": model_id or model.id,
+        "object": "model",
+        "type": "model",
+        "created": 0,
+        "created_at": "2026-05-07T00:00:00Z",
+        "owned_by": "openai",
+        "display_name": display_name or model.display_name,
+        "capabilities": {
+            "responses": True,
+            "messages": True,
+            "streaming": True,
+            "tools": True,
+        },
+    }
+    if model.context_length is not None:
+        item["context_length"] = model.context_length
+    if model.max_completion_tokens is not None:
+        item["max_completion_tokens"] = model.max_completion_tokens
+    if model.thinking_levels:
+        item["thinking"] = {"levels": list(model.thinking_levels)}
+    return item
+
+
 def build_models_payload() -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     for model in BRIDGE_MODELS:
-        item: dict[str, Any] = {
-            "id": model.id,
-            "object": "model",
-            "type": "model",
-            "created": 0,
-            "created_at": "2026-05-07T00:00:00Z",
-            "owned_by": "openai",
-            "display_name": model.display_name,
-            "capabilities": {
-                "responses": True,
-                "messages": True,
-                "streaming": True,
-                "tools": True,
-            },
-        }
-        if model.context_length is not None:
-            item["context_length"] = model.context_length
-        if model.max_completion_tokens is not None:
-            item["max_completion_tokens"] = model.max_completion_tokens
-        if model.thinking_levels:
-            item["thinking"] = {"levels": list(model.thinking_levels)}
+        data.append(model_payload_item(model))
+    route_map = claude_desktop_model_route_map()
+    for route in CLAUDE_DESKTOP_MODEL_ROUTES:
+        route_id = route["id"]
+        source_model = route_map.get(route_id)
+        source = bridge_model_by_id(source_model) or BridgeModel(
+            id=source_model or route["default"],
+            display_name=source_model or route["default"],
+        )
+        item = model_payload_item(source, model_id=route_id, display_name=route["display_name"])
+        item["owned_by"] = "anthropic"
+        item["bridge_target_model"] = source.id
+        item["capabilities"]["claude_desktop_gateway"] = True
         data.append(item)
     return {
         "object": "list",
@@ -649,11 +730,18 @@ def terminal_stream_error_from_payload(event_name: str | None, payload: dict[str
     return TerminalStreamError(str(message))
 
 
-def record_bridge_stream_error(payload: dict[str, Any]) -> None:
-    state = {
-        "updated_at": int(time.time()),
-        "last_stream_error": payload,
-    }
+def _read_bridge_state() -> dict[str, Any]:
+    if not BRIDGE_STATE_PATH.exists() or BRIDGE_STATE_PATH.is_symlink():
+        return {}
+    try:
+        payload = json.loads(BRIDGE_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_bridge_state(state: dict[str, Any]) -> None:
+    state["updated_at"] = int(time.time())
     try:
         BRIDGE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = BRIDGE_STATE_PATH.with_name(
@@ -674,6 +762,126 @@ def record_bridge_stream_error(payload: dict[str, Any]) -> None:
             f"{log_timestamp()} [bridge-state-error] type={type(exc).__name__} detail={truncate_log_text(str(exc))}",
             file=sys.stderr,
         )
+
+
+def record_bridge_stream_error(payload: dict[str, Any]) -> None:
+    state = _read_bridge_state()
+    state["last_stream_error"] = payload
+    _write_bridge_state(state)
+
+
+def _usage_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(value))
+    return 0
+
+
+def _extract_usage_counts(usage: Any) -> dict[str, int]:
+    if not isinstance(usage, dict):
+        return {}
+    input_tokens = _usage_int(usage.get("input_tokens") or usage.get("prompt_tokens"))
+    output_tokens = _usage_int(usage.get("output_tokens") or usage.get("completion_tokens"))
+    total_tokens = _usage_int(usage.get("total_tokens")) or input_tokens + output_tokens
+    input_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+    cache_details = usage.get("cache_creation_input_tokens_details") if isinstance(usage.get("cache_creation_input_tokens_details"), dict) else {}
+    cached_tokens = _usage_int(usage.get("cached_tokens") or input_details.get("cached_tokens"))
+    cache_creation_tokens = _usage_int(usage.get("cache_creation_tokens") or cache_details.get("cache_creation_tokens"))
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cached_tokens": cached_tokens,
+        "cache_creation_tokens": cache_creation_tokens,
+    }
+
+
+def _usage_from_payload(payload: Any) -> dict[str, int]:
+    if not isinstance(payload, dict):
+        return {}
+    response = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+    return _extract_usage_counts(response.get("usage") if isinstance(response, dict) else None)
+
+
+def record_bridge_usage(
+    *,
+    account_id: str,
+    model: str | None,
+    request_type: str,
+    request_id: str,
+    usage: Any,
+    requested_model: str | None = None,
+    duration_ms: int | None = None,
+    status_code: int = 200,
+    source: str = "proxy",
+    route_path: str = "",
+    bridge_port: int | None = None,
+    client_port: int | None = None,
+    client_label: str = "",
+    desktop_route: bool = False,
+) -> None:
+    counts = _extract_usage_counts(usage)
+    if not counts or not any(counts.values()):
+        return
+    cache_miss_tokens = max(0, counts["input_tokens"] - counts["cached_tokens"])
+    cache_eligible_tokens = counts["input_tokens"]
+    cache_hit_rate = (counts["cached_tokens"] / cache_eligible_tokens) if cache_eligible_tokens else 0.0
+    cache_miss_rate = (cache_miss_tokens / cache_eligible_tokens) if cache_eligible_tokens else 0.0
+    state = _read_bridge_state()
+    metrics = state.get("usage_metrics") if isinstance(state.get("usage_metrics"), dict) else {}
+    for key in ("input_tokens", "output_tokens", "total_tokens", "cached_tokens", "cache_creation_tokens"):
+        metrics[key] = _usage_int(metrics.get(key)) + counts[key]
+    aggregate_cache_eligible = _usage_int(metrics.get("input_tokens"))
+    aggregate_cached = _usage_int(metrics.get("cached_tokens"))
+    aggregate_missed = max(0, aggregate_cache_eligible - aggregate_cached)
+    metrics["cache_miss_tokens"] = aggregate_missed
+    metrics["cache_hit_rate"] = (aggregate_cached / aggregate_cache_eligible) if aggregate_cache_eligible else 0.0
+    metrics["cache_miss_rate"] = (aggregate_missed / aggregate_cache_eligible) if aggregate_cache_eligible else 0.0
+    metrics["request_count"] = _usage_int(metrics.get("request_count")) + 1
+    metrics["last_account_id"] = account_id
+    metrics["last_model"] = model or ""
+    metrics["last_requested_model"] = requested_model or model or ""
+    metrics["last_request_type"] = request_type
+    metrics["last_request_id"] = request_id
+    metrics["last_duration_ms"] = _usage_int(duration_ms)
+    metrics["last_status_code"] = _usage_int(status_code)
+    metrics["last_bridge_port"] = _usage_int(bridge_port)
+    metrics["last_client_label"] = client_label or ""
+    metrics["last_updated_at"] = int(time.time())
+    state["usage_metrics"] = metrics
+    event = {
+        "at": int(time.time()),
+        "account_id": account_id,
+        "model": model or "",
+        "actual_model": model or "",
+        "requested_model": requested_model or model or "",
+        "request_type": request_type,
+        "request_id": request_id,
+        "status_code": _usage_int(status_code),
+        "source": source,
+        "route_path": route_path,
+        "bridge_port": _usage_int(bridge_port),
+        "client_port": _usage_int(client_port),
+        "client_label": client_label or "",
+        "desktop_route": bool(desktop_route),
+        "duration_ms": _usage_int(duration_ms),
+        "input_tokens": counts["input_tokens"],
+        "output_tokens": counts["output_tokens"],
+        "total_tokens": counts["total_tokens"],
+        "cached_tokens": counts["cached_tokens"],
+        "cache_creation_tokens": counts["cache_creation_tokens"],
+        "cache_miss_tokens": cache_miss_tokens,
+        "cache_hit_rate": cache_hit_rate,
+        "cache_miss_rate": cache_miss_rate,
+        "cost_usd": 0.0,
+    }
+    events = state.get("usage_events") if isinstance(state.get("usage_events"), list) else []
+    events.append(event)
+    state["usage_events"] = events[-MAX_USAGE_EVENTS:]
+    _write_bridge_state(state)
 
 
 def log_bridge_stream_error(
@@ -863,6 +1071,14 @@ def normalize_request_body(body: dict[str, Any]) -> dict[str, Any]:
 
     model = normalized.get("model")
     if isinstance(model, str):
+        routed_model = map_claude_desktop_model(model)
+        if routed_model != model:
+            print(
+                f"[bridge-normalize] desktop route {model} -> {routed_model}",
+                file=sys.stderr,
+            )
+            normalized["model"] = routed_model
+            model = routed_model
         normalized_model, default_effort = normalize_codex_model_and_effort(model)
         if normalized_model != model:
             print(
@@ -1551,7 +1767,44 @@ def responses_json_to_chat_completion(response: dict[str, Any], fallback_model: 
         "created": int(time.time()),
         "model": response.get("model") if isinstance(response.get("model"), str) else fallback_model or "gpt-5.5",
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": response.get("usage") if isinstance(response.get("usage"), dict) else None,
+        "usage": _usage_to_chat_completion(response.get("usage")),
+    }
+
+
+def _int_usage_value(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    return 0
+
+
+def _usage_to_chat_completion(usage: Any) -> dict[str, int]:
+    if not isinstance(usage, dict):
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+    prompt_tokens = _int_usage_value(usage.get("prompt_tokens"))
+    completion_tokens = _int_usage_value(usage.get("completion_tokens"))
+    input_tokens = _int_usage_value(usage.get("input_tokens"))
+    output_tokens = _int_usage_value(usage.get("output_tokens"))
+    if prompt_tokens == 0 and input_tokens:
+        prompt_tokens = input_tokens
+    if completion_tokens == 0 and output_tokens:
+        completion_tokens = output_tokens
+    total_tokens = _int_usage_value(usage.get("total_tokens"))
+    if total_tokens == 0:
+        total_tokens = prompt_tokens + completion_tokens
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "input_tokens": input_tokens or prompt_tokens,
+        "output_tokens": output_tokens or completion_tokens,
     }
 
 
@@ -1735,6 +1988,40 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         suffix = match.group(2) or "/"
         return account_id, suffix
 
+    def _usage_context(
+        self,
+        *,
+        request_type: str,
+        route_path: str,
+        original_body: dict[str, Any],
+        actual_model: str | None,
+    ) -> dict[str, Any]:
+        requested_model = original_body.get("model") if isinstance(original_body.get("model"), str) else actual_model
+        requested_model_id = normalize_bridge_model_id(requested_model)
+        desktop_route = requested_model_id in claude_desktop_model_route_map()
+        user_agent = str(self.headers.get("User-Agent") or "").lower()
+        if desktop_route:
+            client_label = "Claude Desktop 3P"
+        elif request_type == "messages":
+            client_label = "Claude Code / Anthropic"
+        elif request_type == "chat.completions":
+            client_label = "Hermes / OpenAI Chat" if "hermes" in user_agent else "OpenAI Chat"
+        elif request_type == "responses":
+            client_label = "Codex / OpenAI Responses" if "codex" in user_agent else "OpenAI Responses"
+        else:
+            client_label = request_type
+        client_address = getattr(self, "client_address", None)
+        client_port = client_address[1] if isinstance(client_address, tuple) and len(client_address) > 1 else 0
+        return {
+            "requested_model": requested_model or "",
+            "actual_model": actual_model or "",
+            "route_path": route_path,
+            "bridge_port": int(getattr(self.server, "server_port", 0) or 0),
+            "client_port": int(client_port or 0),
+            "client_label": client_label,
+            "desktop_route": desktop_route,
+        }
+
     def do_GET(self) -> None:
         route_account_id, route_path = self._resolve_account_route()
         if route_path == "/health":
@@ -1745,7 +2032,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self._write_bytes(payload)
             return
-        if route_path == "/v1/models":
+        if route_path in MODELS_PATHS:
             self._write_json_payload(200, build_models_payload())
             return
         if route_path == "/quota":
@@ -1828,13 +2115,13 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         route_account_id, route_path = self._resolve_account_route()
-        if route_path == "/v1/responses":
+        if route_path in RESPONSES_PATHS:
             self._handle_responses(route_account_id, route_path)
             return
-        if route_path == "/v1/messages":
+        if route_path in MESSAGES_PATHS:
             self._handle_messages(route_account_id, route_path)
             return
-        if route_path == "/v1/chat/completions":
+        if route_path in CHAT_COMPLETIONS_PATHS:
             self._handle_chat_completions(route_account_id, route_path)
             return
         self.send_error(404, "Not Found")
@@ -2007,6 +2294,12 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         upstream_url = f"{UPSTREAM_BASE_URL}/responses"
         max_attempts = stream_max_retries() + 1 if is_stream else 1
         started_at = time.monotonic()
+        usage_context = self._usage_context(
+            request_type=request_type,
+            route_path=route_path,
+            original_body=original_body,
+            actual_model=requested_model,
+        )
 
         for account_index, candidate_account_id in enumerate(candidate_account_ids):
             account_id, access_token = self.server.auth_store.get_access_token(candidate_account_id)
@@ -2070,6 +2363,22 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             response_body = json.loads(
                                 build_non_stream_json_from_sse(body, requested_model).decode("utf-8")
                             )
+                            record_bridge_usage(
+                                account_id=account_id,
+                                model=requested_model,
+                                requested_model=usage_context.get("requested_model"),
+                                request_type=request_type,
+                                request_id=request_id,
+                                usage=response_body.get("usage") if isinstance(response_body, dict) else None,
+                                duration_ms=int((time.monotonic() - started_at) * 1000),
+                                status_code=response.status_code,
+                                source="proxy",
+                                route_path=route_path,
+                                bridge_port=usage_context.get("bridge_port"),
+                                client_port=usage_context.get("client_port"),
+                                client_label=str(usage_context.get("client_label") or ""),
+                                desktop_route=bool(usage_context.get("desktop_route")),
+                            )
                             if output_format == "messages":
                                 response_body = responses_json_to_anthropic_message(response_body, requested_model)
                             elif output_format == "chat":
@@ -2090,6 +2399,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             requested_model=requested_model,
                             upstream_request_id=upstream_request_id,
                             metrics=metrics,
+                            usage_context=usage_context,
                         )
                         chunks: Any = iter(())
                         try:
@@ -2217,6 +2527,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         requested_model: str | None = None,
         upstream_request_id: str | None = None,
         metrics: BridgeStreamMetrics | None = None,
+        usage_context: dict[str, Any] | None = None,
     ):
         block_queue: queue.Queue[list[str] | BaseException | object] = queue.Queue(maxsize=16)
         done_marker = object()
@@ -2261,6 +2572,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         metrics = metrics or BridgeStreamMetrics()
         committed = False
         pending_chunks: list[bytes] = []
+        usage_recorded = False
 
         try:
             while True:
@@ -2349,6 +2661,26 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
 
                 state.last_upstream_at = time.monotonic()
                 event_name, payload, _data_lines = self._parse_sse_block(queued)
+                if not usage_recorded and event_name == "response.completed":
+                    usage_counts = _usage_from_payload(payload)
+                    if usage_counts:
+                        record_bridge_usage(
+                            account_id=account_id,
+                            model=requested_model,
+                            requested_model=(usage_context or {}).get("requested_model"),
+                            request_type="responses",
+                            request_id=stream_request_id,
+                            usage=usage_counts,
+                            duration_ms=int((time.monotonic() - stream_started_at) * 1000),
+                            status_code=response.status_code,
+                            source="proxy",
+                            route_path=str((usage_context or {}).get("route_path") or ""),
+                            bridge_port=(usage_context or {}).get("bridge_port"),
+                            client_port=(usage_context or {}).get("client_port"),
+                            client_label=str((usage_context or {}).get("client_label") or ""),
+                            desktop_route=bool((usage_context or {}).get("desktop_route")),
+                        )
+                        usage_recorded = True
                 terminal_error = terminal_stream_error_from_payload(event_name, payload)
                 if terminal_error is not None and not committed and is_retryable_terminal_stream_error(terminal_error):
                     metrics.upstream_events += 1

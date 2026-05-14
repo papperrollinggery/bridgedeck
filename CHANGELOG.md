@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.19
+
+- Added BridgeDeck-managed ChatGPT/Codex OAuth device authorization with expiring user codes.
+- Added safe hide/reset behavior for temporary authorization codes and status polling.
+- Added post-authorization CC Switch Local Bridge join/update action for new and existing accounts.
+- Added usage HUD, cache metrics, and detailed bridge usage event logging in the UI.
+- Improved account status and app entry smoke coverage for the packaged BridgeDeck UI.
+
 ## 0.2.18
 
 - Added OpenAI-compatible `/v1/messages`, `/v1/chat/completions`, and `/v1/models` bridge endpoints for third-party clients.

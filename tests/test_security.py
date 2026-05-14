@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import http.client
 import io
+import base64
 import sqlite3
 import tempfile
 import threading
@@ -10,6 +11,7 @@ import time
 import types
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -68,6 +70,12 @@ except ModuleNotFoundError:
 import local_codex_bridge
 
 
+def fake_jwt(payload: dict[str, Any]) -> str:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(body).decode("ascii").rstrip("=")
+    return f"header.{encoded}.sig"
+
+
 class FakeManager:
     def __init__(self) -> None:
         self.set_current_called = False
@@ -96,6 +104,8 @@ class FakeManager:
                     "name": "Provider",
                     "account_id": "01234567-89ab-cdef-0123-456789abcdef",
                     "base_url": "http://127.0.0.1:8876/accounts/01234567-89ab-cdef-0123-456789abcdef",
+                    "model": "gpt-5.5",
+                    "max_context_tokens": "272000",
                     "auth_token": "full-token" if include_secrets else "",
                     "auth_token_masked": "full...oken",
                     "compact_enabled": True,
@@ -142,6 +152,50 @@ class FakeManager:
                 "shims": [],
                 "risk_flags": ["omc_codex_shim_missing"],
             },
+            "usage_metrics": {
+                "request_count": 3,
+                "input_tokens": 1200,
+                "output_tokens": 340,
+                "total_tokens": 1540,
+                "cached_tokens": 900,
+                "cache_creation_tokens": 100,
+                "cache_miss_tokens": 300,
+                "cache_hit_rate": 0.75,
+                "cache_miss_rate": 0.25,
+                "last_account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                "last_model": "gpt-5.5",
+                "last_requested_model": "claude-opus-4-7",
+                "last_bridge_port": 8876,
+                "last_client_label": "Claude Desktop 3P",
+            },
+            "usage_events": [
+                {
+                    "at": 1778736000,
+                    "account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "model": "gpt-5.5",
+                    "actual_model": "gpt-5.5",
+                    "requested_model": "claude-opus-4-7",
+                    "request_type": "messages",
+                    "request_id": "bridge-test",
+                    "status_code": 200,
+                    "source": "proxy",
+                    "route_path": "/v1/messages",
+                    "bridge_port": 8876,
+                    "client_port": 61234,
+                    "client_label": "Claude Desktop 3P",
+                    "desktop_route": True,
+                    "duration_ms": 7650,
+                    "input_tokens": 1200,
+                    "output_tokens": 340,
+                    "total_tokens": 1540,
+                    "cached_tokens": 900,
+                    "cache_creation_tokens": 100,
+                    "cache_miss_tokens": 300,
+                    "cache_hit_rate": 0.75,
+                    "cache_miss_rate": 0.25,
+                    "cost_usd": 0.0,
+                }
+            ],
             "account_matrix": [],
             "current_provider_from_settings": "",
         }
@@ -156,18 +210,25 @@ class FakeManager:
         provider_name: str,
         set_current: bool,
         compact_config: dict[str, Any] | None = None,
+        model_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {"ok": True}
 
     def patch_provider(self, provider_id: str) -> dict[str, Any]:
         return {"ok": True}
 
-    def update_provider_compact(self, provider_id: str, compact_config: dict[str, Any] | None) -> dict[str, Any]:
+    def update_provider_compact(
+        self,
+        provider_id: str,
+        compact_config: dict[str, Any] | None,
+        model_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         return {
             "ok": True,
             "message": "上下文配置已保存",
             "provider_id": provider_id,
             "compact_config": bridgedeck.normalize_compact_config(compact_config),
+            "model_config": bridgedeck.normalize_bridge_model_config(model_config),
         }
 
     def sync_common_env_to_bridge_providers(self, provider_id: str) -> dict[str, Any]:
@@ -948,6 +1009,23 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertTrue(by_id["gpt-5.5"]["capabilities"]["messages"])
         self.assertTrue(by_id["gpt-5.5"]["capabilities"]["responses"])
 
+    def test_models_registry_exposes_claude_desktop_safe_routes(self) -> None:
+        payload = local_codex_bridge.build_models_payload()
+        by_id = {item["id"]: item for item in payload["data"]}
+
+        self.assertEqual(by_id["claude-haiku-4-5"]["bridge_target_model"], "gpt-5.3-codex-spark")
+        self.assertEqual(by_id["claude-sonnet-4-6"]["bridge_target_model"], "gpt-5.3-codex")
+        self.assertEqual(by_id["claude-opus-4-7"]["bridge_target_model"], "gpt-5.5")
+        self.assertEqual(by_id["claude-opus-4-7"]["context_length"], 272000)
+        self.assertTrue(by_id["claude-opus-4-7"]["capabilities"]["claude_desktop_gateway"])
+
+    def test_claude_desktop_safe_route_maps_before_forwarding(self) -> None:
+        body = local_codex_bridge.normalize_request_body(
+            {"model": "claude-opus-4-7", "input": [{"role": "user", "content": []}]}
+        )
+
+        self.assertEqual(body["model"], "gpt-5.5")
+
     def test_models_endpoint_is_account_scoped_and_ignores_sensitive_query(self) -> None:
         server = self.start_local_bridge_server()
         request = urllib.request.Request(
@@ -960,7 +1038,19 @@ class LocalCodexBridgeCase(unittest.TestCase):
         by_id = {item["id"]: item for item in payload["data"]}
         self.assertEqual(response.status, 200)
         self.assertIn("gpt-5.5", by_id)
+        self.assertIn("claude-opus-4-7", by_id)
         self.assertEqual(by_id["gpt-5.5"]["context_length"], 272000)
+
+    def test_models_endpoint_accepts_openai_base_url_path_variants(self) -> None:
+        server = self.start_local_bridge_server()
+        for path in ("/accounts/acct-1/models", "/accounts/acct-1/v1/v1/models"):
+            with self.subTest(path=path):
+                request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}{path}")
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+
+                self.assertEqual(response.status, 200)
+                self.assertIn("gpt-5.5", {item["id"] for item in payload["data"]})
 
     def test_messages_endpoint_posts_translated_responses_request_to_mock_upstream(self) -> None:
         server = self.start_local_bridge_server()
@@ -1001,6 +1091,68 @@ class LocalCodexBridgeCase(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(payload["type"], "message")
         self.assertEqual(payload["content"][0], {"type": "text", "text": "hello"})
+
+    def test_messages_endpoint_maps_claude_desktop_safe_model_to_gpt(self) -> None:
+        server = self.start_local_bridge_server()
+        client = FakeForwardClient(
+            [
+                FakeForwardResponse(
+                    200,
+                    body=(
+                        b"event: response.output_text.delta\n"
+                        b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+                    ),
+                )
+            ]
+        )
+
+        with mock.patch.object(local_codex_bridge, "build_upstream_http_client", return_value=client):
+            status, _, _ = self.post_local_bridge_json(
+                server,
+                "/accounts/acct-1/v1/messages",
+                {
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 200,
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+
+        sent = client.calls[0]["kwargs"]
+        self.assertEqual(status, 200)
+        self.assertEqual(sent["json"]["model"], "gpt-5.3-codex")
+
+    def test_chat_completions_endpoint_accepts_openai_base_url_path_variants(self) -> None:
+        for path in ("/accounts/acct-1/chat/completions", "/accounts/acct-1/v1/v1/chat/completions"):
+            with self.subTest(path=path):
+                server = self.start_local_bridge_server()
+                client = FakeForwardClient(
+                    [
+                        FakeForwardResponse(
+                            200,
+                            body=(
+                                b"event: response.output_text.delta\n"
+                                b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+                            ),
+                        )
+                    ]
+                )
+
+                with mock.patch.object(local_codex_bridge, "build_upstream_http_client", return_value=client):
+                    status, body, _ = self.post_local_bridge_json(
+                        server,
+                        path,
+                        {
+                            "model": "gpt-5.5",
+                            "stream": False,
+                            "messages": [{"role": "user", "content": "hi"}],
+                        },
+                    )
+
+                payload = json.loads(body)
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["choices"][0]["message"]["content"], "hello")
+                self.assertEqual(client.calls[0]["kwargs"]["json"]["model"], "gpt-5.5")
 
     def test_chat_completions_endpoint_posts_translated_responses_request_to_mock_upstream(self) -> None:
         server = self.start_local_bridge_server()
@@ -1207,7 +1359,90 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(payload["choices"][0]["message"]["content"], "hello")
         self.assertEqual(payload["choices"][0]["finish_reason"], "tool_calls")
         self.assertEqual(payload["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "lookup")
-        self.assertEqual(payload["usage"], {"input_tokens": 3, "output_tokens": 2})
+        self.assertEqual(
+            payload["usage"],
+            {
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "total_tokens": 5,
+                "input_tokens": 3,
+                "output_tokens": 2,
+            },
+        )
+
+    def test_responses_json_chat_completion_usage_never_returns_null_standard_fields(self) -> None:
+        payload = local_codex_bridge.responses_json_to_chat_completion(
+            {
+                "id": "resp_1",
+                "status": "completed",
+                "model": "gpt-5.5",
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 17,
+                    "total_tokens": 28,
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                },
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "hello"}]}],
+            }
+        )
+
+        self.assertEqual(payload["usage"]["prompt_tokens"], 11)
+        self.assertEqual(payload["usage"]["completion_tokens"], 17)
+        self.assertEqual(payload["usage"]["total_tokens"], 28)
+        self.assertIsInstance(payload["usage"]["prompt_tokens"], int)
+        self.assertIsInstance(payload["usage"]["completion_tokens"], int)
+
+    def test_record_bridge_usage_accumulates_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "bridge-state.json"
+            with mock.patch.object(local_codex_bridge, "BRIDGE_STATE_PATH", state_path):
+                local_codex_bridge.record_bridge_usage(
+                    account_id="acct-1",
+                    model="gpt-5.5",
+                    requested_model="claude-opus-4-7",
+                    request_type="responses",
+                    request_id="req-1",
+                    usage={
+                        "input_tokens": 11,
+                        "output_tokens": 7,
+                        "input_tokens_details": {"cached_tokens": 5},
+                        "cache_creation_tokens": 2,
+                    },
+                    route_path="/v1/messages",
+                    bridge_port=8876,
+                    client_port=61234,
+                    client_label="Claude Desktop 3P",
+                    desktop_route=True,
+                )
+                local_codex_bridge.record_bridge_usage(
+                    account_id="acct-1",
+                    model="gpt-5.5",
+                    request_type="chat.completions",
+                    request_id="req-2",
+                    usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                )
+
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["usage_metrics"]["request_count"], 2)
+        self.assertEqual(payload["usage_metrics"]["input_tokens"], 14)
+        self.assertEqual(payload["usage_metrics"]["output_tokens"], 9)
+        self.assertEqual(payload["usage_metrics"]["total_tokens"], 23)
+        self.assertEqual(payload["usage_metrics"]["cached_tokens"], 5)
+        self.assertEqual(payload["usage_metrics"]["cache_creation_tokens"], 2)
+        self.assertEqual(payload["usage_metrics"]["cache_miss_tokens"], 9)
+        self.assertAlmostEqual(payload["usage_metrics"]["cache_hit_rate"], 5 / 14)
+        self.assertAlmostEqual(payload["usage_metrics"]["cache_miss_rate"], 9 / 14)
+        self.assertEqual(payload["usage_metrics"]["last_request_type"], "chat.completions")
+        self.assertEqual(len(payload["usage_events"]), 2)
+        self.assertEqual(payload["usage_events"][0]["cache_miss_tokens"], 6)
+        self.assertEqual(payload["usage_events"][0]["requested_model"], "claude-opus-4-7")
+        self.assertEqual(payload["usage_events"][0]["actual_model"], "gpt-5.5")
+        self.assertEqual(payload["usage_events"][0]["bridge_port"], 8876)
+        self.assertEqual(payload["usage_events"][0]["client_label"], "Claude Desktop 3P")
+        self.assertTrue(payload["usage_events"][0]["desktop_route"])
+        self.assertEqual(payload["usage_events"][1]["status_code"], 200)
 
     def test_chat_stream_converts_response_text_delta_and_done(self) -> None:
         chunks = [
@@ -1417,6 +1652,72 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(payload["last_stream_error"]["error_type"], "RemoteProtocolError")
         self.assertEqual(payload["last_stream_error"]["request_id"], "bridge-test")
 
+    def test_bridge_state_reads_usage_metrics_without_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": 123,
+                        "usage_metrics": {
+                            "request_count": 2,
+                            "input_tokens": 11,
+                            "output_tokens": 7,
+                            "total_tokens": 18,
+                            "cached_tokens": 5,
+                            "cache_creation_tokens": 3,
+                            "cache_miss_tokens": 6,
+                            "cache_hit_rate": 0.45,
+                            "cache_miss_rate": 0.55,
+                            "last_model": "gpt-5.5",
+                        },
+                        "usage_events": [
+                            {
+                                "at": 1778736000,
+                                "account_id": "acct-1",
+                                "model": "gpt-5.5",
+                                "actual_model": "gpt-5.5",
+                                "requested_model": "claude-opus-4-7",
+                                "request_type": "responses",
+                                "request_id": "bridge-test",
+                                "status_code": 200,
+                                "source": "proxy",
+                                "route_path": "/v1/messages",
+                                "bridge_port": 8876,
+                                "client_port": 61234,
+                                "client_label": "Claude Desktop 3P",
+                                "desktop_route": True,
+                                "duration_ms": 1200,
+                                "input_tokens": 11,
+                                "output_tokens": 7,
+                                "total_tokens": 18,
+                                "cached_tokens": 5,
+                                "cache_creation_tokens": 3,
+                                "cache_miss_tokens": 6,
+                                "cache_hit_rate": 0.45,
+                                "cache_miss_rate": 0.55,
+                                "cost_usd": 0,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = bridgedeck.read_local_bridge_state(state_path)
+
+        self.assertEqual(payload["usage_metrics"]["request_count"], 2)
+        self.assertEqual(payload["usage_metrics"]["total_tokens"], 18)
+        self.assertEqual(payload["usage_metrics"]["cached_tokens"], 5)
+        self.assertEqual(payload["usage_metrics"]["cache_miss_tokens"], 6)
+        self.assertAlmostEqual(payload["usage_metrics"]["cache_hit_rate"], 0.45)
+        self.assertEqual(payload["usage_events"][0]["request_id"], "bridge-test")
+        self.assertEqual(payload["usage_events"][0]["cache_miss_tokens"], 6)
+        self.assertEqual(payload["usage_events"][0]["requested_model"], "claude-opus-4-7")
+        self.assertEqual(payload["usage_events"][0]["actual_model"], "gpt-5.5")
+        self.assertEqual(payload["usage_events"][0]["bridge_port"], 8876)
+        self.assertTrue(payload["usage_events"][0]["desktop_route"])
+
 
 class ServerCase(unittest.TestCase):
     def start_server(self, *, allow_sensitive: bool = True, allow_remote_access: bool = False):
@@ -1531,13 +1832,27 @@ class ServerCase(unittest.TestCase):
         self.assertIn("sk-bridgedeck-local-placeholder", html)
         self.assertIn("ANTHROPIC_BASE_URL", html)
         self.assertIn("ANTHROPIC_MODEL=gpt-5.5", html)
+        self.assertIn("ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark", html)
+        self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex", html)
+        self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5", html)
+        self.assertIn("claude-haiku-4-5", html)
+        self.assertIn("claude-sonnet-4-6", html)
+        self.assertIn("claude-opus-4-7", html)
+        self.assertIn("Desktop Gateway", html)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000", html)
         self.assertIn("272k context / 128k max output", html)
         self.assertIn("copy-api-base-url", html)
         self.assertIn("copy-claude-env", html)
+        self.assertIn('id="bridgeModel"', html)
+        self.assertIn('id="modelContextTokens"', html)
+        self.assertIn('data-action="compact-preset-model"', html)
+        self.assertIn("context unknown", html)
         self.assertIn('id="compactWindow"', html)
         self.assertIn('data-action="compact-preset-1m"', html)
         self.assertIn('data-action="save-compact-selected"', html)
         self.assertIn('data-action="sync-common-env-selected"', html)
+        self.assertIn('data-action="stop-bridgedeck-ui"', html)
+        self.assertIn("只停 8899，不影响 8876 Local Bridge", html)
         self.assertIn('id="pluginSyncStatus"', html)
         self.assertIn('data-action="extract-safe-common-config"', html)
         self.assertIn('data-action="sync-claude-plugins"', html)
@@ -1691,6 +2006,7 @@ class ServerCase(unittest.TestCase):
             method="POST",
             body={
                 "provider_id": "provider-1",
+                "model_config": {"model": "gpt-5.5"},
                 "compact_config": {"enabled": True, "window_tokens": "1000000", "threshold_percent": "80"},
             },
             headers={"X-CCSBT-Token": "test-token"},
@@ -1698,6 +2014,8 @@ class ServerCase(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(payload["compact_config"]["window_tokens"], "1000000")
+        self.assertEqual(payload["model_config"]["model"], "gpt-5.5")
+        self.assertEqual(payload["model_config"]["context_tokens"], "272000")
 
     def test_sync_common_env_endpoint_uses_selected_provider(self) -> None:
         server, _ = self.start_server()
@@ -1790,6 +2108,12 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(payload["providers"][0]["account_id"], "01234567...cdef")
         self.assertIn("/accounts/<redacted>", payload["providers"][0]["base_url"])
         self.assertEqual(payload["cli_homes"][0]["path"], "~/.codex")
+        self.assertEqual(payload["usage_metrics"]["last_account_id"], "01234567...cdef")
+        self.assertEqual(payload["usage_metrics"]["total_tokens"], 1540)
+        self.assertEqual(payload["usage_events"][0]["account_id"], "01234567...cdef")
+        self.assertEqual(payload["usage_events"][0]["input_tokens"], 1200)
+        self.assertEqual(payload["usage_events"][0]["requested_model"], "claude-opus-4-7")
+        self.assertEqual(payload["usage_events"][0]["actual_model"], "gpt-5.5")
 
     def test_cross_site_fetch_metadata_is_rejected(self) -> None:
         server, manager = self.start_server()
@@ -1876,6 +2200,38 @@ class ServerCase(unittest.TestCase):
             "/api/local-bridge-control",
             method="POST",
             body={"action": "restart"},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "Write APIs are disabled for remote mode")
+
+    def test_ui_control_shutdown_is_local_only_and_async(self) -> None:
+        server, _ = self.start_server()
+
+        with mock.patch.object(server, "shutdown") as shutdown:
+            status, payload = self.request(
+                server,
+                "/api/ui-control",
+                method="POST",
+                body={"action": "shutdown"},
+                headers={"X-CCSBT-Token": "test-token"},
+            )
+            time.sleep(0.35)
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertIn("Local Bridge 保持运行", payload["message"])
+        shutdown.assert_called_once()
+
+    def test_ui_control_requires_local_write_mode(self) -> None:
+        server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
+
+        status, payload = self.request(
+            server,
+            "/api/ui-control",
+            method="POST",
+            body={"action": "shutdown"},
             headers={"X-CCSBT-Token": "test-token"},
         )
 
@@ -1990,6 +2346,167 @@ class LauncherCase(unittest.TestCase):
                 auth_store=auth_store,
             )
         )
+
+    def test_codex_oauth_authorize_url_uses_pkce_and_fixed_callback(self) -> None:
+        url = bridgedeck.codex_oauth_authorize_url("state-1", "challenge-1")
+        parsed = urllib.parse.urlsplit(url)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        self.assertEqual(f"{parsed.scheme}://{parsed.netloc}{parsed.path}", bridgedeck.CODEX_OAUTH_AUTHORIZE_URL)
+        self.assertEqual(params["client_id"], [bridgedeck.CODEX_OAUTH_CLIENT_ID])
+        self.assertEqual(params["redirect_uri"], [bridgedeck.CODEX_OAUTH_REDIRECT_URI])
+        self.assertEqual(params["code_challenge"], ["challenge-1"])
+        self.assertEqual(params["state"], ["state-1"])
+        self.assertEqual(params["codex_cli_simplified_flow"], ["true"])
+        self.assertNotIn("code_verifier", params)
+
+    def test_parse_oauth_code_input_accepts_redirect_url_and_code_hash(self) -> None:
+        parsed = bridgedeck.parse_oauth_code_input("http://localhost:1455/auth/callback?code=abc&state=xyz")
+        self.assertEqual(parsed, {"code": "abc", "state": "xyz"})
+
+        parsed = bridgedeck.parse_oauth_code_input("abc#xyz")
+        self.assertEqual(parsed, {"code": "abc", "state": "xyz"})
+
+    def test_request_codex_device_code_posts_ccswitch_shape(self) -> None:
+        with mock.patch.object(
+            bridgedeck,
+            "_post_json_url",
+            return_value={
+                "device_auth_id": "deviceauth-test",
+                "user_code": "ABCD-EFGH",
+                "interval": "5",
+                "expires_at": "2026-05-14T13:48:09Z",
+            },
+        ) as post:
+            result = bridgedeck.request_codex_device_code()
+
+        self.assertEqual(result["user_code"], "ABCD-EFGH")
+        post.assert_called_once_with(
+            bridgedeck.CODEX_DEVICE_USERCODE_URL,
+            {"client_id": bridgedeck.CODEX_OAUTH_CLIENT_ID, "scope": bridgedeck.CODEX_DEVICE_SCOPE},
+            user_agent=bridgedeck.CODEX_DEVICE_USER_AGENT,
+        )
+
+    def test_exchange_codex_device_auth_exchanges_authorization_code(self) -> None:
+        token = {"access_token": fake_jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct"}}), "refresh_token": "refresh"}
+        with mock.patch.object(
+            bridgedeck,
+            "_post_json_url",
+            return_value={"authorization_code": "auth-code"},
+        ), mock.patch.object(bridgedeck, "exchange_codex_oauth_code", return_value=token) as exchange:
+            result = bridgedeck.exchange_codex_device_auth("deviceauth-test", "ABCD-EFGH")
+
+        self.assertEqual(result, token)
+        exchange.assert_called_once_with(
+            "auth-code",
+            bridgedeck.CODEX_DEVICE_CODE_VERIFIER,
+            redirect_uri=bridgedeck.CODEX_DEVICE_REDIRECT_URI,
+        )
+
+    def test_save_codex_oauth_account_stores_refresh_without_access_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auth_store = root / ".cc-switch" / "codex_oauth_auth.json"
+            auth_store.parent.mkdir(parents=True, exist_ok=True)
+            auth_store.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "accounts": {
+                            "acct-existing": {
+                                "account_id": "acct-existing",
+                                "email": "old@example.com",
+                                "refresh_token": "old-refresh",
+                            }
+                        },
+                        "default_account_id": "acct-existing",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manager = bridgedeck.BridgeManager(
+                bridgedeck.ManagerPaths(
+                    db=root / ".cc-switch" / "cc-switch.db",
+                    settings=root / ".cc-switch" / "settings.json",
+                    auth_store=auth_store,
+                )
+            )
+            access = fake_jwt(
+                {
+                    "https://api.openai.com/auth": {"chatgpt_account_id": "acct-new"},
+                    "https://api.openai.com/profile": {"email": "new@example.com"},
+                }
+            )
+
+            account_id = manager._save_codex_oauth_account(
+                {"access_token": access, "refresh_token": "new-refresh"},
+                set_default=False,
+            )
+
+            saved = json.loads(auth_store.read_text(encoding="utf-8"))
+            self.assertEqual(account_id, "acct-new")
+            self.assertEqual(saved["default_account_id"], "acct-existing")
+            self.assertEqual(saved["accounts"]["acct-new"]["email"], "new@example.com")
+            self.assertEqual(saved["accounts"]["acct-new"]["refresh_token"], "new-refresh")
+            self.assertNotIn("access_token", saved["accounts"]["acct-new"])
+
+    def test_managed_codex_provider_uses_auth_store_binding_over_embedded_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(manager.paths.db) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE providers (
+                        id TEXT NOT NULL,
+                        app_type TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        settings_config TEXT NOT NULL,
+                        meta TEXT NOT NULL,
+                        provider_type TEXT,
+                        is_current BOOLEAN NOT NULL DEFAULT 0,
+                        sort_index INTEGER
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO providers (
+                        id, app_type, name, settings_config, meta, provider_type, is_current, sort_index
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "codex-1",
+                        "codex",
+                        "OpenAI PRO",
+                        json.dumps(
+                            {"auth": {"tokens": {"account_id": "acct-2", "refresh_token": "old-token"}}}
+                        ),
+                        json.dumps(
+                            {
+                                "authBinding": {
+                                    "source": "managed_account",
+                                    "authProvider": "codex_oauth",
+                                    "accountId": "acct-1",
+                                }
+                            }
+                        ),
+                        "codex_oauth",
+                        1,
+                        1,
+                    ),
+                )
+
+            with manager._connect() as conn:
+                providers = manager._list_codex_providers(conn)
+
+        self.assertEqual(providers[0]["meta_account_id"], "acct-1")
+        self.assertEqual(providers[0]["token_account_id"], "acct-1")
+        self.assertEqual(providers[0]["embedded_token_account_id"], "acct-2")
+        self.assertTrue(providers[0]["uses_managed_auth_store"])
+        self.assertTrue(providers[0]["embedded_token_stale"])
+        self.assertFalse(providers[0]["token_mismatch"])
 
     def test_create_cli_launcher_does_not_refresh_or_write_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2156,6 +2673,9 @@ class LauncherCase(unittest.TestCase):
             env = settings["env"]
             self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8876/accounts/acct-1")
             self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "local-bridge")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gpt-5.3-codex-spark")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-5.3-codex")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gpt-5.5")
             self.assertEqual(meta["apiFormat"], "openai_responses")
             self.assertEqual(meta["codexOauthTransport"], "local_bridge")
             self.assertEqual(meta["authBinding"]["authProvider"], "codex_oauth")
@@ -2193,6 +2713,27 @@ class LauncherCase(unittest.TestCase):
 
             self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", settings["env"])
             self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", settings["env"])
+
+    def test_provider_payload_applies_selected_bridge_model_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+
+            settings, _ = manager._build_provider_payload(
+                "acct-1",
+                settings_config={"env": {}},
+                model_config={"model": "GPT-5.5"},
+            )
+
+            env = settings["env"]
+            self.assertEqual(env["ANTHROPIC_MODEL"], "gpt-5.5")
+            self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "272000")
+
+    def test_unknown_bridge_model_does_not_invent_context(self) -> None:
+        normalized = bridgedeck.normalize_bridge_model_config({"model": "gpt-5.4"})
+
+        self.assertEqual(normalized["model"], "gpt-5.4")
+        self.assertEqual(normalized["context_tokens"], "")
+        self.assertEqual(normalized["max_output_tokens"], "")
 
     def test_provider_payload_normalizes_gpt_model_env_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
