@@ -1,153 +1,148 @@
-# BridgeDeck / BridgeDeck 本地账号桥接面板
+# BridgeDeck
 
-Local web helper for managing CC Switch Codex OAuth bridge providers and launcher-only Codex CLI account routes.
+Local account control panel for CC Switch, Codex OAuth accounts, Claude Code, Codex CLI, and OpenAI/Anthropic-compatible local API access.
 
-本工具是一个本地网页助手，用于管理 CC Switch 的 Codex OAuth 桥接 Provider，以及为 Codex CLI 生成不复制 token 的账号启动器。
+Languages: [English](README.md) | [Simplified Chinese](README.zh-CN.md)
 
-## What It Does / 功能
+BridgeDeck is a local macOS helper. It does not host a cloud proxy, does not issue tokens, and does not copy OAuth tokens into generated Codex CLI profiles. It reads your local CC Switch and Codex configuration, then gives you a safer UI for account routing, bridge provider repair, local API setup, usage visibility, and diagnostics.
 
-- Create or repair Claude providers that route through a local Codex bridge.
-- 创建或修复走本地 Codex bridge 的 Claude Provider。
-- Keep Claude provider account binding and quota identity intact.
-- 保留 Claude Provider 的账号绑定和额度身份。
-- Generate launcher-only Codex CLI routes under `~/.cc-switch/codex-cli-launchers/`.
-- 在 `~/.cc-switch/codex-cli-launchers/` 下生成 launcher-only Codex CLI 账号路由。
-- Detect stale tokenful `~/.codex-cli-*` profiles without copying or refreshing OpenAI tokens.
-- 检测旧的 tokenful `~/.codex-cli-*` 配置，不复制、不刷新 OpenAI token。
-- Detect Codex Desktop config state, and optionally set a default Codex account for tools that cannot pass CLI flags.
-- 检测 Codex Desktop 配置状态，并可选设置默认 Codex 账号，供无法输入 CLI 参数的工具使用。
-- Detect Codex provider account/token mismatch.
-- 检查 Codex Provider 的显示账号和实际 token 账号是否不一致。
-- Hide tokens by default; reveal only on explicit user action.
-- 默认隐藏 token，只有用户主动点击才显示。
-- Back up local files before writes.
-- 写入前自动备份本地文件。
+BridgeDeck is an independent project. It is not affiliated with CC Switch, OpenAI, Anthropic, GitHub, Microsoft, or any desktop client vendor. Bridge, OAuth, gateway, and account-routing workflows may be subject to the terms of the services you use.
 
-## Disclaimer / 免责声明
+## What It Solves
 
-This project is an independent local helper. It is not affiliated with CC Switch, OpenAI, Anthropic, GitHub, or Microsoft.
+BridgeDeck is useful when one machine has multiple ChatGPT/Codex OAuth accounts and several tools need different entry points:
 
-本项目是独立本地辅助工具，与 CC Switch、OpenAI、Anthropic、GitHub、Microsoft 无官方关联。
+- Claude Code needs a Claude-compatible provider that actually routes to a selected Codex account.
+- Codex CLI needs either a standalone per-account launcher or a global default account.
+- Third-party tools need an OpenAI-compatible `base_url` and placeholder key.
+- Claude Desktop or Anthropic-compatible clients need a local `/v1/messages` bridge.
+- Account quota, provider binding, and actual token identity need to be checked without exposing real tokens.
 
-Using reverse-proxy, bridge, OAuth, or account-routing workflows may be subject to the terms of the relevant services. You are responsible for deciding whether a workflow is allowed for your account and environment.
+## Main Capabilities
 
-使用反向代理、桥接、OAuth 或账号路由相关流程，可能受到对应服务条款约束。是否适合你的账号和环境，由使用者自行判断。
+- **BridgeDeck-managed ChatGPT authorization**: generate an OpenAI device code in BridgeDeck, complete authorization in the browser, then join or update the matching CC Switch Local Bridge provider.
+- **Claude Code bridge providers**: create, repair, and inspect Claude providers that route through `127.0.0.1:8876`.
+- **Codex CLI routing**: generate launcher-only per-account Codex CLI commands and optionally set the global Codex CLI default.
+- **OpenAI-compatible local API**: expose account-scoped `/v1/responses`, `/v1/chat/completions`, and `/v1/models`.
+- **Anthropic-compatible local API**: expose `/v1/messages` for Claude-style clients.
+- **Usage dashboard**: show request count, token totals, cache write tokens, cache hit tokens, cache miss tokens, hit rate, status, entry source, requested model, and actual routed model.
+- **Account status checks**: compare CC Switch provider binding, actual OAuth identity, Claude config, Codex CLI config, and Desktop/global Codex state.
+- **Privacy-first UI**: mask account IDs, emails, local paths, and tokens by default; require explicit local actions for write operations.
 
-## Requirements / 运行要求
+## Runtime Ports
 
-- macOS
-- Python 3.10+
-- CC Switch installed and configured
-- 已安装并配置 CC Switch
-- Codex OAuth accounts already logged in inside CC Switch
-- 已在 CC Switch 内完成 Codex OAuth 账号登录
-- Optional: local Codex bridge running on `127.0.0.1:8876`
-- 可选：本地 Codex bridge 已运行在 `127.0.0.1:8876`
+| Port | Component | Purpose |
+| --- | --- | --- |
+| `8899` | BridgeDeck UI | Local web control panel |
+| `8876` | Local Codex Bridge | Account-scoped OpenAI/Anthropic-compatible API |
+| `15721` | CC Switch | Existing CC Switch service |
 
-Tested locally on macOS with the system Python 3 runtime. CC Switch schema compatibility is checked at runtime through SQLite columns where possible.
+BridgeDeck binds to `127.0.0.1` by default.
 
-本工具在 macOS 系统 Python 3 环境下测试。CC Switch 数据库兼容性会尽量通过 SQLite 字段检测处理。
+## Install
 
-## Quick Start / 快速启动
+### Download the macOS App
+
+1. Download `BridgeDeck.dmg` from [GitHub Releases](https://github.com/papperrollinggery/bridgedeck/releases).
+2. Open the DMG and drag `BridgeDeck.app` to `Applications`, or run it directly.
+3. If macOS blocks the unsigned app, right-click the app and choose `Open`.
+
+When the app icon is opened, BridgeDeck shows a native choice dialog:
+
+- `Open UI`: start or open the `8899` control panel.
+- `Start Bridge Only`: start only the `8876` Local Codex Bridge.
+- `Stop UI, Keep Bridge`: stop the `8899` UI while leaving `8876` running.
+
+### Run From Source
 
 ```bash
 chmod +x run-bridgedeck.command
 ./run-bridgedeck.command
 ```
 
-The macOS launcher shows a native choice dialog:
-
-macOS 启动器会先显示原生选择框：
-
-- `打开 UI`: start/open the 8899 configuration page.
-- `只启动 Bridge`: start only the 8876 Local Codex Bridge.
-- `关闭 UI 保留 Bridge`: stop only the 8899 UI when it is running.
-- `打开 UI`：启动/打开 8899 配置页。
-- `只启动 Bridge`：只启动 8876 Local Codex Bridge。
-- `关闭 UI 保留 Bridge`：UI 已运行时只关闭 8899，保留 8876。
-
-Manual UI URL / 手动打开 UI：
-
-```text
-http://127.0.0.1:8899
-```
-
-Manual start / 手动启动：
+Manual UI start:
 
 ```bash
 python3 bridgedeck.py --host 127.0.0.1 --port 8899
 ```
 
-## Install From DMG / 通过 DMG 安装
+Manual UI URL:
 
-1. Download `BridgeDeck.dmg` from GitHub Releases.
-2. Open the DMG and drag the app to `Applications`, or run it directly.
-3. If macOS Gatekeeper blocks the unsigned app, right-click the app and choose `Open`.
-
-1. 从 GitHub Releases 下载 `BridgeDeck.dmg`。
-2. 打开 DMG，将 App 拖到 `Applications`，或直接运行。
-3. 如果 macOS Gatekeeper 拦截未签名 App，右键 App 选择“打开”。
-
-## Main Workflows / 主要使用流程
-
-### Claude via a ChatGPT Account / Claude 使用某个 ChatGPT 账号
-
-1. Log in to the target Codex OAuth account in CC Switch.
-2. Open this tool.
-3. In `Claude 桥接账号`, select the account.
-4. Keep `设为当前` enabled if you want Claude Code to switch immediately.
-5. Click `创建/更新 Claude 桥接`.
-6. In `Claude Provider 管理`, confirm the provider shows `settings=true`.
-
-1. 先在 CC Switch 里登录目标 Codex OAuth 账号。
-2. 打开本工具。
-3. 在 `Claude 桥接账号` 中选择账号。
-4. 如果要立刻切换 Claude Code，保持 `设为当前` 勾选。
-5. 点击 `创建/更新 Claude 桥接`。
-6. 在 `Claude Provider 管理` 中确认目标 Provider 显示 `settings=true`。
-
-### Standalone Codex CLI / 单独 Codex CLI
-
-This creates a per-account launcher and does not change the global default Codex account.
-
-单独 Codex CLI 只生成某个账号的独立启动器，不改变全局默认 Codex 账号。
-
-1. In `单独 Codex CLI`, click `选用` for the account.
-2. Keep the generated directory such as `~/.codex-cli-pro`.
-3. Click `生成启动器`.
-4. Start CLI using the displayed command:
-
-1. 在 `单独 Codex CLI` 中，对目标账号点击 `选用`。
-2. 保持生成的目录，例如 `~/.codex-cli-pro`。
-3. 点击 `生成启动器`。
-4. 使用页面输出命令启动 CLI：
-
-```bash
-CODEX_HOME=/Users/you/.codex-cli-pro OPENAI_API_KEY=local-bridge codex -c 'base_url="http://127.0.0.1:8876/accounts/<account_id>/v1"'
+```text
+http://127.0.0.1:8899
 ```
 
-or use the generated launcher:
+Start, stop, or inspect only the Local Codex Bridge:
 
-也可以使用自动生成的启动器：
+```bash
+python3 bridgedeck.py --local-bridge start
+python3 bridgedeck.py --local-bridge status
+python3 bridgedeck.py --local-bridge restart
+python3 bridgedeck.py --local-bridge stop
+```
+
+## Common Workflows
+
+### Authorize or Refresh a ChatGPT/Codex Account
+
+1. Open BridgeDeck.
+2. Go to `Entry Switching`.
+3. Click `Generate Authorization Code`.
+4. Open the displayed OpenAI device authorization page.
+5. Enter the code and confirm authorization.
+6. Return to BridgeDeck and wait for the status to complete.
+7. Click `Join CC Switch` for a new account, or `Update CC Switch` for an existing account.
+
+BridgeDeck stores only the refresh token in the CC Switch-compatible OAuth account store. It does not return the access token to the page.
+
+### Route Claude Code Through a Selected ChatGPT Account
+
+1. Make sure the target account exists in CC Switch or authorize it through BridgeDeck.
+2. Open `Entry Switching`.
+3. Select the account under `Claude Code`.
+4. Apply the Claude Code account.
+5. Confirm the status matrix shows the expected current account and no provider mismatch.
+
+### Create a Standalone Codex CLI Launcher
+
+Use this when one terminal or automation should use a specific account without changing the global default:
 
 ```text
 ~/.cc-switch/codex-cli-launchers/codex-<name>.command
 ```
 
-### Generic API Access / 通用 API 接入
+Generated launchers route through the local bridge and do not copy OAuth tokens into `auth.json`.
 
-BridgeDeck exposes account-scoped OpenAI-compatible and Anthropic-compatible routes on the local bridge. The UI shows copy-safe examples with a placeholder key only.
+### Set the Global Codex CLI Account
 
-BridgeDeck 在本地 bridge 上提供账号级 OpenAI 兼容和 Anthropic 兼容路由。UI 只展示 placeholder key，不展示真实 OAuth token。
+Use this only for tools that call the default `codex` command and cannot pass a custom command, such as Desktop integrations or tmux/OMC shims.
+
+BridgeDeck writes only the selected `base_url` into `~/.codex/config.toml` after making a backup. It does not write `access_token`, `refresh_token`, or `id_token`.
+
+## Local API Access
+
+BridgeDeck exposes account-scoped local routes. The API key is a local placeholder, not a real OpenAI token.
 
 ```bash
 OPENAI_API_KEY=sk-bridgedeck-local-placeholder
 OPENAI_BASE_URL=http://127.0.0.1:8876/accounts/<account_id>/v1
 ```
 
-Claude Desktop 3P gateway style:
+Supported OpenAI-compatible routes:
 
-Claude Desktop 第三方 gateway 形式：
+```text
+POST /accounts/<account_id>/v1/responses
+POST /accounts/<account_id>/v1/chat/completions
+GET  /accounts/<account_id>/v1/models
+```
+
+Supported Anthropic-compatible route:
+
+```text
+POST /accounts/<account_id>/v1/messages
+```
+
+Example Anthropic-style environment:
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8876/accounts/<account_id>/v1
@@ -156,151 +151,83 @@ ANTHROPIC_MODEL=gpt-5.5
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
 ```
 
-Supported local routes:
+BridgeDeck also exposes desktop-safe Claude-style model aliases so clients with model-name restrictions can route to the intended GPT model while the UI still shows both the requested model and actual routed model.
 
-本地支持路由：
+## Usage Dashboard
 
-- `POST /accounts/<account_id>/v1/responses`
-- `POST /accounts/<account_id>/v1/messages`
-- `POST /accounts/<account_id>/v1/chat/completions`
-- `GET /accounts/<account_id>/v1/models`
+The `Usage Details` page reads Local Codex Bridge state and shows:
 
-`gpt-5.5` is exposed as `272000` context tokens, `128000` max output tokens, with thinking levels `low`, `medium`, `high`, and `xhigh`.
+- total requests
+- total tokens
+- input and output tokens
+- cache creation/write tokens
+- cache hit tokens
+- cache miss tokens
+- cache hit and miss rate
+- provider/account label
+- requested model and actual routed model
+- client source, such as Codex, Claude Code, Desktop, Hermes, or generic API
+- HTTP status and recent error state
 
-`gpt-5.5` 展示为 `272000` context tokens、`128000` max output tokens，thinking levels 为 `low`、`medium`、`high`、`xhigh`。
+Only recent local events are retained. Account identifiers are masked before display.
 
-### Global Codex CLI / 全局 Codex CLI
+## Files Read or Written
 
-For tools such as Paperclip that call the default `codex` command and do not let you enter a launch command, use `设为全局 Codex CLI`.
+BridgeDeck may read or write these local files depending on the action you choose:
 
-对于 Paperclip 这类直接调用默认 `codex`、不提供命令输入位置的工具，使用 `设为全局 Codex CLI`。
+```text
+~/.cc-switch/cc-switch.db
+~/.cc-switch/settings.json
+~/.cc-switch/codex_oauth_auth.json
+~/.cc-switch/codex-cli-launchers/*
+~/.cc-switch/bridgedeck-backups/*
+~/.cc-switch/bridgedeck-local-bridge-state.json
+~/.codex/config.toml
+~/.codex/.env
+~/.codex-cli-*
+```
 
-This writes only `base_url` in `~/.codex/config.toml` after making a backup. It does not copy `access_token`, `refresh_token`, or `id_token`.
-
-该操作会先备份，再只写入 `~/.codex/config.toml` 里的 `base_url`。不会复制 `access_token`、`refresh_token` 或 `id_token`。
-
-## Files Read or Written / 读写文件
-
-The tool reads/writes these local files:
-
-本工具会读写以下本地文件：
-
-- `~/.cc-switch/cc-switch.db`
-- `~/.cc-switch/settings.json`
-- `~/.cc-switch/codex_oauth_auth.json`
-- `~/.codex-cli-*`
-- `~/.cc-switch/codex-cli-launchers/*`
-- `~/.codex/config.toml` only when `默认都用这个账号` is clicked
-- 只有点击 `默认都用这个账号` 时才会写入 `~/.codex/config.toml`
-
-Codex CLI launchers no longer write `auth.json` or copy OAuth tokens. Migration may disable an old `~/.codex-cli-*/auth.json` after backing it up.
-
-Codex CLI 启动器不再写 `auth.json`，也不复制 OAuth token。迁移旧配置时会先备份，再禁用旧的 `~/.codex-cli-*/auth.json`。
-
-By default, it reads but does not overwrite the default Codex config:
-
-默认只读取、不覆盖默认 Codex 配置：
-
-- `~/.codex/config.toml`
-- `~/.codex/.env`
-
-Backups are written to:
-
-备份文件写入：
+Backups are written before local configuration changes:
 
 ```text
 ~/.cc-switch/bridgedeck-backups/
 ```
 
-## Security Model / 安全模型
+## Security and Privacy
 
-- The app binds to `127.0.0.1` by default.
-- 默认只监听 `127.0.0.1`。
+- Localhost binding is the default.
 - Non-loopback binding requires `--allow-remote`.
-- 非本机监听必须显式传入 `--allow-remote`。
-- Remote mode is read-only by default and cannot reveal full tokens.
-- 远程模式默认只读，不能显示完整 token。
-- Remote read-only mode redacts account IDs, email addresses, local paths, and bridge account URLs in API responses.
-- 远程只读模式会在 API 响应中脱敏 account id、邮箱、本地路径和 bridge 账号 URL。
+- Remote mode is read-only by default.
+- Remote read-only responses redact account IDs, emails, local paths, proxy credentials, and bridge account URLs.
 - Write APIs and token reveal in remote mode require `--allow-remote-write`.
-- 远程模式下写入和显示 token 必须额外传入 `--allow-remote-write`。
-- All API requests require a per-run browser token.
-- 所有 API 请求都需要本次启动生成的浏览器令牌。
-- API requests reject cross-site Fetch Metadata where supported by the browser.
-- 浏览器支持 Fetch Metadata 时，API 会拒绝跨站请求。
-- Full tokens are not returned by `/api/data` unless the UI explicitly requests `include_secrets=1`.
-- `/api/data` 默认不返回完整 token，只有 UI 明确请求 `include_secrets=1` 才返回。
-- The page sends CSP, frame blocking, no-store, nosniff, and referrer policy headers.
-- 页面会发送 CSP、防嵌入、no-store、nosniff 和 referrer policy 安全响应头。
-- Do not expose this app to a public network.
-- 不要把本工具暴露到公网。
+- API requests require a per-run browser token.
+- Cross-site Fetch Metadata is rejected where supported by the browser.
+- HTML responses use CSP, frame blocking, `no-store`, `nosniff`, and referrer policy headers.
+- Full tokens are not returned by `/api/data` unless the local UI explicitly requests secret reveal.
 
-## Privacy / 隐私
-
-The UI may show account IDs, email addresses, local paths, and masked tokens. Do not include screenshots or logs from your real environment in public issues unless you redact them first.
-
-页面可能显示 account id、邮箱、本地路径和脱敏 token。提交公开 issue 前，请先对截图和日志做脱敏。
-
-Never publish:
-
-不要公开：
-
-- OAuth access tokens
-- OAuth refresh tokens
-- `auth.json`
-- `codex_oauth_auth.json`
-- `cc-switch.db`
-- private screenshots with account IDs or emails
-- 带账号 ID、邮箱、本地路径的未脱敏截图
-
-## Uninstall / 卸载
-
-Remove the app or this folder. The tool does not install background services.
-
-删除 App 或本目录即可。本工具不会安装后台服务。
-
-Optional generated files:
-
-可选清理自动生成文件：
-
-```bash
-rm -rf ~/.cc-switch/codex-cli-launchers
-rm -rf ~/.cc-switch/bridgedeck-backups
-rm -rf ~/.codex-cli-*
-```
-
-## Package macOS DMG / 打包 macOS DMG
-
-```bash
-chmod +x package-bridgedeck-dmg.command
-./package-bridgedeck-dmg.command
-```
-
-Output / 输出：
+Never publish these files or raw screenshots from a real machine:
 
 ```text
-dist/BridgeDeck.dmg
+~/.cc-switch/codex_oauth_auth.json
+~/.cc-switch/cc-switch.db
+~/.codex/auth.json
+~/.codex-cli-*/auth.json
+screenshots with account IDs or emails
+logs containing tokens, account IDs, emails, local paths, or proxy credentials
 ```
 
-For public releases, add a checksum:
+## Troubleshooting
 
-公开发布建议同时提供校验值：
+| Problem | Check |
+| --- | --- |
+| UI keeps loading | Open `http://127.0.0.1:8899`, then restart only the UI if needed. The `8876` bridge can keep running. |
+| Local API returns `404` | Use `/accounts/<account_id>/v1` as the base URL and make sure the route is one of the supported local routes. |
+| Local API returns `401` | Re-authorize the account in BridgeDeck or CC Switch, then update the matching Local Bridge provider. |
+| Proxy returns `503` | Check the active proxy, CC Switch service, and Local Codex Bridge status. Temporary upstream service errors can also appear as `503`. |
+| Desktop client rejects model names | Use the model aliases shown by BridgeDeck and confirm the UI displays the actual routed model. |
+| Quota/account mismatch | Use the status matrix and provider mismatch panel, then re-authorize or update the provider binding. |
 
-```bash
-shasum -a 256 dist/BridgeDeck.dmg
-```
-
-## Development Checks / 开发检查
-
-```bash
-python3 -m py_compile bridgedeck.py
-python3 -m unittest discover -s tests
-python3 bridgedeck.py --host 127.0.0.1 --port 8899
-zsh -n run-bridgedeck.command
-zsh -n package-bridgedeck-dmg.command
-```
-
-## CLI Options / 命令行参数
+## CLI Options
 
 ```text
 --db PATH              path to cc-switch.db
@@ -313,61 +240,45 @@ zsh -n package-bridgedeck-dmg.command
 --local-bridge ACTION  start/stop/restart/status 8876 without starting the UI
 ```
 
-```text
---db PATH              cc-switch.db 路径
---settings PATH        settings.json 路径
---auth-store PATH      codex_oauth_auth.json 路径
---host HOST            监听地址，默认 127.0.0.1
---port PORT            监听端口，默认 8899
---allow-remote         允许非本机监听；默认只读且不能显示完整 token
---allow-remote-write   允许远程模式写入和显示完整 token
---local-bridge ACTION  不启动 UI，直接 start/stop/restart/status 8876
-```
+## Development
 
-## Project Layout / 项目结构
-
-```text
-bridgedeck.py                   local web app and API / 本地网页应用和 API
-run-bridgedeck.command          macOS launcher / macOS 启动脚本
-package-bridgedeck-dmg.command  macOS app/dmg packager / macOS 打包脚本
-README.md                      documentation / 文档
-SECURITY.md                    security policy / 安全说明
-CONTRIBUTING.md                contribution guide / 贡献说明
-CHANGELOG.md                   changelog / 变更记录
-OPEN_SOURCE_CHECKLIST.md       release checklist / 开源发布清单
-LICENSE                        PolyForm Noncommercial 1.0.0 / PolyForm 非商用许可证
-COMMERCIAL.md                  commercial licensing notes / 商业授权说明
-.github/                       issue and PR templates / issue 和 PR 模板
-```
-
-## Release Checklist / 发布检查
+Run the local checks:
 
 ```bash
-python3 -m py_compile bridgedeck.py
+python3 -m py_compile bridgedeck.py local_codex_bridge.py
 python3 -m unittest discover -s tests
 zsh -n run-bridgedeck.command
 zsh -n package-bridgedeck-dmg.command
+```
+
+Package the macOS app and DMG:
+
+```bash
+chmod +x package-bridgedeck-dmg.command
 ./package-bridgedeck-dmg.command
 shasum -a 256 dist/BridgeDeck.dmg
 ```
 
-Before publishing, make sure the repository does not contain:
+Project layout:
 
-发布前确认仓库不包含：
+```text
+bridgedeck.py                   local web app and API
+local_codex_bridge.py           8876 account-scoped bridge service
+BridgeDeckLauncher.swift        native macOS app launcher
+run-bridgedeck.command          source launcher
+package-bridgedeck-dmg.command  macOS app and DMG packager
+README.md                       English documentation
+README.zh-CN.md                 Simplified Chinese documentation
+SECURITY.md                     security policy
+CONTRIBUTING.md                 contribution guide
+CHANGELOG.md                    changelog
+OPEN_SOURCE_CHECKLIST.md        release checklist
+LICENSE                         PolyForm Noncommercial 1.0.0
+COMMERCIAL.md                   commercial licensing notes
+```
 
-- `private-notes/`
-- `__pycache__/`
-- `.env`
-- `*.db`
-- `auth.json`
-- `codex_oauth_auth.json`
-- screenshots with private account data
-- 含私人账号信息的截图
-
-## License / 许可证
+## License
 
 BridgeDeck is licensed under the PolyForm Noncommercial License 1.0.0.
-Commercial use requires a separate written commercial license. See `COMMERCIAL.md`.
 
-BridgeDeck 使用 PolyForm Noncommercial License 1.0.0 授权。
-商业使用需要单独取得书面商业授权。见 `COMMERCIAL.md`。
+Commercial use requires a separate written commercial license. See `COMMERCIAL.md`.
