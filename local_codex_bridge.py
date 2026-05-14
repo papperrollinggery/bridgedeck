@@ -62,6 +62,7 @@ BRIDGE_STATE_PATH = Path(
         str(Path.home() / ".cc-switch" / "bridgedeck-local-bridge-state.json"),
     )
 )
+MAX_USAGE_EVENTS = 200
 
 
 @dataclass
@@ -812,21 +813,74 @@ def record_bridge_usage(
     request_type: str,
     request_id: str,
     usage: Any,
+    requested_model: str | None = None,
+    duration_ms: int | None = None,
+    status_code: int = 200,
+    source: str = "proxy",
+    route_path: str = "",
+    bridge_port: int | None = None,
+    client_port: int | None = None,
+    client_label: str = "",
+    desktop_route: bool = False,
 ) -> None:
     counts = _extract_usage_counts(usage)
     if not counts or not any(counts.values()):
         return
+    cache_miss_tokens = max(0, counts["input_tokens"] - counts["cached_tokens"])
+    cache_eligible_tokens = counts["input_tokens"]
+    cache_hit_rate = (counts["cached_tokens"] / cache_eligible_tokens) if cache_eligible_tokens else 0.0
+    cache_miss_rate = (cache_miss_tokens / cache_eligible_tokens) if cache_eligible_tokens else 0.0
     state = _read_bridge_state()
     metrics = state.get("usage_metrics") if isinstance(state.get("usage_metrics"), dict) else {}
     for key in ("input_tokens", "output_tokens", "total_tokens", "cached_tokens", "cache_creation_tokens"):
         metrics[key] = _usage_int(metrics.get(key)) + counts[key]
+    aggregate_cache_eligible = _usage_int(metrics.get("input_tokens"))
+    aggregate_cached = _usage_int(metrics.get("cached_tokens"))
+    aggregate_missed = max(0, aggregate_cache_eligible - aggregate_cached)
+    metrics["cache_miss_tokens"] = aggregate_missed
+    metrics["cache_hit_rate"] = (aggregate_cached / aggregate_cache_eligible) if aggregate_cache_eligible else 0.0
+    metrics["cache_miss_rate"] = (aggregate_missed / aggregate_cache_eligible) if aggregate_cache_eligible else 0.0
     metrics["request_count"] = _usage_int(metrics.get("request_count")) + 1
     metrics["last_account_id"] = account_id
     metrics["last_model"] = model or ""
+    metrics["last_requested_model"] = requested_model or model or ""
     metrics["last_request_type"] = request_type
     metrics["last_request_id"] = request_id
+    metrics["last_duration_ms"] = _usage_int(duration_ms)
+    metrics["last_status_code"] = _usage_int(status_code)
+    metrics["last_bridge_port"] = _usage_int(bridge_port)
+    metrics["last_client_label"] = client_label or ""
     metrics["last_updated_at"] = int(time.time())
     state["usage_metrics"] = metrics
+    event = {
+        "at": int(time.time()),
+        "account_id": account_id,
+        "model": model or "",
+        "actual_model": model or "",
+        "requested_model": requested_model or model or "",
+        "request_type": request_type,
+        "request_id": request_id,
+        "status_code": _usage_int(status_code),
+        "source": source,
+        "route_path": route_path,
+        "bridge_port": _usage_int(bridge_port),
+        "client_port": _usage_int(client_port),
+        "client_label": client_label or "",
+        "desktop_route": bool(desktop_route),
+        "duration_ms": _usage_int(duration_ms),
+        "input_tokens": counts["input_tokens"],
+        "output_tokens": counts["output_tokens"],
+        "total_tokens": counts["total_tokens"],
+        "cached_tokens": counts["cached_tokens"],
+        "cache_creation_tokens": counts["cache_creation_tokens"],
+        "cache_miss_tokens": cache_miss_tokens,
+        "cache_hit_rate": cache_hit_rate,
+        "cache_miss_rate": cache_miss_rate,
+        "cost_usd": 0.0,
+    }
+    events = state.get("usage_events") if isinstance(state.get("usage_events"), list) else []
+    events.append(event)
+    state["usage_events"] = events[-MAX_USAGE_EVENTS:]
     _write_bridge_state(state)
 
 
@@ -1934,6 +1988,40 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         suffix = match.group(2) or "/"
         return account_id, suffix
 
+    def _usage_context(
+        self,
+        *,
+        request_type: str,
+        route_path: str,
+        original_body: dict[str, Any],
+        actual_model: str | None,
+    ) -> dict[str, Any]:
+        requested_model = original_body.get("model") if isinstance(original_body.get("model"), str) else actual_model
+        requested_model_id = normalize_bridge_model_id(requested_model)
+        desktop_route = requested_model_id in claude_desktop_model_route_map()
+        user_agent = str(self.headers.get("User-Agent") or "").lower()
+        if desktop_route:
+            client_label = "Claude Desktop 3P"
+        elif request_type == "messages":
+            client_label = "Claude Code / Anthropic"
+        elif request_type == "chat.completions":
+            client_label = "Hermes / OpenAI Chat" if "hermes" in user_agent else "OpenAI Chat"
+        elif request_type == "responses":
+            client_label = "Codex / OpenAI Responses" if "codex" in user_agent else "OpenAI Responses"
+        else:
+            client_label = request_type
+        client_address = getattr(self, "client_address", None)
+        client_port = client_address[1] if isinstance(client_address, tuple) and len(client_address) > 1 else 0
+        return {
+            "requested_model": requested_model or "",
+            "actual_model": actual_model or "",
+            "route_path": route_path,
+            "bridge_port": int(getattr(self.server, "server_port", 0) or 0),
+            "client_port": int(client_port or 0),
+            "client_label": client_label,
+            "desktop_route": desktop_route,
+        }
+
     def do_GET(self) -> None:
         route_account_id, route_path = self._resolve_account_route()
         if route_path == "/health":
@@ -2206,6 +2294,12 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         upstream_url = f"{UPSTREAM_BASE_URL}/responses"
         max_attempts = stream_max_retries() + 1 if is_stream else 1
         started_at = time.monotonic()
+        usage_context = self._usage_context(
+            request_type=request_type,
+            route_path=route_path,
+            original_body=original_body,
+            actual_model=requested_model,
+        )
 
         for account_index, candidate_account_id in enumerate(candidate_account_ids):
             account_id, access_token = self.server.auth_store.get_access_token(candidate_account_id)
@@ -2272,9 +2366,18 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             record_bridge_usage(
                                 account_id=account_id,
                                 model=requested_model,
+                                requested_model=usage_context.get("requested_model"),
                                 request_type=request_type,
                                 request_id=request_id,
                                 usage=response_body.get("usage") if isinstance(response_body, dict) else None,
+                                duration_ms=int((time.monotonic() - started_at) * 1000),
+                                status_code=response.status_code,
+                                source="proxy",
+                                route_path=route_path,
+                                bridge_port=usage_context.get("bridge_port"),
+                                client_port=usage_context.get("client_port"),
+                                client_label=str(usage_context.get("client_label") or ""),
+                                desktop_route=bool(usage_context.get("desktop_route")),
                             )
                             if output_format == "messages":
                                 response_body = responses_json_to_anthropic_message(response_body, requested_model)
@@ -2296,6 +2399,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             requested_model=requested_model,
                             upstream_request_id=upstream_request_id,
                             metrics=metrics,
+                            usage_context=usage_context,
                         )
                         chunks: Any = iter(())
                         try:
@@ -2423,6 +2527,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         requested_model: str | None = None,
         upstream_request_id: str | None = None,
         metrics: BridgeStreamMetrics | None = None,
+        usage_context: dict[str, Any] | None = None,
     ):
         block_queue: queue.Queue[list[str] | BaseException | object] = queue.Queue(maxsize=16)
         done_marker = object()
@@ -2562,9 +2667,18 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         record_bridge_usage(
                             account_id=account_id,
                             model=requested_model,
+                            requested_model=(usage_context or {}).get("requested_model"),
                             request_type="responses",
                             request_id=stream_request_id,
                             usage=usage_counts,
+                            duration_ms=int((time.monotonic() - stream_started_at) * 1000),
+                            status_code=response.status_code,
+                            source="proxy",
+                            route_path=str((usage_context or {}).get("route_path") or ""),
+                            bridge_port=(usage_context or {}).get("bridge_port"),
+                            client_port=(usage_context or {}).get("client_port"),
+                            client_label=str((usage_context or {}).get("client_label") or ""),
+                            desktop_route=bool((usage_context or {}).get("desktop_route")),
                         )
                         usage_recorded = True
                 terminal_error = terminal_stream_error_from_payload(event_name, payload)

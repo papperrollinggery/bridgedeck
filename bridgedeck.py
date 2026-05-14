@@ -6,8 +6,10 @@ import base64
 import copy
 import datetime as dt
 import hashlib
+import html
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -37,7 +39,12 @@ DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH = Path.home() / ".claude" / "plugins" / "i
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CODEX_AUTH_PATH = DEFAULT_CODEX_HOME / "auth.json"
 DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
-DEFAULT_LOCAL_BRIDGE_STATE_PATH = Path.home() / ".cc-switch" / "bridgedeck-local-bridge-state.json"
+DEFAULT_LOCAL_BRIDGE_STATE_PATH = Path(
+    os.environ.get(
+        "BRIDGEDECK_LOCAL_BRIDGE_STATE_PATH",
+        str(Path.home() / ".cc-switch" / "bridgedeck-local-bridge-state.json"),
+    )
+)
 DEFAULT_OMC_CODEX_SHIM_PATHS = (
     DEFAULT_CLI_LAUNCHER_DIR / "bin" / "codex",
     Path.home() / ".codebuddy" / "bin" / "codex",
@@ -47,7 +54,7 @@ DEFAULT_ZPROFILE_PATH = Path.home() / ".zprofile"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.18"
+APP_VERSION = "0.2.19"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -110,6 +117,21 @@ MANAGED_CODEX_PATH_START = "# >>> BridgeDeck codex shim >>>"
 MANAGED_CODEX_PATH_END = "# <<< BridgeDeck codex shim <<<"
 PROXY_DIAG_OPENAI_URL = "https://api.openai.com/v1/models"
 PROXY_DIAG_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_OAUTH_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
+CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_OAUTH_REDIRECT_URI = "http://localhost:1455/auth/callback"
+CODEX_OAUTH_CALLBACK_HOST = "127.0.0.1"
+CODEX_OAUTH_CALLBACK_PORT = 1455
+CODEX_OAUTH_SCOPE = "openid profile email offline_access"
+CODEX_DEVICE_SCOPE = "openid profile email"
+CODEX_DEVICE_USERCODE_URL = "https://auth.openai.com/api/accounts/deviceauth/usercode"
+CODEX_DEVICE_TOKEN_URL = "https://auth.openai.com/api/accounts/deviceauth/token"
+CODEX_DEVICE_VERIFY_URL = "https://auth.openai.com/codex/device"
+CODEX_DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
+CODEX_DEVICE_CODE_VERIFIER = "cc-switch-codex-oauth"
+CODEX_DEVICE_USER_AGENT = "cc-switch-codex-oauth"
+CODEX_OAUTH_FLOW_TTL_SECS = 10 * 60
 
 
 def now_ts() -> str:
@@ -388,6 +410,165 @@ def jwt_identity(token: str | None) -> dict[str, Any]:
     }
 
 
+def pkce_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def codex_oauth_authorize_url(state: str, challenge: str) -> str:
+    query = urllib.parse.urlencode(
+        {
+            "response_type": "code",
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+            "redirect_uri": CODEX_OAUTH_REDIRECT_URI,
+            "scope": CODEX_OAUTH_SCOPE,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+            "id_token_add_organizations": "true",
+            "codex_cli_simplified_flow": "true",
+            "originator": "bridgedeck",
+        }
+    )
+    return f"{CODEX_OAUTH_AUTHORIZE_URL}?{query}"
+
+
+def parse_oauth_code_input(value: str) -> dict[str, str]:
+    text = value.strip()
+    if not text:
+        return {}
+    try:
+        parsed = urllib.parse.urlsplit(text)
+        if parsed.query:
+            params = urllib.parse.parse_qs(parsed.query)
+            return {
+                "code": (params.get("code") or [""])[0],
+                "state": (params.get("state") or [""])[0],
+            }
+    except Exception:
+        pass
+    if "#" in text and "code=" not in text:
+        code, state = text.split("#", 1)
+        return {"code": code.strip(), "state": state.strip()}
+    if "code=" in text:
+        params = urllib.parse.parse_qs(text.lstrip("?"))
+        return {
+            "code": (params.get("code") or [""])[0],
+            "state": (params.get("state") or [""])[0],
+        }
+    return {"code": text, "state": ""}
+
+
+class CodexDeviceAuthorizationPending(RuntimeError):
+    pass
+
+
+def _openai_oauth_opener() -> urllib.request.OpenerDirector:
+    proxy_url, _ = detect_codex_proxy_url()
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+
+
+def _post_json_url(url: str, payload: dict[str, Any], *, user_agent: str) -> dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": user_agent,
+        },
+        method="POST",
+    )
+    try:
+        with _openai_oauth_opener().open(request, timeout=30) as response:
+            parsed = json.loads(response.read(MAX_REQUEST_BYTES).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1200).decode("utf-8", "replace")
+        try:
+            parsed_detail = json.loads(detail)
+            code = str(((parsed_detail.get("error") or {}) if isinstance(parsed_detail, dict) else {}).get("code") or "")
+        except Exception:
+            code = ""
+        if code == "deviceauth_authorization_unknown":
+            raise CodexDeviceAuthorizationPending("等待用户完成设备授权") from exc
+        raise RuntimeError(f"Device authorization failed: HTTP {exc.code} {truncate_log_text(detail)}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Device authorization failed: invalid response")
+    return parsed
+
+
+def request_codex_device_code() -> dict[str, Any]:
+    payload = _post_json_url(
+        CODEX_DEVICE_USERCODE_URL,
+        {"client_id": CODEX_OAUTH_CLIENT_ID, "scope": CODEX_DEVICE_SCOPE},
+        user_agent=CODEX_DEVICE_USER_AGENT,
+    )
+    if not payload.get("device_auth_id") or not payload.get("user_code"):
+        raise RuntimeError("Device authorization failed: missing user_code")
+    return payload
+
+
+def exchange_codex_device_auth(device_auth_id: str, user_code: str) -> dict[str, Any]:
+    payload = _post_json_url(
+        CODEX_DEVICE_TOKEN_URL,
+        {
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+            "device_auth_id": device_auth_id,
+            "user_code": user_code,
+        },
+        user_agent=CODEX_DEVICE_USER_AGENT,
+    )
+    if payload.get("access_token") and payload.get("refresh_token"):
+        return payload
+    code = str(payload.get("authorization_code") or payload.get("code") or "")
+    if not code:
+        raise RuntimeError("Device authorization failed: missing authorization code")
+    return exchange_codex_oauth_code(
+        code,
+        CODEX_DEVICE_CODE_VERIFIER,
+        redirect_uri=CODEX_DEVICE_REDIRECT_URI,
+    )
+
+
+def exchange_codex_oauth_code(
+    code: str,
+    verifier: str,
+    *,
+    redirect_uri: str = CODEX_OAUTH_REDIRECT_URI,
+) -> dict[str, Any]:
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "authorization_code",
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": redirect_uri,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        CODEX_OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "bridgedeck-codex-oauth",
+        },
+        method="POST",
+    )
+    try:
+        with _openai_oauth_opener().open(request, timeout=30) as response:
+            payload = json.loads(response.read(MAX_REQUEST_BYTES).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1200).decode("utf-8", "replace")
+        raise RuntimeError(f"OAuth token exchange failed: HTTP {exc.code} {truncate_log_text(detail)}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("OAuth token exchange failed: invalid response")
+    if not payload.get("access_token") or not payload.get("refresh_token"):
+        raise RuntimeError("OAuth token exchange failed: missing token fields")
+    return payload
+
+
 def classify_error_text(text: str | None) -> str:
     value = (text or "").lower()
     if "refresh_token_reused" in value or "refresh token reused" in value:
@@ -539,6 +720,18 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def safe_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(result):
+        return default
+    return result
+
+
 def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dict[str, Any]:
     if not path.exists() or path.is_symlink():
         return {}
@@ -558,12 +751,52 @@ def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dic
             "total_tokens": safe_int(usage.get("total_tokens"), 0),
             "cached_tokens": safe_int(usage.get("cached_tokens"), 0),
             "cache_creation_tokens": safe_int(usage.get("cache_creation_tokens"), 0),
+            "cache_miss_tokens": safe_int(usage.get("cache_miss_tokens"), 0),
+            "cache_hit_rate": safe_float(usage.get("cache_hit_rate"), 0.0),
+            "cache_miss_rate": safe_float(usage.get("cache_miss_rate"), 0.0),
             "last_account_id": str(usage.get("last_account_id") or ""),
             "last_model": str(usage.get("last_model") or ""),
+            "last_requested_model": str(usage.get("last_requested_model") or ""),
             "last_request_type": str(usage.get("last_request_type") or ""),
             "last_request_id": str(usage.get("last_request_id") or ""),
+            "last_duration_ms": safe_int(usage.get("last_duration_ms"), 0),
+            "last_status_code": safe_int(usage.get("last_status_code"), 0),
+            "last_bridge_port": safe_int(usage.get("last_bridge_port"), 0),
+            "last_client_label": str(usage.get("last_client_label") or ""),
             "last_updated_at": usage.get("last_updated_at"),
         }
+    events = payload.get("usage_events")
+    if isinstance(events, list):
+        state["usage_events"] = [
+            {
+                "at": safe_int(item.get("at"), 0),
+                "account_id": str(item.get("account_id") or ""),
+                "model": str(item.get("model") or ""),
+                "actual_model": str(item.get("actual_model") or item.get("model") or ""),
+                "requested_model": str(item.get("requested_model") or item.get("model") or ""),
+                "request_type": str(item.get("request_type") or ""),
+                "request_id": str(item.get("request_id") or ""),
+                "status_code": safe_int(item.get("status_code"), 0),
+                "source": str(item.get("source") or ""),
+                "route_path": str(item.get("route_path") or ""),
+                "bridge_port": safe_int(item.get("bridge_port"), 0),
+                "client_port": safe_int(item.get("client_port"), 0),
+                "client_label": str(item.get("client_label") or ""),
+                "desktop_route": bool(item.get("desktop_route")),
+                "duration_ms": safe_int(item.get("duration_ms"), 0),
+                "input_tokens": safe_int(item.get("input_tokens"), 0),
+                "output_tokens": safe_int(item.get("output_tokens"), 0),
+                "total_tokens": safe_int(item.get("total_tokens"), 0),
+                "cached_tokens": safe_int(item.get("cached_tokens"), 0),
+                "cache_creation_tokens": safe_int(item.get("cache_creation_tokens"), 0),
+                "cache_miss_tokens": safe_int(item.get("cache_miss_tokens"), 0),
+                "cache_hit_rate": safe_float(item.get("cache_hit_rate"), 0.0),
+                "cache_miss_rate": safe_float(item.get("cache_miss_rate"), 0.0),
+                "cost_usd": safe_float(item.get("cost_usd"), 0.0),
+            }
+            for item in events[-200:]
+            if isinstance(item, dict)
+        ]
     error = payload.get("last_stream_error")
     if not isinstance(error, dict):
         return state
@@ -709,10 +942,35 @@ class ManagerPaths:
     auth_store: Path
 
 
+@dataclass
+class CodexOAuthFlow:
+    flow_id: str
+    set_default: bool
+    created_at: float
+    state: str = ""
+    verifier: str = ""
+    auth_url: str = ""
+    status: str = "pending"
+    device_auth_id: str = ""
+    user_code: str = ""
+    verification_url: str = CODEX_DEVICE_VERIFY_URL
+    interval: int = 5
+    expires_at: str = ""
+    next_poll_at: float = 0.0
+    bridge_provider_exists: bool = False
+    account_id: str = ""
+    email: str = ""
+    error: str = ""
+
+
 class BridgeManager:
     def __init__(self, paths: ManagerPaths) -> None:
         self.paths = paths
         self._lock = threading.RLock()
+        self._oauth_lock = threading.RLock()
+        self._oauth_flows: dict[str, CodexOAuthFlow] = {}
+        self._oauth_callback_server: ThreadingHTTPServer | None = None
+        self._oauth_callback_thread: threading.Thread | None = None
 
     def _backup_file(self, path: Path, label: str) -> str | None:
         if not path.exists():
@@ -729,6 +987,307 @@ class BridgeManager:
         conn = sqlite3.connect(str(self.paths.db))
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _cleanup_oauth_flows(self) -> None:
+        cutoff = time.time() - CODEX_OAUTH_FLOW_TTL_SECS
+        expired = [
+            flow_id
+            for flow_id, flow in self._oauth_flows.items()
+            if flow.created_at < cutoff and flow.status == "pending"
+        ]
+        for flow_id in expired:
+            self._oauth_flows.pop(flow_id, None)
+
+    def _oauth_flow_payload(self, flow: CodexOAuthFlow) -> dict[str, Any]:
+        return {
+            "ok": flow.status != "error",
+            "flow_id": flow.flow_id,
+            "status": flow.status,
+            "auth_url": flow.auth_url,
+            "verification_url": flow.verification_url,
+            "user_code": flow.user_code,
+            "interval": flow.interval,
+            "expires_at": flow.expires_at,
+            "set_default": flow.set_default,
+            "bridge_provider_exists": flow.bridge_provider_exists,
+            "account_id": mask_id_value(flow.account_id),
+            "email": mask_email_value(flow.email),
+            "error": flow.error,
+        }
+
+    def _ensure_oauth_callback_server(self) -> dict[str, Any]:
+        with self._oauth_lock:
+            if self._oauth_callback_server:
+                return {"ok": True, "port": CODEX_OAUTH_CALLBACK_PORT}
+
+            manager = self
+
+            class OAuthCallbackHandler(BaseHTTPRequestHandler):
+                def do_GET(self) -> None:
+                    parsed = urllib.parse.urlsplit(self.path)
+                    if parsed.path != "/auth/callback":
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+                    params = urllib.parse.parse_qs(parsed.query)
+                    state = (params.get("state") or [""])[0]
+                    code = (params.get("code") or [""])[0]
+                    try:
+                        result = manager.complete_codex_oauth_callback(state, code)
+                        ok = bool(result.get("ok"))
+                        title = "BridgeDeck 授权完成" if ok else "BridgeDeck 授权失败"
+                        detail = str(result.get("message") or result.get("error") or "")
+                        status = 200 if ok else 400
+                    except Exception as exc:  # noqa: BLE001
+                        title = "BridgeDeck 授权失败"
+                        detail = str(exc)
+                        status = 400
+                    safe_title = html.escape(title)
+                    safe_detail = html.escape(detail)
+                    body = (
+                        "<!doctype html><meta charset='utf-8'>"
+                        f"<title>{safe_title}</title>"
+                        "<body style='font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
+                        "background:#0c0f14;color:#edf2fb;padding:32px'>"
+                        f"<h1>{safe_title}</h1><p>{safe_detail}</p><p>可以关闭这个窗口。</p></body>"
+                    ).encode("utf-8")
+                    self.send_response(status)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, fmt: str, *args: Any) -> None:
+                    return
+
+            try:
+                server = ThreadingHTTPServer((CODEX_OAUTH_CALLBACK_HOST, CODEX_OAUTH_CALLBACK_PORT), OAuthCallbackHandler)
+            except OSError as exc:
+                return {"ok": False, "port": CODEX_OAUTH_CALLBACK_PORT, "error": str(exc)}
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self._oauth_callback_server = server
+            self._oauth_callback_thread = thread
+            return {"ok": True, "port": CODEX_OAUTH_CALLBACK_PORT}
+
+    def start_codex_oauth(self, *, set_default: bool = False) -> dict[str, Any]:
+        device = request_codex_device_code()
+        interval_raw = str(device.get("interval") or "5")
+        try:
+            interval = max(2, min(30, int(float(interval_raw))))
+        except ValueError:
+            interval = 5
+        flow = CodexOAuthFlow(
+            flow_id=uuid.uuid4().hex,
+            set_default=bool(set_default),
+            created_at=time.time(),
+            auth_url=CODEX_DEVICE_VERIFY_URL,
+            device_auth_id=str(device.get("device_auth_id") or ""),
+            user_code=str(device.get("user_code") or ""),
+            verification_url=CODEX_DEVICE_VERIFY_URL,
+            interval=interval,
+            expires_at=str(device.get("expires_at") or ""),
+            next_poll_at=time.time() + interval,
+        )
+        with self._oauth_lock:
+            self._cleanup_oauth_flows()
+            self._oauth_flows[flow.flow_id] = flow
+        result = self._oauth_flow_payload(flow)
+        result.update(
+            {
+                "ok": True,
+                "callback_server": False,
+                "callback_port": 0,
+                "callback_error": "",
+                "message": "验证码已生成",
+            }
+        )
+        return result
+
+    def codex_oauth_status(self, flow_id: str) -> dict[str, Any]:
+        with self._oauth_lock:
+            self._cleanup_oauth_flows()
+            flow = self._oauth_flows.get(flow_id)
+            if not flow:
+                return {"ok": False, "status": "missing", "error": "授权流程不存在或已过期"}
+            should_poll = bool(flow.device_auth_id and flow.user_code and flow.status == "pending" and time.time() >= flow.next_poll_at)
+        if should_poll:
+            return self._complete_codex_device_flow(flow)
+        return self._oauth_flow_payload(flow)
+
+    def complete_codex_oauth(self, flow_id: str, code_input: str) -> dict[str, Any]:
+        parsed = parse_oauth_code_input(code_input)
+        code = parsed.get("code") or ""
+        incoming_state = parsed.get("state") or ""
+        if not code:
+            raise ValueError("缺少授权 code")
+        with self._oauth_lock:
+            flow = self._oauth_flows.get(flow_id)
+            if not flow:
+                raise ValueError("授权流程不存在或已过期")
+            if flow.device_auth_id and flow.user_code:
+                return self._complete_codex_device_flow(flow)
+            if incoming_state and incoming_state != flow.state:
+                flow.status = "error"
+                flow.error = "OAuth state 不一致"
+                raise ValueError(flow.error)
+        return self._complete_codex_oauth_flow(flow, code)
+
+    def complete_codex_oauth_callback(self, state: str, code: str) -> dict[str, Any]:
+        if not state or not code:
+            raise ValueError("缺少 OAuth state 或 code")
+        with self._oauth_lock:
+            flow = next((item for item in self._oauth_flows.values() if item.state == state), None)
+            if not flow:
+                raise ValueError("OAuth state 不存在或已过期")
+        return self._complete_codex_oauth_flow(flow, code)
+
+    def _bridge_provider_for_account(self, account_id: str) -> dict[str, Any] | None:
+        if not account_id:
+            return None
+        with self._connect() as conn:
+            row = self._select_existing_bridge_provider_for_account(conn, account_id)
+            if not row:
+                return None
+            return {"id": str(row["id"]), "name": str(row["name"])}
+
+    def apply_codex_oauth_bridge(self, flow_id: str) -> dict[str, Any]:
+        with self._oauth_lock:
+            flow = self._oauth_flows.get(flow_id)
+            if not flow:
+                raise ValueError("授权流程不存在或已过期")
+            if flow.status != "completed" or not flow.account_id:
+                raise ValueError("账号尚未完成授权")
+            account_id = flow.account_id
+
+        existing = self._bridge_provider_for_account(account_id)
+        snapshot = self.snapshot(include_secrets=False)
+        providers = [p for p in snapshot.get("providers", []) if isinstance(p, dict)]
+        existing_names = {str(provider.get("name") or "") for provider in providers}
+        quota: dict[str, Any] = {}
+        try:
+            quota_rows = self.quotas().get("quotas", [])
+            quota = next(
+                (
+                    item
+                    for item in quota_rows
+                    if isinstance(item, dict) and str(item.get("account_id") or "") == account_id
+                ),
+                {},
+            )
+        except Exception:
+            quota = {}
+
+        provider_name = str(existing.get("name") or "") if existing else self._provider_name_for_quota(account_id, quota, existing_names)
+        result = self.create_or_update_provider(account_id, provider_name, False)
+        mode = "updated" if existing else "created"
+        with self._oauth_lock:
+            flow.bridge_provider_exists = True
+        return {
+            "ok": True,
+            "mode": mode,
+            "provider_id": result.get("provider_id"),
+            "provider_name": result.get("provider_name") or provider_name,
+            "message": "已更新 CC Switch Local Bridge" if existing else "已加入 CC Switch Local Bridge",
+        }
+
+    def _complete_codex_device_flow(self, flow: CodexOAuthFlow) -> dict[str, Any]:
+        with self._oauth_lock:
+            if flow.status == "completed":
+                return {**self._oauth_flow_payload(flow), "message": "该账号已完成授权"}
+            if flow.status == "exchanging":
+                return {**self._oauth_flow_payload(flow), "message": "正在交换 token"}
+            flow.status = "exchanging"
+            flow.error = ""
+        try:
+            token_data = exchange_codex_device_auth(flow.device_auth_id, flow.user_code)
+            account_id = self._save_codex_oauth_account(token_data, set_default=flow.set_default)
+            identity = jwt_identity(str(token_data.get("access_token") or ""))
+            with self._oauth_lock:
+                flow.status = "completed"
+                flow.account_id = account_id
+                flow.email = str(identity.get("email") or "")
+                flow.bridge_provider_exists = self._bridge_provider_for_account(account_id) is not None
+                flow.error = ""
+                return {
+                    **self._oauth_flow_payload(flow),
+                    "message": f"授权完成：{mask_email_value(flow.email) or mask_id_value(account_id)}",
+                }
+        except CodexDeviceAuthorizationPending:
+            with self._oauth_lock:
+                flow.status = "pending"
+                flow.error = ""
+                flow.next_poll_at = time.time() + flow.interval
+                return {**self._oauth_flow_payload(flow), "message": "等待用户输入验证码并确认"}
+        except Exception as exc:  # noqa: BLE001
+            with self._oauth_lock:
+                flow.status = "error"
+                flow.error = str(exc)
+                return self._oauth_flow_payload(flow)
+
+    def _complete_codex_oauth_flow(self, flow: CodexOAuthFlow, code: str) -> dict[str, Any]:
+        with self._oauth_lock:
+            if flow.status == "completed":
+                return {**self._oauth_flow_payload(flow), "message": "该账号已完成授权"}
+            if flow.status == "exchanging":
+                return {**self._oauth_flow_payload(flow), "message": "正在交换 token"}
+            flow.status = "exchanging"
+            flow.error = ""
+        try:
+            token_data = exchange_codex_oauth_code(code, flow.verifier)
+            account_id = self._save_codex_oauth_account(token_data, set_default=flow.set_default)
+            identity = jwt_identity(str(token_data.get("access_token") or ""))
+            with self._oauth_lock:
+                flow.status = "completed"
+                flow.account_id = account_id
+                flow.email = str(identity.get("email") or "")
+                flow.bridge_provider_exists = self._bridge_provider_for_account(account_id) is not None
+                flow.error = ""
+                return {
+                    **self._oauth_flow_payload(flow),
+                    "message": f"授权完成：{mask_email_value(flow.email) or mask_id_value(account_id)}",
+                }
+        except Exception as exc:  # noqa: BLE001
+            with self._oauth_lock:
+                flow.status = "error"
+                flow.error = str(exc)
+                return self._oauth_flow_payload(flow)
+
+    def _save_codex_oauth_account(self, token_data: dict[str, Any], *, set_default: bool) -> str:
+        access_token = str(token_data.get("access_token") or "")
+        refresh_token = str(token_data.get("refresh_token") or "")
+        if not access_token or not refresh_token:
+            raise RuntimeError("OAuth token response missing required fields")
+        identity = jwt_identity(access_token)
+        account_id = str(identity.get("account_id") or token_data.get("account_id") or "")
+        if not account_id:
+            raise RuntimeError("无法从 token 识别 ChatGPT account_id")
+        email = str(identity.get("email") or "")
+        with self._lock:
+            raw = load_json(self.paths.auth_store, {})
+            store = raw if isinstance(raw, dict) else {}
+            accounts = store.get("accounts") if isinstance(store.get("accounts"), dict) else {}
+            next_accounts = copy.deepcopy(accounts)
+            next_accounts[account_id] = {
+                "account_id": account_id,
+                "email": email,
+                "refresh_token": refresh_token,
+                "authenticated_at": int(time.time()),
+            }
+            default_account_id = str(store.get("default_account_id") or "")
+            if set_default or not default_account_id:
+                default_account_id = account_id
+            next_store = {
+                "version": 1,
+                "accounts": next_accounts,
+                "default_account_id": default_account_id,
+            }
+            before = json.dumps(store, ensure_ascii=False, sort_keys=True)
+            after = json.dumps(next_store, ensure_ascii=False, sort_keys=True)
+            if before != after:
+                self._backup_file(self.paths.auth_store, "codex-oauth")
+                dump_json(self.paths.auth_store, next_store)
+        return account_id
 
     def _provider_columns(self, conn: sqlite3.Connection) -> set[str]:
         rows = conn.execute("PRAGMA table_info(providers)").fetchall()
@@ -2129,6 +2688,7 @@ class BridgeManager:
             plugin_status = self.claude_plugin_sync_status()
         except Exception as exc:  # noqa: BLE001
             plugin_status = {"ok": False, "error": str(exc)}
+        local_bridge_state = read_local_bridge_state()
         data: dict[str, Any] = {
             "version": APP_VERSION,
             "paths": {
@@ -2153,7 +2713,8 @@ class BridgeManager:
             "codex_desktop": self._codex_desktop_status(),
             "current_codex_launcher": self._current_codex_launcher_status(),
             "omc_codex_shim": self._omc_codex_shim_status(),
-            "usage_metrics": read_local_bridge_state().get("usage_metrics", {}),
+            "usage_metrics": local_bridge_state.get("usage_metrics", {}),
+            "usage_events": local_bridge_state.get("usage_events", []),
             "account_matrix": [],
             "current_provider_from_settings": self._current_provider_from_settings(),
             "auto_switch": self._load_auto_switch_config(),
@@ -3268,6 +3829,9 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     usage_metrics = redacted.get("usage_metrics")
     if isinstance(usage_metrics, dict):
         usage_metrics["last_account_id"] = mask_id_value(usage_metrics.get("last_account_id"))
+    for event in redacted.get("usage_events", []):
+        if isinstance(event, dict):
+            event["account_id"] = mask_id_value(event.get("account_id"))
     codex_auth = redacted.get("codex_auth")
     if isinstance(codex_auth, dict):
         codex_auth.pop("path", None)
@@ -3333,15 +3897,17 @@ INDEX_HTML = """<!doctype html>
     .navItem:hover, .navItem.active { background:var(--focus); border-color:#315077; color:var(--text); }
     .navHint { color:var(--muted); font-size:11px; font-weight:600; }
     .sidePanel { margin-top:auto; border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--panel2); }
-    .workspace { min-width:0; padding:20px; display:grid; grid-template-columns:minmax(0, 1fr) 300px; gap:16px; align-items:start; align-content:start; }
-    .topBar { grid-column:1 / -1; grid-row:1; display:flex; justify-content:space-between; gap:16px; align-items:flex-start; padding:16px; border:1px solid var(--line); border-radius:8px; background:var(--surface); }
+    .workspace { width:100%; min-width:0; box-sizing:border-box; padding:20px; display:grid; grid-template-columns:minmax(0, 1fr) 300px; gap:16px; align-items:start; align-content:start; }
+    .topBar { grid-column:1 / -1; grid-row:1; justify-self:stretch; width:100%; display:flex; justify-content:space-between; gap:16px; align-items:flex-start; padding:16px; border:1px solid var(--line); border-radius:8px; background:var(--surface); }
     .topBar h1 { margin:0; font-size:24px; }
     .topBar p { margin:6px 0 0; color:var(--muted); font-size:13px; }
     .topActions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
-    .pageStack { grid-column:1; grid-row:2; min-width:0; }
+    .pageStack { grid-column:1; grid-row:2; justify-self:stretch; width:100%; min-width:0; }
     .deckPage { display:none; }
     .deckPage.active { display:block; }
-    .guideDock { grid-column:2; grid-row:2; position:sticky; top:20px; }
+    .guideDock { grid-column:2; grid-row:2; justify-self:stretch; width:100%; position:sticky; top:20px; }
+    body.usageMode .workspace { grid-template-columns:minmax(0, 1fr); }
+    body.usageMode .guideDock { display:none; }
     .card, .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:14px; }
     .panel.subtle { background:var(--panel2); }
     .pageHeader { display:flex; justify-content:space-between; gap:14px; align-items:flex-start; margin-bottom:14px; }
@@ -3381,7 +3947,39 @@ INDEX_HTML = """<!doctype html>
     .metricIcon.bad { background:#351717; color:#ff8e8e; }
     .metricValue { font-size:32px; line-height:1; font-weight:900; letter-spacing:0; }
     .metricSub { border-top:1px solid var(--line); padding-top:10px; display:grid; gap:5px; color:var(--muted); font-size:12px; }
-    .metricLine { display:flex; justify-content:space-between; gap:10px; }
+    .metricLine { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
+    .metricLine span { flex:0 0 auto; white-space:nowrap; }
+    .metricLine strong { flex:1 1 auto; min-width:0; text-align:right; overflow-wrap:anywhere; }
+    .metricEllipsis { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; overflow-wrap:normal; }
+    .hudPanel { border:1px solid var(--line); border-radius:8px; padding:16px; background:#101720; display:grid; grid-template-columns:340px minmax(0, 1fr); gap:16px; align-items:center; }
+    .hudDial { position:relative; min-height:230px; display:grid; place-items:center; }
+    .hudDial::before { content:""; width:220px; height:220px; border-radius:50%; background:
+      conic-gradient(from 225deg, var(--ok) 0 var(--hit-angle, 0deg), #2b3545 var(--hit-angle, 0deg) 270deg, transparent 270deg 360deg);
+      mask:radial-gradient(circle, transparent 0 63px, #000 64px 100px, transparent 101px);
+      -webkit-mask:radial-gradient(circle, transparent 0 63px, #000 64px 100px, transparent 101px);
+      transform:rotate(45deg);
+    }
+    .hudDial::after { content:""; position:absolute; width:156px; height:156px; border-radius:50%; border:1px solid var(--line); background:#0d121b; }
+    .hudCenter { position:absolute; z-index:1; text-align:center; display:grid; gap:6px; }
+    .hudValue { font-size:44px; line-height:1; font-weight:900; }
+    .hudLabel { color:var(--muted); font-size:12px; font-weight:850; }
+    .hudGrid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
+    .hudStat { border:1px solid var(--line); border-radius:8px; padding:12px; background:var(--panel2); min-height:82px; display:grid; align-content:space-between; gap:8px; }
+    .hudStatLabel { color:var(--muted); font-size:12px; font-weight:850; }
+    .hudStatValue { font-size:22px; font-weight:900; overflow-wrap:anywhere; }
+    .usageControls { display:flex; gap:8px; flex-wrap:wrap; justify-content:space-between; align-items:center; margin:12px 0; }
+    .usageTable table { min-width:0; }
+    .usageTimeCol { width:9%; }
+    .usageEntryCol { width:15%; }
+    .usageProviderCol { width:15%; }
+    .usageModelCol { width:17%; }
+    .usageNumCol { width:6.2%; }
+    .usageStatusCol { width:7%; }
+    .usageEntryMain, .usageModelMain { display:block; color:var(--text); font-weight:850; line-height:1.25; }
+    .usageMeta { display:block; color:var(--muted); font-size:11px; line-height:1.35; margin-top:3px; overflow-wrap:anywhere; }
+    .usageTag { display:inline-flex; align-items:center; width:max-content; max-width:100%; border:1px solid var(--line); border-radius:999px; padding:2px 6px; margin-top:5px; color:var(--soft); background:#111827; font-size:10px; font-weight:850; line-height:1; }
+    .usageTag.desktop { border-color:#2f5f8f; background:#102033; color:#b9dcff; }
+    .usageTag.chat { border-color:#255c43; background:#0f2018; color:#a6f3c6; }
     .overviewGrid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; margin-top:12px; }
     .overviewCard { border:1px solid var(--line); border-radius:8px; padding:13px; background:var(--panel2); min-height:122px; display:grid; gap:8px; align-content:start; }
     .overviewLabel { color:var(--muted); font-size:12px; font-weight:850; }
@@ -3408,6 +4006,14 @@ INDEX_HTML = """<!doctype html>
     .toolSelect { display:grid; gap:6px; margin-top:10px; }
     .toolSelect label, .apiEnvLabel { color:var(--muted); font-size:11px; }
     .toolSelect select { width:100%; min-width:0; }
+    .oauthPanel { display:grid; gap:10px; }
+    .oauthActions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .oauthLinkBox { border:1px solid var(--line); border-radius:8px; background:#0d1320; padding:10px; display:grid; gap:8px; }
+    .oauthLinkBox a { color:#9fd0ff; overflow-wrap:anywhere; }
+    #oauthUserCode { width:max-content; max-width:100%; border:1px solid #2f4160; border-radius:8px; padding:8px 12px; font-size:22px; letter-spacing:0; color:#f6f8ff; background:#111b2e; }
+    #oauthExpiresAt { color:var(--muted); font-size:12px; }
+    .oauthPaste { width:100%; min-height:72px; }
+    .hidden { display:none !important; }
     .actualRow { display:flex; gap:8px; align-items:flex-start; margin-top:8px; }
     .actualLine { flex:1 1 auto; min-width:0; }
     .actualLine strong { color:var(--text); }
@@ -3446,7 +4052,7 @@ INDEX_HTML = """<!doctype html>
     .formGrid label { display:grid; gap:6px; color:var(--muted); font-size:12px; font-weight:700; }
     .formGrid input, .formGrid select { width:100%; min-width:0; }
     .tableWrap { width:100%; overflow:auto; border-radius:8px; border:1px solid var(--line); }
-    table { width:100%; min-width:760px; border-collapse:collapse; table-layout:fixed; font-size:12px; }
+    table { width:100%; min-width:min(760px, 100%); border-collapse:collapse; table-layout:fixed; font-size:12px; }
     th, td { border-bottom:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; overflow-wrap:anywhere; word-break:break-word; }
     th { color:var(--muted); background:#111827; font-weight:800; }
     tr:last-child td { border-bottom:0; }
@@ -3465,14 +4071,19 @@ INDEX_HTML = """<!doctype html>
     .guideTarget { color:var(--muted); font-size:12px; margin-bottom:10px; }
     textarea { width:100%; min-height:220px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
     @media (max-width: 1180px) {
-      .workspace { grid-template-columns:1fr; }
-      .guideDock { position:static; }
+      .workspace { grid-template-columns:minmax(0, 1fr); }
+      .topBar, .pageStack, .guideDock { grid-column:1; }
+      .topBar, .pageStack { grid-row:auto; }
+      .guideDock { grid-row:auto; position:static; }
+      .hudPanel { grid-template-columns:1fr; }
     }
     @media (max-width: 900px) {
       .appShell { grid-template-columns:1fr; }
       .appSidebar { position:static; height:auto; }
       .sideNav { grid-template-columns:repeat(2, minmax(0, 1fr)); }
       .topGrid, .metricGrid, .overviewGrid, .summaryGrid, .splitGrid, .formGrid, .quickActions { grid-template-columns:1fr; }
+      .hudGrid { grid-template-columns:1fr; }
+      .usageTable table { min-width:920px; }
       .topBar { flex-direction:column; }
       input, select { min-width:0; width:100%; }
     }
@@ -3488,6 +4099,7 @@ INDEX_HTML = """<!doctype html>
         </div>
         <nav class="sideNav" aria-label="BridgeDeck sections">
           <button class="navItem active" data-page="overview">总览 <span class="navHint">状态</span></button>
+          <button class="navItem" data-page="usage">使用详情 <span class="navHint">Token</span></button>
           <button class="navItem" data-page="switching">入口切换 <span class="navHint">账号</span></button>
           <button class="navItem" data-page="quota">额度与自动切换 <span class="navHint">OpenAI</span></button>
           <button class="navItem" data-page="claude">Claude Code <span class="navHint">桥接</span></button>
@@ -3546,8 +4158,8 @@ INDEX_HTML = """<!doctype html>
                 <div class="metricHead"><span>额度消耗</span><span id="metricQuotaIcon" class="metricIcon">▣</span></div>
                 <div id="metricQuotaValue" class="metricValue">-</div>
                 <div class="metricSub">
-                  <div class="metricLine"><span>当前账号</span><strong id="metricQuotaAccount">-</strong></div>
-                  <div class="metricLine"><span>剩余单位</span><strong id="metricQuotaRemaining">-</strong></div>
+                  <div class="metricLine"><span>账号</span><strong id="metricQuotaAccount" class="metricEllipsis">-</strong></div>
+                  <div class="metricLine"><span>剩余</span><strong id="metricQuotaRemaining">-</strong></div>
                 </div>
               </div>
               <div class="metricCard">
@@ -3621,6 +4233,61 @@ INDEX_HTML = """<!doctype html>
             </div>
           </section>
 
+          <section class="deckPage" id="page-usage">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">使用详情</h2>
+                <p class="pageDesc">查看 Local Codex Bridge 请求、Token、缓存写入、缓存命中和未命中。</p>
+              </div>
+              <button data-action="refresh">刷新使用详情</button>
+            </div>
+            <div class="hudPanel guideSection" data-guide="usage">
+              <div id="usageHudDial" class="hudDial">
+                <div class="hudCenter">
+                  <div id="usageHudHitRate" class="hudValue">-</div>
+                  <div class="hudLabel">缓存命中率</div>
+                </div>
+              </div>
+              <div class="hudGrid">
+                <div class="hudStat"><div class="hudStatLabel">总请求数</div><div id="usageHudRequests" class="hudStatValue">-</div></div>
+                <div class="hudStat"><div class="hudStatLabel">总 Token</div><div id="usageHudTokens" class="hudStatValue">-</div></div>
+                <div class="hudStat"><div class="hudStatLabel">输入 / 输出</div><div id="usageHudInOut" class="hudStatValue">-</div></div>
+                <div class="hudStat"><div class="hudStatLabel">缓存写入</div><div id="usageHudCacheWrite" class="hudStatValue">-</div></div>
+                <div class="hudStat"><div class="hudStatLabel">命中缓存</div><div id="usageHudCacheRead" class="hudStatValue">-</div></div>
+                <div class="hudStat"><div class="hudStatLabel">未命中缓存</div><div id="usageHudCacheMiss" class="hudStatValue">-</div></div>
+              </div>
+            </div>
+            <div class="usageControls">
+              <div class="sectionHint">明细只保留最近 200 条；账号显示会按当前本机配置做脱敏。</div>
+              <div class="row">
+                <button class="miniBtn" data-page="services">服务状态</button>
+                <button class="miniBtn" data-page="diagnostics">诊断日志</button>
+              </div>
+            </div>
+            <div class="tableWrap usageTable">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="usageTimeCol">时间</th>
+                    <th class="usageEntryCol">入口</th>
+                    <th class="usageProviderCol">供应商</th>
+                    <th class="usageModelCol">模型</th>
+                    <th class="usageNumCol">输入</th>
+                    <th class="usageNumCol">输出</th>
+                    <th class="usageNumCol">缓存写入</th>
+                    <th class="usageNumCol">命中缓存</th>
+                    <th class="usageNumCol">未命中</th>
+                    <th class="usageNumCol">命中率</th>
+                    <th class="usageStatusCol">状态</th>
+                  </tr>
+                </thead>
+                <tbody id="usageRows">
+                  <tr><td colspan="11">加载中...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
           <section class="deckPage" id="page-switching">
             <div class="pageHeader">
               <div>
@@ -3628,6 +4295,29 @@ INDEX_HTML = """<!doctype html>
                 <p class="pageDesc">Claude Code、单独 Codex CLI、全局 Codex CLI 分开选，避免一个操作影响全部。</p>
               </div>
               <button data-action="refresh">刷新状态</button>
+            </div>
+            <div class="panel guideSection oauthPanel" data-guide="oauth">
+              <div>
+                <h2>ChatGPT 授权</h2>
+                <div class="sectionHint">在 BridgeDeck 内新增或重新授权 ChatGPT 账号；完成后写入 CC Switch 使用的 OAuth 账号池。</div>
+              </div>
+              <div class="oauthActions">
+                <button class="primary" data-action="start-codex-oauth">生成授权验证码</button>
+                <label><input type="checkbox" id="oauthSetDefault"> 授权后设为默认账号</label>
+                <button class="miniBtn" data-action="refresh">刷新账号列表</button>
+              </div>
+              <div id="oauthResult" class="simpleResult">未开始授权。</div>
+              <div id="oauthUrlBox" class="oauthLinkBox hidden">
+                <div class="muted">打开 OpenAI 设备授权页，输入下方验证码。</div>
+                <div id="oauthUserCode" class="mono strong">-</div>
+                <div id="oauthExpiresAt">有效期：-</div>
+                <a id="oauthAuthLink" href="#" target="_blank" rel="noopener noreferrer">OpenAI 设备授权页</a>
+                <div class="oauthActions">
+                  <button class="miniBtn" data-action="check-codex-oauth">检查授权状态</button>
+                  <button class="miniBtn hidden" id="oauthApplyBridgeBtn" data-action="apply-codex-oauth-bridge">加入 CC Switch</button>
+                  <button class="miniBtn" data-action="hide-codex-oauth">隐藏验证码</button>
+                </div>
+              </div>
             </div>
             <div class="card guideSection" id="simpleFlowCard" data-guide="simpleFlow">
               <div class="toolGrid">
@@ -3775,7 +4465,7 @@ INDEX_HTML = """<!doctype html>
                       <th class="accountCol">account</th>
                       <th class="urlCol">base_url</th>
                       <th class="smallCol">model</th>
-                      <th class="smallCol">compact</th>
+                      <th class="smallCol">压缩</th>
                       <th class="tokenCol">token</th>
                     </tr>
                   </thead>
@@ -4007,6 +4697,10 @@ INDEX_HTML = """<!doctype html>
     let lastData = null;
     let tokenVisible = false;
     let lastAccounts = [];
+    let activeOAuthFlowId = '';
+    let oauthPollTimer = null;
+    let oauthExpiryTimer = null;
+    let activeOAuthExpiresAt = '';
     const BRIDGE_MODELS = __BRIDGE_MODELS_JSON__;
     const DEFAULT_BRIDGE_MODEL = 'gpt-5.5';
     const DEFAULT_COMPACT_WINDOW = '272000';
@@ -4021,6 +4715,16 @@ INDEX_HTML = """<!doctype html>
       ['claude-opus-4-7', 'gpt-5.5']
     ];
     const GUIDES = {
+      oauth: {
+        title: 'ChatGPT 授权',
+        target: '入口切换：新增或重新授权账号',
+        steps: [
+          '点击“生成授权验证码”。',
+          '在打开的 OpenAI 设备授权页输入验证码。',
+          '确认授权后回到 BridgeDeck 检查状态。',
+          '授权完成后刷新账号列表，再选择入口使用。'
+        ]
+      },
       simpleFlow: {
         title: '日常模式',
         target: '上方板块：每个入口单独选账号',
@@ -4120,6 +4824,17 @@ INDEX_HTML = """<!doctype html>
           'refresh_token 失效时，回 CC Switch 重新登录该账号。',
           'stale_launcher 时，用“迁移旧 CLI 目录”。'
         ]
+      },
+      usage: {
+        title: '使用详情',
+        target: '使用详情版面：HUD 仪表盘和请求列表',
+        steps: [
+          '上方 HUD 看缓存命中率和总 Token。',
+          '输入/输出、缓存写入、命中缓存、未命中缓存分开显示。',
+          '下方列表按最近请求倒序展示。',
+          '状态不是 200 时，切到本地服务或诊断日志排查。',
+          '这里只读本地 bridge 状态，不会切换账号或重启服务。'
+        ]
       }
     };
     function esc(value) {
@@ -4217,6 +4932,51 @@ INDEX_HTML = """<!doctype html>
       if (!Number.isFinite(num)) return '-';
       return new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(num);
     }
+    function fmtPercent(value) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return '-';
+      return `${Math.round(num * 100)}%`;
+    }
+    function fmtDuration(value) {
+      const ms = Number(value);
+      if (!Number.isFinite(ms) || ms <= 0) return '-';
+      return `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`;
+    }
+    function fmtDateTime(value) {
+      const seconds = Number(value);
+      if (!Number.isFinite(seconds) || seconds <= 0) return '-';
+      const date = new Date(seconds * 1000);
+      return date.toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    }
+    function providerNameForUsage(event, data) {
+      const accountId = event && event.account_id ? String(event.account_id) : '';
+      const providers = data.providers || [];
+      const codexProviders = data.codex_providers || [];
+      const current = providers.find((p) => p.is_current && p.account_id === accountId);
+      if (current) return current.name || 'Local Codex Bridge';
+      const provider = providers.find((p) => p.account_id === accountId);
+      if (provider) return provider.name || 'Local Codex Bridge';
+      const codex = codexProviders.find((p) => p.token_account_id === accountId || p.meta_account_id === accountId);
+      if (codex) return codex.name || 'Local Codex Bridge';
+      return accountId ? `Local Codex Bridge - ${maskId(accountId)}` : 'Local Codex Bridge';
+    }
+    function usageModelCell(event) {
+      const requested = String(event.requested_model || event.model || '').trim();
+      const actual = String(event.actual_model || event.model || requested || '').trim();
+      if (requested && actual && requested !== actual) {
+        const routeLabel = event.desktop_route ? 'Desktop 路由' : '映射到实际模型';
+        return `<span class="usageModelMain">${esc(requested)}</span><span class="usageMeta">-> ${esc(actual)}</span><span class="usageTag desktop">${esc(routeLabel)}</span>`;
+      }
+      return `<span class="usageModelMain">${esc(actual || '-')}</span><span class="usageTag chat">实际模型</span>`;
+    }
+    function usageEntryCell(event) {
+      const client = String(event.client_label || event.request_type || '未知入口').trim();
+      const port = Number(event.bridge_port || 0);
+      const route = String(event.request_type || event.route_path || '-').trim();
+      const source = String(event.source || 'proxy').trim();
+      const portText = port > 0 ? `:${port}` : '-';
+      return `<span class="usageEntryMain">${esc(client)}</span><span class="usageMeta">${esc(portText)} / ${esc(route)}</span><span class="usageTag">${esc(source)}</span>`;
+    }
     function setMetricIcon(id, state) {
       const el = document.getElementById(id);
       if (!el) return;
@@ -4271,6 +5031,45 @@ INDEX_HTML = """<!doctype html>
       if (taskBox) {
         taskBox.innerHTML = tasks.map((item) => `<div class="taskItem ${item.cls}">${esc(item.text)}</div>`).join('');
       }
+    }
+    function renderUsageDashboard(data) {
+      const usage = data.usage_metrics || {};
+      const events = Array.isArray(data.usage_events) ? [...data.usage_events].reverse() : [];
+      const hitRate = Number(usage.cache_hit_rate);
+      const hitRateValue = Number.isFinite(hitRate) ? Math.max(0, Math.min(1, hitRate)) : 0;
+      const dial = document.getElementById('usageHudDial');
+      if (dial) dial.style.setProperty('--hit-angle', `${hitRateValue * 270}deg`);
+      setText('usageHudHitRate', Number.isFinite(hitRate) ? fmtPercent(hitRate) : '-');
+      setText('usageHudRequests', fmtMetricNumber(usage.request_count || 0));
+      setText('usageHudTokens', fmtMetricNumber(usage.total_tokens || 0));
+      setText('usageHudInOut', `${fmtMetricNumber(usage.input_tokens || 0)} / ${fmtMetricNumber(usage.output_tokens || 0)}`);
+      setText('usageHudCacheWrite', fmtMetricNumber(usage.cache_creation_tokens || 0));
+      setText('usageHudCacheRead', fmtMetricNumber(usage.cached_tokens || 0));
+      setText('usageHudCacheMiss', `${fmtMetricNumber(usage.cache_miss_tokens || 0)} · ${fmtPercent(usage.cache_miss_rate || 0)}`);
+
+      const body = document.getElementById('usageRows');
+      if (!body) return;
+      if (!events.length) {
+        body.innerHTML = '<tr><td colspan="11">还没有采集到 Local Codex Bridge 使用详情。</td></tr>';
+        return;
+      }
+      body.innerHTML = events.map((event) => {
+        const status = Number(event.status_code || 0);
+        const statusClass = status >= 200 && status < 300 ? 'ok' : (status ? 'bad' : 'muted');
+        return `<tr>
+          <td>${esc(fmtDateTime(event.at))}</td>
+          <td>${usageEntryCell(event)}</td>
+          <td>${esc(providerNameForUsage(event, data))}</td>
+          <td class="mono">${usageModelCell(event)}</td>
+          <td>${esc(fmtMetricNumber(event.input_tokens || 0))}</td>
+          <td>${esc(fmtMetricNumber(event.output_tokens || 0))}</td>
+          <td>${esc(fmtMetricNumber(event.cache_creation_tokens || 0))}</td>
+          <td>${esc(fmtMetricNumber(event.cached_tokens || 0))}</td>
+          <td>${esc(fmtMetricNumber(event.cache_miss_tokens || 0))}</td>
+          <td>${esc(fmtPercent(event.cache_hit_rate || 0))}</td>
+          <td><span class="${statusClass}">${esc(status || '-')}</span><br><span class="muted">${esc(fmtDuration(event.duration_ms))}</span></td>
+        </tr>`;
+      }).join('');
     }
     function renderOverviewQuotaMetrics(payload) {
       const quotas = payload && Array.isArray(payload.quotas) ? payload.quotas : [];
@@ -4615,6 +5414,165 @@ INDEX_HTML = """<!doctype html>
       const cls = level === 'ok' ? 'ok' : (level === 'warn' ? 'warnText' : (level === 'bad' ? 'bad' : ''));
       box.innerHTML = cls ? `<strong class="${cls}">${esc(message)}</strong>` : esc(message);
     }
+    function setOAuthResult(message, level='') {
+      const box = document.getElementById('oauthResult');
+      if (!box) return;
+      const cls = level === 'ok' ? 'ok' : (level === 'warn' ? 'warnText' : (level === 'bad' ? 'bad' : ''));
+      box.innerHTML = cls ? `<strong class="${cls}">${esc(message)}</strong>` : esc(message);
+    }
+    function stopOAuthPolling() {
+      if (oauthPollTimer) clearInterval(oauthPollTimer);
+      oauthPollTimer = null;
+    }
+    function stopOAuthExpiryTimer() {
+      if (oauthExpiryTimer) clearInterval(oauthExpiryTimer);
+      oauthExpiryTimer = null;
+    }
+    function formatOAuthExpiry(expiresAt) {
+      if (!expiresAt) return '有效期：-';
+      const expires = new Date(expiresAt);
+      const ms = expires.getTime() - Date.now();
+      if (!Number.isFinite(expires.getTime())) return '有效期：-';
+      if (ms <= 0) return '有效期：已过期';
+      const totalSeconds = Math.ceil(ms / 1000);
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      const clock = expires.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      return `有效期至 ${clock}，剩余 ${minutes}:${String(seconds).padStart(2, '0')}`;
+    }
+    function updateOAuthExpiry() {
+      const box = document.getElementById('oauthExpiresAt');
+      if (!box) return;
+      box.textContent = formatOAuthExpiry(activeOAuthExpiresAt);
+      if (activeOAuthExpiresAt && Date.parse(activeOAuthExpiresAt) <= Date.now()) {
+        stopOAuthPolling();
+        stopOAuthExpiryTimer();
+        setOAuthResult('验证码已过期，请重新生成。', 'warn');
+      }
+    }
+    function setOAuthBridgeButton(result) {
+      const button = document.getElementById('oauthApplyBridgeBtn');
+      if (!button) return;
+      if (result && result.status === 'completed') {
+        button.classList.remove('hidden');
+        button.textContent = result.bridge_provider_exists ? '更新 CC Switch' : '加入 CC Switch';
+      } else {
+        button.classList.add('hidden');
+        button.textContent = '加入 CC Switch';
+      }
+    }
+    function hideCodexOAuth() {
+      stopOAuthPolling();
+      stopOAuthExpiryTimer();
+      activeOAuthFlowId = '';
+      activeOAuthExpiresAt = '';
+      const box = document.getElementById('oauthUrlBox');
+      if (box) box.classList.add('hidden');
+      setText('oauthUserCode', '-');
+      setText('oauthExpiresAt', '有效期：-');
+      setOAuthBridgeButton(null);
+      setOAuthResult('验证码已隐藏。需要授权时重新生成。');
+    }
+    async function checkCodexOAuthStatus() {
+      if (!activeOAuthFlowId) {
+        setOAuthResult('还没有进行中的授权流程。', 'warn');
+        return null;
+      }
+      const result = await api(`/api/codex-oauth/status?flow_id=${encodeURIComponent(activeOAuthFlowId)}`);
+      if (result.expires_at) {
+        activeOAuthExpiresAt = result.expires_at;
+        updateOAuthExpiry();
+      }
+      setOAuthBridgeButton(result);
+      if (result.status === 'completed') {
+        stopOAuthPolling();
+        stopOAuthExpiryTimer();
+        setOAuthResult(`授权完成：${result.email || result.account_id || '新账号'}`, 'ok');
+        await refreshData();
+      } else if (result.status === 'error') {
+        stopOAuthPolling();
+        stopOAuthExpiryTimer();
+        setOAuthResult(`授权失败：${result.error || '未知错误'}`, 'bad');
+      } else if (result.status === 'exchanging') {
+        setOAuthResult('已确认授权，正在交换 token...');
+      } else {
+        setOAuthResult('等待你在 OpenAI 页面输入验证码并确认...');
+      }
+      return result;
+    }
+    function startOAuthPolling() {
+      stopOAuthPolling();
+      oauthPollTimer = setInterval(() => {
+        checkCodexOAuthStatus().catch((error) => {
+          stopOAuthPolling();
+          setOAuthResult(`授权状态检查失败：${error.message}`, 'bad');
+        });
+      }, 1800);
+    }
+    async function startCodexOAuth() {
+      const setDefault = Boolean(document.getElementById('oauthSetDefault')?.checked);
+      const popup = window.open('about:blank', '_blank');
+      if (popup) popup.opener = null;
+      stopOAuthPolling();
+      stopOAuthExpiryTimer();
+      setOAuthBridgeButton(null);
+      const result = await api('/api/codex-oauth/start', 'POST', { set_default: setDefault });
+      activeOAuthFlowId = result.flow_id || '';
+      activeOAuthExpiresAt = result.expires_at || '';
+      const link = document.getElementById('oauthAuthLink');
+      const codeBox = document.getElementById('oauthUserCode');
+      const box = document.getElementById('oauthUrlBox');
+      if (link) {
+        link.href = result.verification_url || result.auth_url || '#';
+        link.textContent = result.verification_url || result.auth_url || '授权页生成失败';
+      }
+      if (codeBox) {
+        codeBox.textContent = result.user_code || '-';
+      }
+      updateOAuthExpiry();
+      if (box) box.classList.remove('hidden');
+      if (result.user_code) {
+        setOAuthResult(`验证码已生成：${result.user_code}。输入并确认后会自动写入账号池。`);
+      } else {
+        setOAuthResult(result.error || '验证码生成失败。', 'bad');
+      }
+      const authUrl = result.verification_url || result.auth_url || '';
+      if (popup && authUrl) {
+        popup.location.href = authUrl;
+      } else if (authUrl) {
+        window.open(authUrl, '_blank', 'noopener,noreferrer');
+      }
+      oauthExpiryTimer = setInterval(updateOAuthExpiry, 1000);
+      startOAuthPolling();
+    }
+    async function applyCodexOAuthBridge() {
+      if (!activeOAuthFlowId) {
+        setOAuthResult('没有可加入的已授权账号。', 'warn');
+        return null;
+      }
+      const result = await api('/api/codex-oauth/apply-bridge', 'POST', { flow_id: activeOAuthFlowId });
+      setOAuthResult(result.message || 'CC Switch 已更新。', 'ok');
+      const button = document.getElementById('oauthApplyBridgeBtn');
+      if (button) button.textContent = '更新 CC Switch';
+      await refreshData();
+      return result;
+    }
+    async function finishCodexOAuth() {
+      const input = document.getElementById('oauthManualInput');
+      const code = input ? input.value.trim() : '';
+      if (!activeOAuthFlowId || !code) {
+        setOAuthResult('缺少授权流程或 code。', 'warn');
+        return;
+      }
+      const result = await api('/api/codex-oauth/finish', 'POST', { flow_id: activeOAuthFlowId, code });
+      if (result.status === 'completed') {
+        stopOAuthPolling();
+        setOAuthResult(`授权完成：${result.email || result.account_id || '新账号'}`, 'ok');
+        await refreshData();
+      } else {
+        setOAuthResult(result.error || result.message || '授权未完成', result.ok === false ? 'bad' : '');
+      }
+    }
     function selectedProviderId() {
       const chosen = document.querySelector('input[name="providerPick"]:checked');
       return chosen ? chosen.value : '';
@@ -4636,6 +5594,7 @@ INDEX_HTML = """<!doctype html>
       document.querySelectorAll('.navItem[data-page]').forEach((item) => {
         item.classList.toggle('active', item.dataset.page === pageId);
       });
+      document.body.classList.toggle('usageMode', pageId === 'usage');
       if (pushState) sessionStorage.setItem('bridgedeckPage', pageId);
       const guideSection = target.querySelector('.guideSection');
       if (guideSection) setGuide(guideSection.dataset.guide || 'providerCreate');
@@ -5253,6 +6212,7 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('paths').textContent = `db: ${humanPath(data.paths.db)}\\nsettings: ${humanPath(data.paths.settings)}\\nauth_store: ${humanPath(data.paths.auth_store)}`;
       renderHealth(data);
       renderOverviewDashboard(data);
+      renderUsageDashboard(data);
       renderAccounts(data);
       renderAccountMatrix(data);
       renderProviders(data);
@@ -5427,6 +6387,11 @@ INDEX_HTML = """<!doctype html>
         const run = async () => {
           if (action === 'scroll') return scrollToSection(button.dataset.target || '');
           if (action === 'refresh') return refreshData(true);
+          if (action === 'start-codex-oauth') return startCodexOAuth();
+          if (action === 'finish-codex-oauth') return finishCodexOAuth();
+          if (action === 'check-codex-oauth') return checkCodexOAuthStatus();
+          if (action === 'hide-codex-oauth') return hideCodexOAuth();
+          if (action === 'apply-codex-oauth-bridge') return applyCodexOAuthBridge();
           if (action === 'create-provider') return createProvider();
           if (action === 'create-cli-home') return createCliHome();
           if (action === 'simple-claude') return simpleClaude();
@@ -5648,6 +6613,19 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
+            if parsed.path == "/api/codex-oauth/status":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    flow_id = (urllib.parse.parse_qs(parsed.query).get("flow_id") or [""])[0]
+                    json_response(self, 200, manager.codex_oauth_status(flow_id))
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
             json_response(self, 404, {"ok": False, "error": "Not Found"})
 
         def do_POST(self) -> None:
@@ -5769,6 +6747,21 @@ def build_handler(
                 if self.path == "/api/create-missing-bridges":
                     result = manager.create_missing_bridge_providers()
                     json_response(self, 200, result)
+                    return
+                if self.path == "/api/codex-oauth/start":
+                    result = manager.start_codex_oauth(set_default=bool(payload.get("set_default", False)))
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/codex-oauth/apply-bridge":
+                    flow_id = str(payload.get("flow_id") or "")
+                    result = manager.apply_codex_oauth_bridge(flow_id)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/codex-oauth/finish":
+                    flow_id = str(payload.get("flow_id") or "")
+                    code_input = str(payload.get("code") or payload.get("code_or_url") or "")
+                    result = manager.complete_codex_oauth(flow_id, code_input)
+                    json_response(self, 200 if result.get("ok", True) else 400, result)
                     return
                 if self.path == "/api/local-bridge-control":
                     result = manager.control_local_bridge(str(payload.get("action") or ""))

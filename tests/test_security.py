@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import http.client
 import io
+import base64
 import sqlite3
 import tempfile
 import threading
@@ -10,6 +11,7 @@ import time
 import types
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -66,6 +68,12 @@ except ModuleNotFoundError:
     sys.modules["httpx"] = httpx_stub
 
 import local_codex_bridge
+
+
+def fake_jwt(payload: dict[str, Any]) -> str:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(body).decode("ascii").rstrip("=")
+    return f"header.{encoded}.sig"
 
 
 class FakeManager:
@@ -151,9 +159,43 @@ class FakeManager:
                 "total_tokens": 1540,
                 "cached_tokens": 900,
                 "cache_creation_tokens": 100,
+                "cache_miss_tokens": 300,
+                "cache_hit_rate": 0.75,
+                "cache_miss_rate": 0.25,
                 "last_account_id": "01234567-89ab-cdef-0123-456789abcdef",
                 "last_model": "gpt-5.5",
+                "last_requested_model": "claude-opus-4-7",
+                "last_bridge_port": 8876,
+                "last_client_label": "Claude Desktop 3P",
             },
+            "usage_events": [
+                {
+                    "at": 1778736000,
+                    "account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "model": "gpt-5.5",
+                    "actual_model": "gpt-5.5",
+                    "requested_model": "claude-opus-4-7",
+                    "request_type": "messages",
+                    "request_id": "bridge-test",
+                    "status_code": 200,
+                    "source": "proxy",
+                    "route_path": "/v1/messages",
+                    "bridge_port": 8876,
+                    "client_port": 61234,
+                    "client_label": "Claude Desktop 3P",
+                    "desktop_route": True,
+                    "duration_ms": 7650,
+                    "input_tokens": 1200,
+                    "output_tokens": 340,
+                    "total_tokens": 1540,
+                    "cached_tokens": 900,
+                    "cache_creation_tokens": 100,
+                    "cache_miss_tokens": 300,
+                    "cache_hit_rate": 0.75,
+                    "cache_miss_rate": 0.25,
+                    "cost_usd": 0.0,
+                }
+            ],
             "account_matrix": [],
             "current_provider_from_settings": "",
         }
@@ -1358,13 +1400,20 @@ class LocalCodexBridgeCase(unittest.TestCase):
                 local_codex_bridge.record_bridge_usage(
                     account_id="acct-1",
                     model="gpt-5.5",
+                    requested_model="claude-opus-4-7",
                     request_type="responses",
                     request_id="req-1",
                     usage={
                         "input_tokens": 11,
                         "output_tokens": 7,
                         "input_tokens_details": {"cached_tokens": 5},
+                        "cache_creation_tokens": 2,
                     },
+                    route_path="/v1/messages",
+                    bridge_port=8876,
+                    client_port=61234,
+                    client_label="Claude Desktop 3P",
+                    desktop_route=True,
                 )
                 local_codex_bridge.record_bridge_usage(
                     account_id="acct-1",
@@ -1381,7 +1430,19 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(payload["usage_metrics"]["output_tokens"], 9)
         self.assertEqual(payload["usage_metrics"]["total_tokens"], 23)
         self.assertEqual(payload["usage_metrics"]["cached_tokens"], 5)
+        self.assertEqual(payload["usage_metrics"]["cache_creation_tokens"], 2)
+        self.assertEqual(payload["usage_metrics"]["cache_miss_tokens"], 9)
+        self.assertAlmostEqual(payload["usage_metrics"]["cache_hit_rate"], 5 / 14)
+        self.assertAlmostEqual(payload["usage_metrics"]["cache_miss_rate"], 9 / 14)
         self.assertEqual(payload["usage_metrics"]["last_request_type"], "chat.completions")
+        self.assertEqual(len(payload["usage_events"]), 2)
+        self.assertEqual(payload["usage_events"][0]["cache_miss_tokens"], 6)
+        self.assertEqual(payload["usage_events"][0]["requested_model"], "claude-opus-4-7")
+        self.assertEqual(payload["usage_events"][0]["actual_model"], "gpt-5.5")
+        self.assertEqual(payload["usage_events"][0]["bridge_port"], 8876)
+        self.assertEqual(payload["usage_events"][0]["client_label"], "Claude Desktop 3P")
+        self.assertTrue(payload["usage_events"][0]["desktop_route"])
+        self.assertEqual(payload["usage_events"][1]["status_code"], 200)
 
     def test_chat_stream_converts_response_text_delta_and_done(self) -> None:
         chunks = [
@@ -1605,8 +1666,39 @@ class LocalCodexBridgeCase(unittest.TestCase):
                             "total_tokens": 18,
                             "cached_tokens": 5,
                             "cache_creation_tokens": 3,
+                            "cache_miss_tokens": 6,
+                            "cache_hit_rate": 0.45,
+                            "cache_miss_rate": 0.55,
                             "last_model": "gpt-5.5",
                         },
+                        "usage_events": [
+                            {
+                                "at": 1778736000,
+                                "account_id": "acct-1",
+                                "model": "gpt-5.5",
+                                "actual_model": "gpt-5.5",
+                                "requested_model": "claude-opus-4-7",
+                                "request_type": "responses",
+                                "request_id": "bridge-test",
+                                "status_code": 200,
+                                "source": "proxy",
+                                "route_path": "/v1/messages",
+                                "bridge_port": 8876,
+                                "client_port": 61234,
+                                "client_label": "Claude Desktop 3P",
+                                "desktop_route": True,
+                                "duration_ms": 1200,
+                                "input_tokens": 11,
+                                "output_tokens": 7,
+                                "total_tokens": 18,
+                                "cached_tokens": 5,
+                                "cache_creation_tokens": 3,
+                                "cache_miss_tokens": 6,
+                                "cache_hit_rate": 0.45,
+                                "cache_miss_rate": 0.55,
+                                "cost_usd": 0,
+                            }
+                        ],
                     }
                 ),
                 encoding="utf-8",
@@ -1617,6 +1709,14 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(payload["usage_metrics"]["request_count"], 2)
         self.assertEqual(payload["usage_metrics"]["total_tokens"], 18)
         self.assertEqual(payload["usage_metrics"]["cached_tokens"], 5)
+        self.assertEqual(payload["usage_metrics"]["cache_miss_tokens"], 6)
+        self.assertAlmostEqual(payload["usage_metrics"]["cache_hit_rate"], 0.45)
+        self.assertEqual(payload["usage_events"][0]["request_id"], "bridge-test")
+        self.assertEqual(payload["usage_events"][0]["cache_miss_tokens"], 6)
+        self.assertEqual(payload["usage_events"][0]["requested_model"], "claude-opus-4-7")
+        self.assertEqual(payload["usage_events"][0]["actual_model"], "gpt-5.5")
+        self.assertEqual(payload["usage_events"][0]["bridge_port"], 8876)
+        self.assertTrue(payload["usage_events"][0]["desktop_route"])
 
 
 class ServerCase(unittest.TestCase):
@@ -2010,6 +2110,10 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(payload["cli_homes"][0]["path"], "~/.codex")
         self.assertEqual(payload["usage_metrics"]["last_account_id"], "01234567...cdef")
         self.assertEqual(payload["usage_metrics"]["total_tokens"], 1540)
+        self.assertEqual(payload["usage_events"][0]["account_id"], "01234567...cdef")
+        self.assertEqual(payload["usage_events"][0]["input_tokens"], 1200)
+        self.assertEqual(payload["usage_events"][0]["requested_model"], "claude-opus-4-7")
+        self.assertEqual(payload["usage_events"][0]["actual_model"], "gpt-5.5")
 
     def test_cross_site_fetch_metadata_is_rejected(self) -> None:
         server, manager = self.start_server()
@@ -2242,6 +2346,109 @@ class LauncherCase(unittest.TestCase):
                 auth_store=auth_store,
             )
         )
+
+    def test_codex_oauth_authorize_url_uses_pkce_and_fixed_callback(self) -> None:
+        url = bridgedeck.codex_oauth_authorize_url("state-1", "challenge-1")
+        parsed = urllib.parse.urlsplit(url)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        self.assertEqual(f"{parsed.scheme}://{parsed.netloc}{parsed.path}", bridgedeck.CODEX_OAUTH_AUTHORIZE_URL)
+        self.assertEqual(params["client_id"], [bridgedeck.CODEX_OAUTH_CLIENT_ID])
+        self.assertEqual(params["redirect_uri"], [bridgedeck.CODEX_OAUTH_REDIRECT_URI])
+        self.assertEqual(params["code_challenge"], ["challenge-1"])
+        self.assertEqual(params["state"], ["state-1"])
+        self.assertEqual(params["codex_cli_simplified_flow"], ["true"])
+        self.assertNotIn("code_verifier", params)
+
+    def test_parse_oauth_code_input_accepts_redirect_url_and_code_hash(self) -> None:
+        parsed = bridgedeck.parse_oauth_code_input("http://localhost:1455/auth/callback?code=abc&state=xyz")
+        self.assertEqual(parsed, {"code": "abc", "state": "xyz"})
+
+        parsed = bridgedeck.parse_oauth_code_input("abc#xyz")
+        self.assertEqual(parsed, {"code": "abc", "state": "xyz"})
+
+    def test_request_codex_device_code_posts_ccswitch_shape(self) -> None:
+        with mock.patch.object(
+            bridgedeck,
+            "_post_json_url",
+            return_value={
+                "device_auth_id": "deviceauth-test",
+                "user_code": "ABCD-EFGH",
+                "interval": "5",
+                "expires_at": "2026-05-14T13:48:09Z",
+            },
+        ) as post:
+            result = bridgedeck.request_codex_device_code()
+
+        self.assertEqual(result["user_code"], "ABCD-EFGH")
+        post.assert_called_once_with(
+            bridgedeck.CODEX_DEVICE_USERCODE_URL,
+            {"client_id": bridgedeck.CODEX_OAUTH_CLIENT_ID, "scope": bridgedeck.CODEX_DEVICE_SCOPE},
+            user_agent=bridgedeck.CODEX_DEVICE_USER_AGENT,
+        )
+
+    def test_exchange_codex_device_auth_exchanges_authorization_code(self) -> None:
+        token = {"access_token": fake_jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct"}}), "refresh_token": "refresh"}
+        with mock.patch.object(
+            bridgedeck,
+            "_post_json_url",
+            return_value={"authorization_code": "auth-code"},
+        ), mock.patch.object(bridgedeck, "exchange_codex_oauth_code", return_value=token) as exchange:
+            result = bridgedeck.exchange_codex_device_auth("deviceauth-test", "ABCD-EFGH")
+
+        self.assertEqual(result, token)
+        exchange.assert_called_once_with(
+            "auth-code",
+            bridgedeck.CODEX_DEVICE_CODE_VERIFIER,
+            redirect_uri=bridgedeck.CODEX_DEVICE_REDIRECT_URI,
+        )
+
+    def test_save_codex_oauth_account_stores_refresh_without_access_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auth_store = root / ".cc-switch" / "codex_oauth_auth.json"
+            auth_store.parent.mkdir(parents=True, exist_ok=True)
+            auth_store.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "accounts": {
+                            "acct-existing": {
+                                "account_id": "acct-existing",
+                                "email": "old@example.com",
+                                "refresh_token": "old-refresh",
+                            }
+                        },
+                        "default_account_id": "acct-existing",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manager = bridgedeck.BridgeManager(
+                bridgedeck.ManagerPaths(
+                    db=root / ".cc-switch" / "cc-switch.db",
+                    settings=root / ".cc-switch" / "settings.json",
+                    auth_store=auth_store,
+                )
+            )
+            access = fake_jwt(
+                {
+                    "https://api.openai.com/auth": {"chatgpt_account_id": "acct-new"},
+                    "https://api.openai.com/profile": {"email": "new@example.com"},
+                }
+            )
+
+            account_id = manager._save_codex_oauth_account(
+                {"access_token": access, "refresh_token": "new-refresh"},
+                set_default=False,
+            )
+
+            saved = json.loads(auth_store.read_text(encoding="utf-8"))
+            self.assertEqual(account_id, "acct-new")
+            self.assertEqual(saved["default_account_id"], "acct-existing")
+            self.assertEqual(saved["accounts"]["acct-new"]["email"], "new@example.com")
+            self.assertEqual(saved["accounts"]["acct-new"]["refresh_token"], "new-refresh")
+            self.assertNotIn("access_token", saved["accounts"]["acct-new"])
 
     def test_managed_codex_provider_uses_auth_store_binding_over_embedded_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
