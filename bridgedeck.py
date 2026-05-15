@@ -5963,9 +5963,49 @@ INDEX_HTML = """<!doctype html>
       const chosen = document.querySelector('input[name="providerPick"]:checked');
       return chosen ? chosen.value : '';
     }
+    function providerById(providerId) {
+      return providerId && lastData ? (lastData.providers || []).find((p) => p.id === providerId) || null : null;
+    }
+    function providerForSelectedClaudeAccount() {
+      if (!lastData) return null;
+      const item = selectedAccount('account') || selectedAccount('simpleClaudeAccount');
+      const accountId = item && item.account_id ? item.account_id : '';
+      if (!accountId) return null;
+      const matches = (lastData.providers || []).filter((p) => p.account_id === accountId && isBridgeClaudeProvider(p));
+      return matches.find((p) => p.id === lastData.current_provider_from_settings)
+        || matches.find((p) => p.is_current)
+        || matches[0]
+        || null;
+    }
+    function currentBridgeClaudeProvider() {
+      const provider = currentClaudeProvider(lastData);
+      return isBridgeClaudeProvider(provider) ? provider : null;
+    }
+    function markProviderPicked(providerId) {
+      if (!providerId) return;
+      const input = Array.from(document.querySelectorAll('input[name="providerPick"]')).find((item) => item.value === providerId);
+      if (input) input.checked = true;
+    }
+    function selectedProviderActionTarget() {
+      const explicitId = selectedProviderId();
+      if (explicitId) return { provider: providerById(explicitId), source: '手动选中 provider' };
+      const accountProvider = providerForSelectedClaudeAccount();
+      if (accountProvider) return { provider: accountProvider, source: '上方账号对应 provider' };
+      const currentProvider = currentBridgeClaudeProvider();
+      if (currentProvider) return { provider: currentProvider, source: '当前 CC Switch provider' };
+      return { provider: null, source: '' };
+    }
+    function selectedProviderActionId() {
+      const target = selectedProviderActionTarget();
+      if (!target.provider) return '';
+      markProviderPicked(target.provider.id);
+      if (target.source !== '手动选中 provider') {
+        log(`未手动选中 provider，已使用${target.source}: ${providerDisplayName(target.provider)}`);
+      }
+      return target.provider.id || '';
+    }
     function selectedProvider() {
-      const id = selectedProviderId();
-      return id && lastData ? (lastData.providers || []).find((p) => p.id === id) : null;
+      return providerById(selectedProviderId());
     }
     function pageIdForSection(section) {
       const page = section ? section.closest('.deckPage') : null;
@@ -6740,37 +6780,37 @@ INDEX_HTML = """<!doctype html>
       return res;
     }
     async function setCurrentFromSelected() {
-      const id = selectedProviderId();
-      if (!id) return log('请先选中一个 provider');
+      const id = selectedProviderActionId();
+      if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/set-current', 'POST', { provider_id: id });
       log(`${res.message}: ${id}`);
       await refreshData();
     }
     async function patchSelected() {
-      const id = selectedProviderId();
-      if (!id) return log('请先选中一个 provider');
+      const id = selectedProviderActionId();
+      if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/patch-provider', 'POST', { provider_id: id });
       log(`${res.message}: ${id}`);
       await refreshData();
     }
     async function saveCompactSelected() {
-      const id = selectedProviderId();
-      if (!id) return log('请先选中一个 provider');
+      const id = selectedProviderActionId();
+      if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/provider-compact', 'POST', { provider_id: id, context_config: bridgeModelConfigPayload(), compact_config: compactConfigPayload() });
       log(`${res.message}: ${providerCompactText({ compact_enabled: res.compact_config.enabled, compact_window_tokens: res.compact_config.window_tokens, compact_threshold_percent: res.compact_config.threshold_percent })}`);
       await refreshData();
     }
     async function saveForcedModelSelected() {
-      const id = selectedProviderId();
-      if (!id) return log('请先选中一个 provider');
+      const id = selectedProviderActionId();
+      if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/provider-model', 'POST', { provider_id: id, model_config: bridgeModelConfigPayload() });
       setRoutingMode('forced');
       log(`${res.message}: ${res.model_config.model}`);
       await refreshData();
     }
     async function clearForcedModelSelected() {
-      const id = selectedProviderId();
-      if (!id) return log('请先选中一个 provider');
+      const id = selectedProviderActionId();
+      if (!id) return log('请先选账号或选中一个 provider');
       const preview = await api('/api/provider-routing', 'POST', { provider_id: id, mode: 'auto', apply: false });
       if (!preview.changed) {
         log('该 provider 已经是 Claude 自动路由。');
@@ -6787,8 +6827,8 @@ INDEX_HTML = """<!doctype html>
       await refreshData();
     }
     async function syncCommonEnvSelected() {
-      const id = selectedProviderId();
-      if (!id) return log('请先选中一个 provider');
+      const id = selectedProviderActionId();
+      if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/sync-common-env', 'POST', { provider_id: id });
       log(`${res.message}: 更新 ${res.updated.length} 个，跳过 ${res.skipped.length} 个；keys: ${res.env_keys.join(', ')}`);
       await refreshData();
