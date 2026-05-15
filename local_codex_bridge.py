@@ -148,21 +148,24 @@ BRIDGE_MODELS: tuple[BridgeModel, ...] = (
     BridgeModel(id="gpt-5.3-codex-spark", display_name="GPT 5.3 Codex Spark"),
 )
 
-CLAUDE_DESKTOP_MODEL_ROUTES: tuple[dict[str, str], ...] = (
+CLAUDE_DESKTOP_MODEL_ROUTES: tuple[dict[str, Any], ...] = (
     {
         "id": "claude-haiku-4-5",
+        "aliases": ("haiku",),
         "display_name": "Claude Haiku 4.5",
         "env": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
         "default": "gpt-5.3-codex-spark",
     },
     {
         "id": "claude-sonnet-4-6",
+        "aliases": ("sonnet",),
         "display_name": "Claude Sonnet 4.6",
         "env": "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "default": "gpt-5.3-codex",
     },
     {
         "id": "claude-opus-4-7",
+        "aliases": ("opus",),
         "display_name": "Claude Opus 4.7",
         "env": "ANTHROPIC_DEFAULT_OPUS_MODEL",
         "default": "gpt-5.5",
@@ -293,6 +296,8 @@ def claude_desktop_model_route_map() -> dict[str, str]:
         source_model = normalize_bridge_model_id(os.environ.get(route["env"]) or route["default"])
         if source_model:
             routes[route["id"]] = source_model
+            for alias in route.get("aliases", ()):
+                routes[str(alias)] = source_model
     return routes
 
 

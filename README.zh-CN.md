@@ -147,9 +147,13 @@ Anthropic 风格环境变量示例：
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8876/accounts/<account_id>/v1
 ANTHROPIC_AUTH_TOKEN=local-bridge
-ANTHROPIC_MODEL=gpt-5.5
+ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark
+ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex
+ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
 ```
+
+不要默认设置 `ANTHROPIC_MODEL`。只有你明确要把所有 Claude Code 主请求强制到某个模型时才设置它；留空时，Claude 的 `haiku` / `sonnet` / `opus` slot 路由才会有意义。
 
 BridgeDeck 也会暴露桌面端安全的 Claude 风格模型别名。遇到客户端限制模型名时，可以用页面显示的别名；页面会同时显示“请求模型”和“实际路由模型”。
 

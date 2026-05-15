@@ -210,6 +210,7 @@ class FakeManager:
         provider_name: str,
         set_current: bool,
         compact_config: dict[str, Any] | None = None,
+        context_config: dict[str, Any] | None = None,
         model_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {"ok": True}
@@ -221,6 +222,7 @@ class FakeManager:
         self,
         provider_id: str,
         compact_config: dict[str, Any] | None,
+        context_config: dict[str, Any] | None = None,
         model_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
@@ -228,7 +230,16 @@ class FakeManager:
             "message": "上下文配置已保存",
             "provider_id": provider_id,
             "compact_config": bridgedeck.normalize_compact_config(compact_config),
-            "model_config": bridgedeck.normalize_bridge_model_config(model_config),
+            "context_config": (
+                bridgedeck.normalize_bridge_model_config(context_config)
+                if context_config is not None
+                else None
+            ),
+            "model_config": (
+                bridgedeck.normalize_bridge_model_config(model_config)
+                if model_config is not None
+                else None
+            ),
         }
 
     def sync_common_env_to_bridge_providers(self, provider_id: str) -> dict[str, Any]:
@@ -1025,6 +1036,20 @@ class LocalCodexBridgeCase(unittest.TestCase):
         )
 
         self.assertEqual(body["model"], "gpt-5.5")
+
+    def test_claude_alias_routes_map_before_forwarding(self) -> None:
+        cases = {
+            "haiku": "gpt-5.3-codex-spark",
+            "sonnet": "gpt-5.3-codex",
+            "opus": "gpt-5.5",
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                body = local_codex_bridge.normalize_request_body(
+                    {"model": source, "input": [{"role": "user", "content": []}]}
+                )
+
+                self.assertEqual(body["model"], expected)
 
     def test_models_endpoint_is_account_scoped_and_ignores_sensitive_query(self) -> None:
         server = self.start_local_bridge_server()
@@ -1831,10 +1856,13 @@ class ServerCase(unittest.TestCase):
         self.assertIn("GET /v1/models", html)
         self.assertIn("sk-bridgedeck-local-placeholder", html)
         self.assertIn("ANTHROPIC_BASE_URL", html)
-        self.assertIn("ANTHROPIC_MODEL=gpt-5.5", html)
+        self.assertNotIn("ANTHROPIC_MODEL=gpt-5.5", html)
         self.assertIn("ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark", html)
         self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex", html)
         self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5", html)
+        self.assertIn("Claude 自动路由", html)
+        self.assertIn("强制主模型", html)
+        self.assertIn("copy-anthropic-forced-env", html)
         self.assertIn("claude-haiku-4-5", html)
         self.assertIn("claude-sonnet-4-6", html)
         self.assertIn("claude-opus-4-7", html)
@@ -1844,12 +1872,15 @@ class ServerCase(unittest.TestCase):
         self.assertIn("copy-api-base-url", html)
         self.assertIn("copy-claude-env", html)
         self.assertIn('id="bridgeModel"', html)
+        self.assertIn('id="modelRoutingMode"', html)
         self.assertIn('id="modelContextTokens"', html)
         self.assertIn('data-action="compact-preset-model"', html)
         self.assertIn("context unknown", html)
         self.assertIn('id="compactWindow"', html)
         self.assertIn('data-action="compact-preset-1m"', html)
         self.assertIn('data-action="save-compact-selected"', html)
+        self.assertIn('data-action="save-forced-model-selected"', html)
+        self.assertIn('data-action="clear-forced-model-selected"', html)
         self.assertIn('data-action="sync-common-env-selected"', html)
         self.assertIn('data-action="stop-bridgedeck-ui"', html)
         self.assertIn("只停 8899，不影响 8876 Local Bridge", html)
@@ -2066,8 +2097,8 @@ class ServerCase(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(payload["compact_config"]["window_tokens"], "1000000")
-        self.assertEqual(payload["model_config"]["model"], "gpt-5.5")
-        self.assertEqual(payload["model_config"]["context_tokens"], "272000")
+        self.assertIsNone(payload["context_config"])
+        self.assertIsNone(payload["model_config"])
 
     def test_sync_common_env_endpoint_uses_selected_provider(self) -> None:
         server, _ = self.start_server()
@@ -2857,6 +2888,7 @@ class LauncherCase(unittest.TestCase):
             env = settings["env"]
             self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8876/accounts/acct-1")
             self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "local-bridge")
+            self.assertNotIn("ANTHROPIC_MODEL", env)
             self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gpt-5.3-codex-spark")
             self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-5.3-codex")
             self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gpt-5.5")
@@ -2910,6 +2942,20 @@ class LauncherCase(unittest.TestCase):
 
             env = settings["env"]
             self.assertEqual(env["ANTHROPIC_MODEL"], "gpt-5.5")
+            self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "272000")
+
+    def test_provider_payload_applies_context_without_forcing_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+
+            settings, _ = manager._build_provider_payload(
+                "acct-1",
+                settings_config={"env": {}},
+                context_config={"model": "GPT-5.5"},
+            )
+
+            env = settings["env"]
+            self.assertNotIn("ANTHROPIC_MODEL", env)
             self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "272000")
 
     def test_unknown_bridge_model_does_not_invent_context(self) -> None:
@@ -3274,6 +3320,191 @@ class LauncherCase(unittest.TestCase):
             self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", settings["env"])
             self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", settings["env"])
             self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", settings["env"])
+            self.assertNotIn("ANTHROPIC_MODEL", settings["env"])
+
+    def test_create_provider_drops_template_forced_model_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE providers (
+                        id TEXT,
+                        name TEXT,
+                        app_type TEXT,
+                        settings_config TEXT,
+                        meta TEXT,
+                        provider_type TEXT,
+                        sort_index INTEGER
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "template",
+                        "MiniMax",
+                        "claude",
+                        json.dumps(
+                            {
+                                "env": {
+                                    "ANTHROPIC_MODEL": "gpt-5.4",
+                                    "HUB_CLAUDE_MEM": "1",
+                                }
+                            }
+                        ),
+                        json.dumps({}),
+                        None,
+                        1,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = manager.create_or_update_provider("acct-1", "Local Codex Bridge - person", False)
+
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                settings = json.loads(
+                    conn.execute("SELECT settings_config FROM providers WHERE id = ?", (result["provider_id"],)).fetchone()[0]
+                )
+            finally:
+                conn.close()
+            self.assertNotIn("ANTHROPIC_MODEL", settings["env"])
+            self.assertEqual(settings["env"]["HUB_CLAUDE_MEM"], "1")
+
+    def test_update_provider_compact_does_not_change_forced_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE providers (
+                        id TEXT,
+                        name TEXT,
+                        app_type TEXT,
+                        settings_config TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?)",
+                    (
+                        "provider",
+                        "Local Codex Bridge - Pro 20x",
+                        "claude",
+                        json.dumps(
+                            {
+                                "env": {
+                                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-1",
+                                    "ANTHROPIC_AUTH_TOKEN": "local-bridge",
+                                    "ANTHROPIC_MODEL": "gpt-5.4",
+                                }
+                            }
+                        ),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            manager.update_provider_compact(
+                "provider",
+                {"enabled": True, "window_tokens": "272000", "threshold_percent": "80"},
+                context_config={"model": "gpt-5.5"},
+                model_config={"model": "gpt-5.5"},
+            )
+
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                settings = json.loads(conn.execute("SELECT settings_config FROM providers WHERE id = 'provider'").fetchone()[0])
+            finally:
+                conn.close()
+            self.assertEqual(settings["env"]["ANTHROPIC_MODEL"], "gpt-5.4")
+            self.assertEqual(settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "272000")
+            self.assertEqual(settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "272000")
+
+    def test_update_provider_forced_model_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                conn.execute("CREATE TABLE providers (id TEXT, name TEXT, app_type TEXT, settings_config TEXT)")
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?)",
+                    (
+                        "provider",
+                        "Local Codex Bridge - Pro",
+                        "claude",
+                        json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-1"}}),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = manager.update_provider_forced_model("provider", {"model": "GPT-5.5"})
+
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                settings = json.loads(conn.execute("SELECT settings_config FROM providers WHERE id = 'provider'").fetchone()[0])
+            finally:
+                conn.close()
+            self.assertEqual(result["model_config"]["model"], "gpt-5.5")
+            self.assertEqual(settings["env"]["ANTHROPIC_MODEL"], "gpt-5.5")
+            self.assertEqual(settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "272000")
+
+    def test_clear_provider_forced_model_previews_then_applies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                conn.execute("CREATE TABLE providers (id TEXT, name TEXT, app_type TEXT, settings_config TEXT)")
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?)",
+                    (
+                        "provider",
+                        "Local Codex Bridge - Pro",
+                        "claude",
+                        json.dumps(
+                            {
+                                "env": {
+                                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-1",
+                                    "ANTHROPIC_MODEL": "gpt-5.5",
+                                    "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-5.5",
+                                }
+                            }
+                        ),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            preview = manager.clear_provider_forced_model("provider", apply=False)
+            applied = manager.clear_provider_forced_model("provider", apply=True)
+
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                settings = json.loads(conn.execute("SELECT settings_config FROM providers WHERE id = 'provider'").fetchone()[0])
+            finally:
+                conn.close()
+            self.assertTrue(preview["changed"])
+            self.assertEqual(preview["removed_model"], "gpt-5.5")
+            self.assertTrue(applied["changed"])
+            self.assertNotIn("ANTHROPIC_MODEL", settings["env"])
+            self.assertEqual(settings["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gpt-5.5")
 
     def test_dedupe_bridge_providers_switches_current_before_delete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

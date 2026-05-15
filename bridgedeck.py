@@ -299,15 +299,28 @@ def normalize_bridge_model_config(config: dict[str, Any] | None) -> dict[str, st
     return {"model": model, "context_tokens": context_tokens, "max_output_tokens": max_output_tokens}
 
 
-def apply_bridge_model_config_to_env(env: dict[str, Any], model_config: dict[str, Any] | None) -> dict[str, str]:
+def apply_bridge_context_config_to_env(env: dict[str, Any], model_config: dict[str, Any] | None) -> dict[str, str]:
     normalized = normalize_bridge_model_config(model_config)
-    env["ANTHROPIC_MODEL"] = normalized["model"]
     if normalized["context_tokens"]:
         env[MAX_CONTEXT_TOKENS_ENV] = normalized["context_tokens"]
     else:
         env.pop(MAX_CONTEXT_TOKENS_ENV, None)
     normalize_provider_model_env(env)
     return normalized
+
+
+def apply_bridge_model_config_to_env(env: dict[str, Any], model_config: dict[str, Any] | None) -> dict[str, str]:
+    normalized = apply_bridge_context_config_to_env(env, model_config)
+    env["ANTHROPIC_MODEL"] = normalized["model"]
+    normalize_provider_model_env(env)
+    return normalized
+
+
+def clear_forced_bridge_model_from_env(env: dict[str, Any]) -> str:
+    model = env.get("ANTHROPIC_MODEL")
+    env.pop("ANTHROPIC_MODEL", None)
+    normalize_provider_model_env(env)
+    return model if isinstance(model, str) else ""
 
 
 def common_provider_env(env: dict[str, Any]) -> dict[str, Any]:
@@ -2801,7 +2814,9 @@ class BridgeManager:
         settings_config: dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
         compact_config: dict[str, Any] | None = None,
+        context_config: dict[str, Any] | None = None,
         model_config: dict[str, Any] | None = None,
+        clear_forced_model: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         settings = copy.deepcopy(settings_config) if isinstance(settings_config, dict) else {}
         if not isinstance(settings, dict):
@@ -2811,10 +2826,12 @@ class BridgeManager:
             env = {}
         env["ANTHROPIC_BASE_URL"] = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}"
         env["ANTHROPIC_AUTH_TOKEN"] = "local-bridge"
+        if clear_forced_model:
+            clear_forced_bridge_model_from_env(env)
         if model_config is not None:
             apply_bridge_model_config_to_env(env, model_config)
-        else:
-            env.setdefault("ANTHROPIC_MODEL", DEFAULT_BRIDGE_PROVIDER_MODEL)
+        elif context_config is not None:
+            apply_bridge_context_config_to_env(env, context_config)
         env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "gpt-5.3-codex-spark")
         env.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", "gpt-5.3-codex")
         env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "gpt-5.5")
@@ -2945,6 +2962,7 @@ class BridgeManager:
                     if isinstance(env.get("ANTHROPIC_AUTH_TOKEN"), str)
                     else ""
                 )
+                forced_model = env.get("ANTHROPIC_MODEL") if isinstance(env.get("ANTHROPIC_MODEL"), str) else ""
 
                 data["providers"].append(
                     {
@@ -2957,7 +2975,12 @@ class BridgeManager:
                         "api_format": meta.get("apiFormat") if isinstance(meta.get("apiFormat"), str) else "",
                         "account_id": account_id,
                         "base_url": env.get("ANTHROPIC_BASE_URL") if isinstance(env.get("ANTHROPIC_BASE_URL"), str) else "",
-                        "model": env.get("ANTHROPIC_MODEL") if isinstance(env.get("ANTHROPIC_MODEL"), str) else "",
+                        "model": forced_model,
+                        "routing_mode": "forced" if forced_model else "claude_auto",
+                        "model_is_legacy_default": forced_model == DEFAULT_BRIDGE_PROVIDER_MODEL,
+                        "haiku_model": env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), str) else "",
+                        "sonnet_model": env.get("ANTHROPIC_DEFAULT_SONNET_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"), str) else "",
+                        "opus_model": env.get("ANTHROPIC_DEFAULT_OPUS_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL"), str) else "",
                         "max_context_tokens": env.get(MAX_CONTEXT_TOKENS_ENV) if isinstance(env.get(MAX_CONTEXT_TOKENS_ENV), str) else "",
                         "auth_token": auth_token if include_secrets else "",
                         "auth_token_masked": mask_token(auth_token),
@@ -3013,6 +3036,7 @@ class BridgeManager:
         provider_name: str,
         set_current: bool,
         compact_config: dict[str, Any] | None = None,
+        context_config: dict[str, Any] | None = None,
         model_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not account_id.strip():
@@ -3046,13 +3070,16 @@ class BridgeManager:
                     template_settings, template_meta = self._pick_template_provider(conn)
                     current_settings = template_settings
                     current_meta = template_meta
+                clear_forced_model = not existing and model_config is None
 
                 new_settings, new_meta = self._build_provider_payload(
                     account_id,
                     settings_config=current_settings,
                     meta=current_meta,
                     compact_config=compact_config,
+                    context_config=context_config,
                     model_config=model_config,
+                    clear_forced_model=clear_forced_model,
                 )
                 settings_text = json.dumps(new_settings, ensure_ascii=False)
                 meta_text = json.dumps(new_meta, ensure_ascii=False)
@@ -3181,6 +3208,7 @@ class BridgeManager:
         self,
         provider_id: str,
         compact_config: dict[str, Any] | None,
+        context_config: dict[str, Any] | None = None,
         model_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not provider_id.strip():
@@ -3206,7 +3234,11 @@ class BridgeManager:
                 base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
                 if not base_url.startswith(f"{LOCAL_BRIDGE_BASE_URL}/accounts/"):
                     raise ValueError("仅支持 Local Codex Bridge provider")
-                normalized_model = apply_bridge_model_config_to_env(env, model_config) if model_config is not None else None
+                normalized_context = (
+                    apply_bridge_context_config_to_env(env, context_config)
+                    if context_config is not None
+                    else None
+                )
                 normalized = apply_compact_config_to_env(env, compact_config)
                 settings["env"] = env
                 conn.execute(
@@ -3220,8 +3252,97 @@ class BridgeManager:
                 "message": "上下文配置已保存",
                 "provider_id": provider_id,
                 "compact_config": normalized,
+                "context_config": normalized_context,
+                "backups": [db_bak],
+            }
+
+    def update_provider_forced_model(
+        self,
+        provider_id: str,
+        model_config: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not provider_id.strip():
+            raise ValueError("provider_id 不能为空")
+
+        with self._lock:
+            db_bak = self._backup_file(self.paths.db, "provider-model")
+            with self._connect() as conn:
+                columns = self._provider_columns(conn)
+                row = conn.execute(
+                    "SELECT id, settings_config FROM providers WHERE app_type = 'claude' AND id = ? LIMIT 1",
+                    (provider_id,),
+                ).fetchone()
+                if not row:
+                    raise ValueError(f"provider 不存在: {provider_id}")
+                if "settings_config" not in columns:
+                    raise RuntimeError("providers 表缺少 settings_config 字段")
+
+                settings = self._extract_json(row["settings_config"])
+                env = settings.get("env")
+                if not isinstance(env, dict):
+                    env = {}
+                base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
+                if not base_url.startswith(f"{LOCAL_BRIDGE_BASE_URL}/accounts/"):
+                    raise ValueError("仅支持 Local Codex Bridge provider")
+                normalized_model = apply_bridge_model_config_to_env(env, model_config)
+                settings["env"] = env
+                conn.execute(
+                    "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = ?",
+                    (json.dumps(settings, ensure_ascii=False), provider_id, "claude"),
+                )
+                conn.commit()
+
+            return {
+                "ok": True,
+                "message": "强制主模型已保存",
+                "provider_id": provider_id,
                 "model_config": normalized_model,
                 "backups": [db_bak],
+            }
+
+    def clear_provider_forced_model(self, provider_id: str, *, apply: bool = False) -> dict[str, Any]:
+        if not provider_id.strip():
+            raise ValueError("provider_id 不能为空")
+
+        with self._lock:
+            db_bak = self._backup_file(self.paths.db, "provider-routing") if apply else None
+            with self._connect() as conn:
+                columns = self._provider_columns(conn)
+                row = conn.execute(
+                    "SELECT id, settings_config FROM providers WHERE app_type = 'claude' AND id = ? LIMIT 1",
+                    (provider_id,),
+                ).fetchone()
+                if not row:
+                    raise ValueError(f"provider 不存在: {provider_id}")
+                if "settings_config" not in columns:
+                    raise RuntimeError("providers 表缺少 settings_config 字段")
+
+                settings = self._extract_json(row["settings_config"])
+                env = settings.get("env")
+                if not isinstance(env, dict):
+                    env = {}
+                base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
+                if not base_url.startswith(f"{LOCAL_BRIDGE_BASE_URL}/accounts/"):
+                    raise ValueError("仅支持 Local Codex Bridge provider")
+                removed_model = env.get("ANTHROPIC_MODEL") if isinstance(env.get("ANTHROPIC_MODEL"), str) else ""
+                changed = bool(removed_model)
+                if apply and changed:
+                    clear_forced_bridge_model_from_env(env)
+                    settings["env"] = env
+                    conn.execute(
+                        "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = ?",
+                        (json.dumps(settings, ensure_ascii=False), provider_id, "claude"),
+                    )
+                    conn.commit()
+
+            return {
+                "ok": True,
+                "message": "已改为 Claude 自动路由" if apply and changed else "Claude 自动路由预览",
+                "provider_id": provider_id,
+                "apply": apply,
+                "changed": changed,
+                "removed_model": removed_model,
+                "backups": [db_bak] if db_bak else [],
             }
 
     def sync_common_env_to_bridge_providers(self, provider_id: str) -> dict[str, Any]:
@@ -4649,11 +4770,12 @@ INDEX_HTML = """<!doctype html>
             </div>
             <div class="card guideSection" id="providerCreateCard" data-guide="providerCreate">
               <h2>Claude 桥接账号</h2>
-              <div class="sectionHint">选择账号、模型和上下文后创建/更新；勾选“设为当前”会同步 CC Switch 当前 Claude Provider。</div>
+              <div class="sectionHint">默认使用 Claude 自动路由，只写 Haiku/Sonnet/Opus slot；只有选择“强制主模型”才写 ANTHROPIC_MODEL。</div>
               <div class="formGrid">
                 <label>ChatGPT 账号<select id="account"></select></label>
                 <label>显示名称<input id="providerName" placeholder="Local Codex Bridge - xxx" /></label>
-                <label>模型<select id="bridgeModel"></select></label>
+                <label>路由模式<select id="modelRoutingMode"><option value="auto">Claude 自动路由</option><option value="forced">强制主模型</option></select></label>
+                <label>模型 / 上下文<select id="bridgeModel"></select></label>
                 <label>上下文 tokens<input id="modelContextTokens" type="number" min="10000" max="2000000" step="1000" value="272000" readonly /></label>
               </div>
               <div class="row">
@@ -4670,7 +4792,9 @@ INDEX_HTML = """<!doctype html>
                   <button class="miniBtn" data-action="compact-preset-220k">220k</button>
                   <button class="miniBtn" data-action="compact-preset-1m">1m</button>
                   <button class="miniBtn" data-action="compact-off">关闭</button>
-                  <button class="miniBtn" data-action="save-compact-selected">保存模型/上下文到选中 provider</button>
+                  <button class="miniBtn" data-action="save-compact-selected">保存上下文/压缩到选中 provider</button>
+                  <button class="miniBtn" data-action="save-forced-model-selected">保存强制主模型</button>
+                  <button class="miniBtn warn" data-action="clear-forced-model-selected">改为 Claude 自动路由</button>
                   <button class="miniBtn" data-action="sync-common-env-selected">同步通用 env 到全部</button>
                 </div>
                 <div class="muted" id="bridgeModelMeta">gpt-5.5 = 272000 context tokens / 128000 max output。</div>
@@ -4694,7 +4818,7 @@ INDEX_HTML = """<!doctype html>
                       <th class="smallCol">当前</th>
                       <th class="accountCol">account</th>
                       <th class="urlCol">base_url</th>
-                      <th class="smallCol">model</th>
+                      <th class="smallCol">路由/模型</th>
                       <th class="smallCol">压缩</th>
                       <th class="tokenCol">token</th>
                     </tr>
@@ -4786,6 +4910,7 @@ INDEX_HTML = """<!doctype html>
                     <button class="miniBtn" data-action="copy-anthropic-token">复制 Anthropic token</button>
                     <button class="miniBtn" data-action="copy-anthropic-base-url">复制 Anthropic URL</button>
                     <button class="miniBtn" data-action="copy-anthropic-env">复制 Anthropic .env</button>
+                    <button class="miniBtn" data-action="copy-anthropic-forced-env">复制强制主模型 env</button>
                   </div>
                   <div class="actualLine mt10" id="simpleApiActual">当前实际：选择账号后可用。</div>
                 </div>
@@ -5945,7 +6070,11 @@ INDEX_HTML = """<!doctype html>
     }
     function anthropicAccessEnv(item) {
       const baseUrl = anthropicAccessBaseUrl(item);
-      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_MODEL=gpt-5.5\nANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark\nANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex\nANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` : '';
+      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark\nANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex\nANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` : '';
+    }
+    function anthropicForcedModelEnv(item) {
+      const base = anthropicAccessEnv(item);
+      return base ? `${base}\nANTHROPIC_MODEL=${selectedBridgeModel()}` : '';
     }
     function apiOpenAiEnv(item) {
       const baseUrl = apiAccessBaseUrl(item);
@@ -6022,6 +6151,10 @@ INDEX_HTML = """<!doctype html>
       const item = selectedAccount('simpleApiAccount');
       return copyText(item ? anthropicAccessEnv(item) : '', 'Anthropic .env');
     }
+    function copyAnthropicForcedEnv() {
+      const item = selectedAccount('simpleApiAccount');
+      return copyText(item ? anthropicForcedModelEnv(item) : '', 'Anthropic forced model env');
+    }
     function copyClaudeEnv() {
       return copyAnthropicEnv();
     }
@@ -6044,15 +6177,28 @@ INDEX_HTML = """<!doctype html>
       const sel = document.getElementById('bridgeModel');
       return sel && sel.value ? sel.value : DEFAULT_BRIDGE_MODEL;
     }
+    function selectedRoutingMode() {
+      const sel = document.getElementById('modelRoutingMode');
+      return sel && sel.value ? sel.value : 'auto';
+    }
+    function setRoutingMode(mode) {
+      const sel = document.getElementById('modelRoutingMode');
+      if (sel) sel.value = mode === 'forced' ? 'forced' : 'auto';
+      updateBridgeModelMeta();
+    }
     function updateBridgeModelMeta() {
       const model = selectedBridgeModel();
       const context = bridgeModelContext(model);
       const maxOutput = bridgeModelMaxOutput(model);
       document.getElementById('modelContextTokens').value = context || '';
       const outputText = maxOutput ? ` / ${maxOutput} max output` : '';
-      document.getElementById('bridgeModelMeta').textContent = context
+      const routingText = selectedRoutingMode() === 'forced'
+        ? `强制主模型：会写 ANTHROPIC_MODEL=${model}。`
+        : 'Claude 自动路由：不写 ANTHROPIC_MODEL，只保留 Haiku/Sonnet/Opus slot。';
+      const contextText = context
         ? `${model} = ${context} context tokens${outputText}。`
         : `${model} 未探测到真实 context；自动压缩使用保守 ${CONSERVATIVE_COMPACT_WINDOW}，不会写 CLAUDE_CODE_MAX_CONTEXT_TOKENS。`;
+      document.getElementById('bridgeModelMeta').textContent = `${routingText} ${contextText}`;
     }
     function renderBridgeModels() {
       const sel = document.getElementById('bridgeModel');
@@ -6067,6 +6213,8 @@ INDEX_HTML = """<!doctype html>
       });
       sel.value = DEFAULT_BRIDGE_MODEL;
       sel.onchange = () => applyModelContextPreset();
+      const routingSel = document.getElementById('modelRoutingMode');
+      if (routingSel) routingSel.onchange = () => updateBridgeModelMeta();
       updateBridgeModelMeta();
     }
     function setBridgeModel(modelId, applyContext = false) {
@@ -6083,6 +6231,9 @@ INDEX_HTML = """<!doctype html>
         context_tokens: bridgeModelContext(model),
         max_output_tokens: bridgeModelMaxOutput(model)
       };
+    }
+    function forcedModelConfigPayload() {
+      return selectedRoutingMode() === 'forced' ? bridgeModelConfigPayload() : null;
     }
     function setCompactFields(enabled, windowTokens, pct) {
       document.getElementById('compactEnabled').checked = Boolean(enabled);
@@ -6109,9 +6260,24 @@ INDEX_HTML = """<!doctype html>
       const pct = provider.compact_threshold_percent || DEFAULT_COMPACT_PCT;
       return `${provider.compact_window_tokens || ''} / ${pct}%`;
     }
+    function providerRoutingText(provider) {
+      if (!provider) return '';
+      const slots = [
+        provider.haiku_model ? `H:${provider.haiku_model}` : '',
+        provider.sonnet_model ? `S:${provider.sonnet_model}` : '',
+        provider.opus_model ? `O:${provider.opus_model}` : ''
+      ].filter(Boolean).join(' ');
+      const context = provider.max_context_tokens ? `\nctx ${provider.max_context_tokens}` : '';
+      if (provider.routing_mode === 'forced' || provider.model) {
+        const legacy = provider.model_is_legacy_default ? ' · 旧默认?' : '';
+        return `强制 ${provider.model || '-'}${legacy}${context}${slots ? `\n${slots}` : ''}`;
+      }
+      return `Claude 自动路由${context}${slots ? `\n${slots}` : ''}`;
+    }
     function applyCompactFromProvider(provider) {
       if (!provider) return;
       setBridgeModel(provider.model || DEFAULT_BRIDGE_MODEL, false);
+      setRoutingMode(provider.model ? 'forced' : 'auto');
       if (provider.compact_enabled) {
         setCompactFields(true, provider.compact_window_tokens || DEFAULT_COMPACT_WINDOW, provider.compact_threshold_percent || DEFAULT_COMPACT_PCT);
       } else {
@@ -6297,7 +6463,7 @@ INDEX_HTML = """<!doctype html>
           <td>${p.is_current ? '<span class="ok">当前</span>' : '<span class="muted">未选</span>'} ${currentBySettings ? '<span class="ok">设置同步</span>' : ''}</td>
           <td class="mono">${esc(maskId(p.account_id || ''))}</td>
           <td class="mono">${esc(p.base_url || '')}</td>
-          <td class="mono">${esc(p.model || '')}${p.max_context_tokens ? '<br>' + esc(p.max_context_tokens) : ''}</td>
+          <td class="mono">${esc(providerRoutingText(p)).replace(/\\n/g, '<br>')}</td>
           <td class="mono">${esc(providerCompactText(p))}</td>
           <td class="mono">${esc(tokenText(p))}</td>
         `;
@@ -6511,7 +6677,8 @@ INDEX_HTML = """<!doctype html>
         account_id: accountId,
         provider_name: providerName,
         set_current: setCurrent,
-        model_config: bridgeModelConfigPayload(),
+        context_config: bridgeModelConfigPayload(),
+        model_config: forcedModelConfigPayload(),
         compact_config: compactConfigPayload()
       });
       log(`${res.message}: ${res.provider_name} (${res.provider_id})`);
@@ -6589,8 +6756,34 @@ INDEX_HTML = """<!doctype html>
     async function saveCompactSelected() {
       const id = selectedProviderId();
       if (!id) return log('请先选中一个 provider');
-      const res = await api('/api/provider-compact', 'POST', { provider_id: id, model_config: bridgeModelConfigPayload(), compact_config: compactConfigPayload() });
+      const res = await api('/api/provider-compact', 'POST', { provider_id: id, context_config: bridgeModelConfigPayload(), compact_config: compactConfigPayload() });
       log(`${res.message}: ${providerCompactText({ compact_enabled: res.compact_config.enabled, compact_window_tokens: res.compact_config.window_tokens, compact_threshold_percent: res.compact_config.threshold_percent })}`);
+      await refreshData();
+    }
+    async function saveForcedModelSelected() {
+      const id = selectedProviderId();
+      if (!id) return log('请先选中一个 provider');
+      const res = await api('/api/provider-model', 'POST', { provider_id: id, model_config: bridgeModelConfigPayload() });
+      setRoutingMode('forced');
+      log(`${res.message}: ${res.model_config.model}`);
+      await refreshData();
+    }
+    async function clearForcedModelSelected() {
+      const id = selectedProviderId();
+      if (!id) return log('请先选中一个 provider');
+      const preview = await api('/api/provider-routing', 'POST', { provider_id: id, mode: 'auto', apply: false });
+      if (!preview.changed) {
+        log('该 provider 已经是 Claude 自动路由。');
+        return;
+      }
+      const message = `将移除 ANTHROPIC_MODEL=${preview.removed_model}，保留 Haiku/Sonnet/Opus slot 映射。继续？`;
+      if (!window.confirm(message)) {
+        log('已取消改为 Claude 自动路由。');
+        return;
+      }
+      const res = await api('/api/provider-routing', 'POST', { provider_id: id, mode: 'auto', apply: true });
+      setRoutingMode('auto');
+      log(`${res.message}: 已移除 ${res.removed_model || '-'}`);
       await refreshData();
     }
     async function syncCommonEnvSelected() {
@@ -6664,6 +6857,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'copy-anthropic-token') return copyAnthropicToken();
           if (action === 'copy-anthropic-base-url') return copyAnthropicBaseUrl();
           if (action === 'copy-anthropic-env') return copyAnthropicEnv();
+          if (action === 'copy-anthropic-forced-env') return copyAnthropicForcedEnv();
           if (action === 'migrate-cli-home') return migrateCliHome();
           if (action === 'toggle-tokens') return toggleTokens();
           if (action === 'set-current-selected') return setCurrentFromSelected();
@@ -6674,6 +6868,8 @@ INDEX_HTML = """<!doctype html>
           if (action === 'compact-preset-1m') return applyCompactPreset('1000000');
           if (action === 'compact-off') return applyCompactPreset('');
           if (action === 'save-compact-selected') return saveCompactSelected();
+          if (action === 'save-forced-model-selected') return saveForcedModelSelected();
+          if (action === 'clear-forced-model-selected') return clearForcedModelSelected();
           if (action === 'sync-common-env-selected') return syncCommonEnvSelected();
           if (action === 'copy-api-base-url') return copyApiBaseUrl();
           if (action === 'copy-api-env') return copyApiEnv();
@@ -6933,12 +7129,14 @@ def build_handler(
                     provider_name = str(payload.get("provider_name") or "")
                     set_current = bool(payload.get("set_current", True))
                     compact_config = payload.get("compact_config") if isinstance(payload.get("compact_config"), dict) else None
+                    context_config = payload.get("context_config") if isinstance(payload.get("context_config"), dict) else None
                     model_config = payload.get("model_config") if isinstance(payload.get("model_config"), dict) else None
                     result = manager.create_or_update_provider(
                         account_id,
                         provider_name,
                         set_current,
                         compact_config=compact_config,
+                        context_config=context_config,
                         model_config=model_config,
                     )
                     json_response(self, 200, result)
@@ -6951,8 +7149,22 @@ def build_handler(
                 if self.path == "/api/provider-compact":
                     provider_id = str(payload.get("provider_id") or "")
                     compact_config = payload.get("compact_config") if isinstance(payload.get("compact_config"), dict) else {}
+                    context_config = payload.get("context_config") if isinstance(payload.get("context_config"), dict) else None
+                    result = manager.update_provider_compact(provider_id, compact_config, context_config=context_config)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/provider-model":
+                    provider_id = str(payload.get("provider_id") or "")
                     model_config = payload.get("model_config") if isinstance(payload.get("model_config"), dict) else None
-                    result = manager.update_provider_compact(provider_id, compact_config, model_config=model_config)
+                    result = manager.update_provider_forced_model(provider_id, model_config)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/provider-routing":
+                    provider_id = str(payload.get("provider_id") or "")
+                    mode = str(payload.get("mode") or "auto")
+                    if mode != "auto":
+                        raise ValueError("仅支持切换到 Claude 自动路由")
+                    result = manager.clear_provider_forced_model(provider_id, apply=bool(payload.get("apply", False)))
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/sync-common-env":
