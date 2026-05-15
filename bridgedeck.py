@@ -74,10 +74,10 @@ BRIDGE_MODEL_OPTIONS = (
         "max_output_tokens": 128_000,
         "thinking_levels": ("low", "medium", "high", "xhigh"),
     },
-    {"id": "gpt-5.4", "name": "gpt-5.4", "thinking_levels": ("low", "medium", "high", "xhigh")},
-    {"id": "gpt-5.4-mini", "name": "gpt-5.4 Mini", "thinking_levels": ("low", "medium", "high", "xhigh")},
-    {"id": "gpt-5.3-codex", "name": "gpt-5.3-codex"},
-    {"id": "gpt-5.3-codex-spark", "name": "gpt-5.3-codex-spark"},
+    {"id": "gpt-5.4", "name": "gpt-5.4", "context_tokens": 220_000, "thinking_levels": ("low", "medium", "high", "xhigh")},
+    {"id": "gpt-5.4-mini", "name": "gpt-5.4 Mini", "context_tokens": 220_000, "thinking_levels": ("low", "medium", "high", "xhigh")},
+    {"id": "gpt-5.3-codex", "name": "gpt-5.3-codex", "context_tokens": 220_000},
+    {"id": "gpt-5.3-codex-spark", "name": "gpt-5.3-codex-spark", "context_tokens": 220_000},
 )
 MODEL_ENV_KEYS = (
     "ANTHROPIC_MODEL",
@@ -4778,6 +4778,7 @@ INDEX_HTML = """<!doctype html>
                 <label>模型 / 上下文<select id="bridgeModel"></select></label>
                 <label>上下文 tokens<input id="modelContextTokens" type="number" min="10000" max="2000000" step="1000" value="272000" readonly /></label>
               </div>
+              <div class="muted" id="selectedProviderMeta">当前账号 provider：未检测。</div>
               <div class="row">
                 <label><input type="checkbox" id="setCurrent" checked /> 设为当前</label>
                 <button class="primary" data-action="create-provider">创建/更新 Claude 桥接</button>
@@ -5966,16 +5967,18 @@ INDEX_HTML = """<!doctype html>
     function providerById(providerId) {
       return providerId && lastData ? (lastData.providers || []).find((p) => p.id === providerId) || null : null;
     }
-    function providerForSelectedClaudeAccount() {
+    function providerForClaudeAccount(accountId) {
       if (!lastData) return null;
-      const item = selectedAccount('account') || selectedAccount('simpleClaudeAccount');
-      const accountId = item && item.account_id ? item.account_id : '';
       if (!accountId) return null;
       const matches = (lastData.providers || []).filter((p) => p.account_id === accountId && isBridgeClaudeProvider(p));
       return matches.find((p) => p.id === lastData.current_provider_from_settings)
         || matches.find((p) => p.is_current)
         || matches[0]
         || null;
+    }
+    function providerForSelectedClaudeAccount() {
+      const item = selectedAccount('account') || selectedAccount('simpleClaudeAccount');
+      return providerForClaudeAccount(item && item.account_id ? item.account_id : '');
     }
     function currentBridgeClaudeProvider() {
       const provider = currentClaudeProvider(lastData);
@@ -6314,8 +6317,26 @@ INDEX_HTML = """<!doctype html>
       }
       return `Claude 自动路由${context}${slots ? `\n${slots}` : ''}`;
     }
+    function setSelectedProviderMeta(provider) {
+      const box = document.getElementById('selectedProviderMeta');
+      if (!box) return;
+      if (!provider) {
+        box.textContent = '当前账号 provider：未检测到，下面显示的是创建新 provider 的默认值。';
+        return;
+      }
+      const routing = providerRoutingText(provider).replace(/\\n/g, '；');
+      box.innerHTML = `当前账号 provider：<strong>${esc(provider.name || maskId(provider.id || ''))}</strong>；实际路由：${esc(routing || '未检测')}`;
+    }
+    function applyDefaultProviderForm() {
+      setBridgeModel(DEFAULT_BRIDGE_MODEL, false);
+      setRoutingMode('auto');
+      setCompactFields(true, bridgeModelRecommendedCompact(DEFAULT_BRIDGE_MODEL), DEFAULT_COMPACT_PCT);
+      setSelectedProviderMeta(null);
+    }
     function applyCompactFromProvider(provider) {
       if (!provider) return;
+      const nameInput = document.getElementById('providerName');
+      if (nameInput && provider.name) nameInput.value = provider.name;
       setBridgeModel(provider.model || DEFAULT_BRIDGE_MODEL, false);
       setRoutingMode(provider.model ? 'forced' : 'auto');
       if (provider.compact_enabled) {
@@ -6323,12 +6344,24 @@ INDEX_HTML = """<!doctype html>
       } else {
         setCompactFields(false, '', DEFAULT_COMPACT_PCT);
       }
+      setSelectedProviderMeta(provider);
+    }
+    function syncClaudeProviderFormForSelectedAccount(markRadio = true) {
+      const provider = providerForSelectedClaudeAccount();
+      if (!provider) {
+        applyDefaultProviderForm();
+        return null;
+      }
+      applyCompactFromProvider(provider);
+      if (markRadio) markProviderPicked(provider.id);
+      return provider;
     }
     function applyClaudeAccount(item) {
       if (!item) return;
       setSelectValue('account', item.account_id);
       setSelectValue('simpleClaudeAccount', item.account_id);
       document.getElementById('providerName').value = `Local Codex Bridge - ${accountSlug(item)}`;
+      syncClaudeProviderFormForSelectedAccount();
     }
     function applyCliAccount(item) {
       if (!item) return;
@@ -6434,6 +6467,7 @@ INDEX_HTML = """<!doctype html>
         }
         applyGlobalCodexAccount(findAccount(previous.global) || a);
         setSelectValue('simpleApiAccount', previous.api || previous.claude || a.account_id);
+        syncClaudeProviderFormForSelectedAccount(false);
       }
       sel.onchange = () => {
         const item = accounts[sel.selectedIndex];
@@ -6495,11 +6529,13 @@ INDEX_HTML = """<!doctype html>
     function renderProviders(data) {
       const body = document.querySelector('#providersTable tbody');
       body.innerHTML = '';
+      const selectedAccountProvider = providerForSelectedClaudeAccount();
       data.providers.forEach((p) => {
         const tr = document.createElement('tr');
         const currentBySettings = data.current_provider_from_settings === p.id;
+        const checked = selectedAccountProvider && selectedAccountProvider.id === p.id ? ' checked' : '';
         tr.innerHTML = `
-          <td><label class="providerNameCell"><input type="radio" name="providerPick" value="${esc(p.id)}"><span class="providerNameText">${esc(p.name)}</span></label></td>
+          <td><label class="providerNameCell"><input type="radio" name="providerPick" value="${esc(p.id)}"${checked}><span class="providerNameText">${esc(p.name)}</span></label></td>
           <td>${p.is_current ? '<span class="ok">当前</span>' : '<span class="muted">未选</span>'} ${currentBySettings ? '<span class="ok">设置同步</span>' : ''}</td>
           <td class="mono">${esc(maskId(p.account_id || ''))}</td>
           <td class="mono">${esc(p.base_url || '')}</td>

@@ -142,10 +142,10 @@ BRIDGE_MODELS: tuple[BridgeModel, ...] = (
         max_completion_tokens=128000,
         thinking_levels=("low", "medium", "high", "xhigh"),
     ),
-    BridgeModel(id="gpt-5.4", display_name="GPT 5.4", thinking_levels=("low", "medium", "high", "xhigh")),
-    BridgeModel(id="gpt-5.4-mini", display_name="GPT 5.4 Mini", thinking_levels=("low", "medium", "high", "xhigh")),
-    BridgeModel(id="gpt-5.3-codex", display_name="GPT 5.3 Codex"),
-    BridgeModel(id="gpt-5.3-codex-spark", display_name="GPT 5.3 Codex Spark"),
+    BridgeModel(id="gpt-5.4", display_name="GPT 5.4", context_length=220000, thinking_levels=("low", "medium", "high", "xhigh")),
+    BridgeModel(id="gpt-5.4-mini", display_name="GPT 5.4 Mini", context_length=220000, thinking_levels=("low", "medium", "high", "xhigh")),
+    BridgeModel(id="gpt-5.3-codex", display_name="GPT 5.3 Codex", context_length=220000),
+    BridgeModel(id="gpt-5.3-codex-spark", display_name="GPT 5.3 Codex Spark", context_length=220000),
 )
 
 CLAUDE_DESKTOP_MODEL_ROUTES: tuple[dict[str, Any], ...] = (

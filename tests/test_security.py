@@ -1019,6 +1019,10 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(by_id["gpt-5.5"]["thinking"]["levels"], ["low", "medium", "high", "xhigh"])
         self.assertTrue(by_id["gpt-5.5"]["capabilities"]["messages"])
         self.assertTrue(by_id["gpt-5.5"]["capabilities"]["responses"])
+        self.assertEqual(by_id["gpt-5.4"]["context_length"], 220000)
+        self.assertEqual(by_id["gpt-5.4-mini"]["context_length"], 220000)
+        self.assertEqual(by_id["gpt-5.3-codex"]["context_length"], 220000)
+        self.assertEqual(by_id["gpt-5.3-codex-spark"]["context_length"], 220000)
 
     def test_models_registry_exposes_claude_desktop_safe_routes(self) -> None:
         payload = local_codex_bridge.build_models_payload()
@@ -1869,11 +1873,18 @@ class ServerCase(unittest.TestCase):
         self.assertIn("Desktop Gateway", html)
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000", html)
         self.assertIn("272k context / 128k max output", html)
+        self.assertIn('"id": "gpt-5.4"', html)
+        self.assertIn('"context_tokens": 220000', html)
         self.assertIn("copy-api-base-url", html)
         self.assertIn("copy-claude-env", html)
         self.assertIn('id="bridgeModel"', html)
         self.assertIn('id="modelRoutingMode"', html)
         self.assertIn('id="modelContextTokens"', html)
+        self.assertIn('id="selectedProviderMeta"', html)
+        self.assertIn("syncClaudeProviderFormForSelectedAccount", html)
+        self.assertIn("当前账号 provider", html)
+        self.assertIn("replace(/\\n/g, '；')", html)
+        self.assertNotIn("replace(/\n/g", html)
         self.assertIn('data-action="compact-preset-model"', html)
         self.assertIn("context unknown", html)
         self.assertIn('id="compactWindow"', html)
@@ -2963,10 +2974,17 @@ class LauncherCase(unittest.TestCase):
             self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "272000")
 
     def test_unknown_bridge_model_does_not_invent_context(self) -> None:
+        normalized = bridgedeck.normalize_bridge_model_config({"model": "gpt-unknown"})
+
+        self.assertEqual(normalized["model"], "gpt-unknown")
+        self.assertEqual(normalized["context_tokens"], "")
+        self.assertEqual(normalized["max_output_tokens"], "")
+
+    def test_gpt54_bridge_model_uses_known_context(self) -> None:
         normalized = bridgedeck.normalize_bridge_model_config({"model": "gpt-5.4"})
 
         self.assertEqual(normalized["model"], "gpt-5.4")
-        self.assertEqual(normalized["context_tokens"], "")
+        self.assertEqual(normalized["context_tokens"], "220000")
         self.assertEqual(normalized["max_output_tokens"], "")
 
     def test_provider_payload_normalizes_gpt_model_env_ids(self) -> None:
