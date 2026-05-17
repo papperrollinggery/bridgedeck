@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import gzip
 import hashlib
 import json
@@ -45,6 +46,7 @@ MESSAGES_PATHS = {"/v1/messages", "/messages", "/v1/v1/messages"}
 CHAT_COMPLETIONS_PATHS = {"/v1/chat/completions", "/chat/completions", "/v1/v1/chat/completions"}
 UPSTREAM_PROXY_ENV = "CODEX_BRIDGE_UPSTREAM_PROXY"
 ALLOW_REMOTE_ENV = "CODEX_BRIDGE_ALLOW_REMOTE"
+BIND_FAILURE_SLEEP_SECS_ENV = "CODEX_BRIDGE_BIND_FAILURE_SLEEP_SECS"
 STREAM_MAX_RETRIES_ENV = "CODEX_BRIDGE_STREAM_MAX_RETRIES"
 SESSION_AFFINITY_ENV = "CODEX_BRIDGE_SESSION_AFFINITY"
 REASONING_PLACEHOLDER_HEARTBEAT_SECS = 8.0
@@ -200,6 +202,25 @@ CLAUDE_DESKTOP_MODEL_ROUTES: tuple[dict[str, Any], ...] = (
 
 def parse_bool_env(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_non_negative_int_env(value: str | None, default: int) -> int:
+    try:
+        parsed = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return default
+    return max(0, parsed)
+
+
+def is_launchd_context() -> bool:
+    return bool(os.environ.get("XPC_SERVICE_NAME"))
+
+
+def bind_failure_sleep_seconds(exc: OSError) -> int:
+    if not is_launchd_context():
+        return 0
+    default = 300 if exc.errno in {errno.EADDRNOTAVAIL, errno.EADDRINUSE} else 60
+    return parse_non_negative_int_env(os.environ.get(BIND_FAILURE_SLEEP_SECS_ENV), default)
 
 
 def decode_request_body(raw_body: bytes, content_encoding: str | None) -> bytes:
@@ -3292,7 +3313,19 @@ def main() -> int:
         return 1
 
     auth_store = AuthStore(auth_store_path)
-    server = CodexBridgeServer((host, port), CodexBridgeHandler, auth_store)
+    try:
+        server = CodexBridgeServer((host, port), CodexBridgeHandler, auth_store)
+    except OSError as exc:
+        sleep_s = bind_failure_sleep_seconds(exc)
+        print(
+            f"{log_timestamp()} failed to bind local bridge on {host}:{port}: "
+            f"{type(exc).__name__}: {truncate_log_text(str(exc))}; "
+            f"launchd_backoff_s={sleep_s}",
+            file=sys.stderr,
+        )
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+        return 1
     print(
         f"{log_timestamp()} codex bridge listening on http://{host}:{port} (upstream_proxy={mask_proxy_url(proxy_url)})",
         file=sys.stderr,

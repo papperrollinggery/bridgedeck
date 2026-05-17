@@ -4,6 +4,7 @@ import json
 import http.client
 import io
 import base64
+import os
 import sqlite3
 import tempfile
 import threading
@@ -1251,6 +1252,22 @@ class LocalCodexBridgeCase(unittest.TestCase):
         zstd_body = local_codex_bridge.zstd.compress(raw)
         self.assertEqual(local_codex_bridge.decode_request_body(zstd_body, "zstd"), raw)
         self.assertEqual(local_codex_bridge.decode_request_body(zstd_body, None), raw)
+
+    def test_launchd_bind_failure_is_throttled(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "XPC_SERVICE_NAME": "local.bridgedeck.test",
+                "CODEX_BRIDGE_BIND_FAILURE_SLEEP_SECS": "7",
+            },
+            clear=False,
+        ):
+            exc = OSError(local_codex_bridge.errno.EADDRNOTAVAIL, "cannot assign requested address")
+            self.assertEqual(local_codex_bridge.bind_failure_sleep_seconds(exc), 7)
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            exc = OSError(local_codex_bridge.errno.EADDRNOTAVAIL, "cannot assign requested address")
+            self.assertEqual(local_codex_bridge.bind_failure_sleep_seconds(exc), 0)
 
     def test_responses_endpoint_accepts_zstd_request_body_from_codex_cli(self) -> None:
         if local_codex_bridge.zstd is None:
