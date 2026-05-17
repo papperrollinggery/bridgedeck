@@ -63,6 +63,8 @@ COMMON_UPSTREAM_PROXY_PORTS = (1087, 7890, 6152, 8080)
 COMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 COMPACT_THRESHOLD_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 MAX_CONTEXT_TOKENS_ENV = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+CLAUDE_CODE_ATTRIBUTION_HEADER_ENV = "CLAUDE_CODE_ATTRIBUTION_HEADER"
+CLAUDE_CODE_ATTRIBUTION_DISABLED_VALUE = "0"
 DEFAULT_COMPACT_WINDOW_TOKENS = 220_000
 DEFAULT_COMPACT_THRESHOLD_PERCENT = 80
 DEFAULT_BRIDGE_PROVIDER_MODEL = "gpt-5.5"
@@ -98,6 +100,7 @@ SAFE_COMMON_ENV_KEYS = (
     "ENABLE_TOOL_SEARCH",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+    CLAUDE_CODE_ATTRIBUTION_HEADER_ENV,
 )
 PROVIDER_SCOPED_ENV_KEYS = {
     "ANTHROPIC_BASE_URL",
@@ -331,6 +334,35 @@ def common_provider_env(env: dict[str, Any]) -> dict[str, Any]:
     }
     normalize_provider_model_env(common)
     return common
+
+
+def is_claude_attribution_disabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value is False
+    return str(value).strip().lower() in {"0", "false"}
+
+
+def ensure_claude_attribution_default(env: dict[str, Any], *, force: bool = False) -> bool:
+    current = env.get(CLAUDE_CODE_ATTRIBUTION_HEADER_ENV)
+    if force or current is None:
+        env[CLAUDE_CODE_ATTRIBUTION_HEADER_ENV] = CLAUDE_CODE_ATTRIBUTION_DISABLED_VALUE
+        return current != CLAUDE_CODE_ATTRIBUTION_DISABLED_VALUE
+    return False
+
+
+def attribution_env_status(value: Any, *, source_present: bool) -> str:
+    if not source_present:
+        return "unknown"
+    if value is None:
+        return "enabled"
+    return "disabled" if is_claude_attribution_disabled(value) else "enabled"
+
+
+def env_from_json_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    env = payload.get("env")
+    return env if isinstance(env, dict) else {}
 
 
 def strip_toml_section_keys(text: str, section: str, keys: tuple[str, ...]) -> tuple[str, list[str]]:
@@ -1530,6 +1562,7 @@ class BridgeManager:
             for key in SAFE_COMMON_ENV_KEYS
             if isinstance(settings_env, dict) and key in settings_env
         }
+        ensure_claude_attribution_default(safe_env)
 
         def build_next_common(existing: dict[str, Any]) -> tuple[dict[str, Any], list[str], list[str]]:
             next_common = copy.deepcopy(existing)
@@ -2835,6 +2868,7 @@ class BridgeManager:
         env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "gpt-5.3-codex-spark")
         env.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", "gpt-5.3-codex")
         env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "gpt-5.5")
+        ensure_claude_attribution_default(env)
         normalize_provider_model_env(env)
         if compact_config is not None:
             apply_compact_config_to_env(env, compact_config)
@@ -2881,6 +2915,218 @@ class BridgeManager:
         row = rows[0]
         return self._extract_json(row["settings_config"]), self._extract_json(row["meta"])
 
+    def _attribution_source(
+        self,
+        *,
+        source_id: str,
+        label: str,
+        path: str,
+        value: Any,
+        present: bool,
+        scope: str,
+        provider_id: str = "",
+        provider_name: str = "",
+    ) -> dict[str, Any]:
+        status = attribution_env_status(value, source_present=present)
+        return {
+            "id": source_id,
+            "label": label,
+            "path": path,
+            "scope": scope,
+            "provider_id": provider_id,
+            "provider_name": provider_name,
+            "present": present,
+            "status": status,
+            "value": "" if value is None else str(value),
+        }
+
+    def _json_env_file_attribution_source(self, path: Path, source_id: str, label: str) -> dict[str, Any]:
+        if not path.exists():
+            return self._attribution_source(
+                source_id=source_id,
+                label=label,
+                path=str(path),
+                value=None,
+                present=False,
+                scope="file",
+            )
+        if path.is_symlink():
+            return {
+                **self._attribution_source(
+                    source_id=source_id,
+                    label=label,
+                    path=str(path),
+                    value=None,
+                    present=False,
+                    scope="file",
+                ),
+                "error": "symlink_not_allowed",
+            }
+        try:
+            payload = load_json(path, {})
+            env = env_from_json_payload(payload)
+            value = env.get(CLAUDE_CODE_ATTRIBUTION_HEADER_ENV)
+            return self._attribution_source(
+                source_id=source_id,
+                label=label,
+                path=str(path),
+                value=value,
+                present=True,
+                scope="file",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                **self._attribution_source(
+                    source_id=source_id,
+                    label=label,
+                    path=str(path),
+                    value=None,
+                    present=False,
+                    scope="file",
+                ),
+                "error": f"{type(exc).__name__}: {truncate_log_text(str(exc))}",
+            }
+
+    def claude_attribution_header_status(self) -> dict[str, Any]:
+        sources: list[dict[str, Any]] = [
+            self._json_env_file_attribution_source(
+                DEFAULT_CLAUDE_SETTINGS_PATH,
+                "claude_settings",
+                "~/.claude/settings.json",
+            ),
+            self._json_env_file_attribution_source(
+                DEFAULT_CCSWITCH_COMMON_CONFIG_PATH,
+                "ccswitch_common_file",
+                "~/.ccswitch-common-config.json",
+            ),
+        ]
+        skipped_providers: list[dict[str, Any]] = []
+
+        if self.paths.db.exists():
+            try:
+                with self._connect() as conn:
+                    has_settings = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
+                    ).fetchone()
+                    if has_settings:
+                        row = conn.execute(
+                            "SELECT value FROM settings WHERE key = 'common_config_claude'"
+                        ).fetchone()
+                        if row:
+                            common = self._extract_json(row["value"])
+                            env = env_from_json_payload(common)
+                            sources.append(
+                                self._attribution_source(
+                                    source_id="ccswitch_common_db",
+                                    label="CC Switch common_config_claude",
+                                    path=str(self.paths.db),
+                                    value=env.get(CLAUDE_CODE_ATTRIBUTION_HEADER_ENV),
+                                    present=True,
+                                    scope="db_common",
+                                )
+                            )
+                        else:
+                            sources.append(
+                                self._attribution_source(
+                                    source_id="ccswitch_common_db",
+                                    label="CC Switch common_config_claude",
+                                    path=str(self.paths.db),
+                                    value=None,
+                                    present=False,
+                                    scope="db_common",
+                                )
+                            )
+
+                    has_providers = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'providers'"
+                    ).fetchone()
+                    if has_providers:
+                        rows = conn.execute(
+                            """
+                            SELECT id, name, settings_config, meta
+                            FROM providers
+                            WHERE app_type = 'claude'
+                            ORDER BY sort_index ASC, name ASC
+                            """
+                        ).fetchall()
+                        for row in rows:
+                            settings = self._extract_json(row["settings_config"])
+                            meta = self._extract_json(row["meta"])
+                            env = env_from_json_payload(settings)
+                            base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
+                            managed = base_url.startswith(f"{LOCAL_BRIDGE_BASE_URL}/accounts/") or meta.get(
+                                "codexOauthTransport"
+                            ) == "local_bridge"
+                            if not managed:
+                                skipped_providers.append({"id": row["id"], "name": row["name"], "reason": "not_local_bridge"})
+                                continue
+                            sources.append(
+                                self._attribution_source(
+                                    source_id=f"provider:{row['id']}",
+                                    label=f"Provider: {row['name']}",
+                                    path=str(self.paths.db),
+                                    value=env.get(CLAUDE_CODE_ATTRIBUTION_HEADER_ENV),
+                                    present=True,
+                                    scope="provider",
+                                    provider_id=str(row["id"]),
+                                    provider_name=str(row["name"]),
+                                )
+                            )
+            except Exception as exc:  # noqa: BLE001
+                sources.append(
+                    {
+                        **self._attribution_source(
+                            source_id="ccswitch_db",
+                            label="CC Switch DB",
+                            path=str(self.paths.db),
+                            value=None,
+                            present=False,
+                            scope="db",
+                        ),
+                        "error": f"{type(exc).__name__}: {truncate_log_text(str(exc))}",
+                    }
+                )
+        else:
+            sources.append(
+                self._attribution_source(
+                    source_id="ccswitch_db",
+                    label="CC Switch DB",
+                    path=str(self.paths.db),
+                    value=None,
+                    present=False,
+                    scope="db",
+                )
+            )
+
+        known = [item for item in sources if item.get("status") != "unknown"]
+        has_disabled = any(item.get("status") == "disabled" for item in known)
+        has_enabled = any(item.get("status") == "enabled" for item in known)
+        if not known:
+            status = "unknown"
+            message = "未检测到 Claude Code 配置。"
+        elif has_disabled and has_enabled:
+            status = "inconsistent"
+            message = "不同配置源对 CLAUDE_CODE_ATTRIBUTION_HEADER 设置不一致。"
+        elif has_enabled:
+            status = "enabled"
+            message = "Claude Code billing attribution header 未关闭。"
+        else:
+            status = "disabled"
+            message = "已关闭 Claude Code billing attribution header。"
+
+        return {
+            "ok": True,
+            "status": status,
+            "message": message,
+            "env_key": CLAUDE_CODE_ATTRIBUTION_HEADER_ENV,
+            "disabled_value": CLAUDE_CODE_ATTRIBUTION_DISABLED_VALUE,
+            "sources": sources,
+            "skipped_providers": skipped_providers,
+            "disabled_count": sum(1 for item in sources if item.get("status") == "disabled"),
+            "enabled_count": sum(1 for item in sources if item.get("status") == "enabled"),
+            "unknown_count": sum(1 for item in sources if item.get("status") == "unknown"),
+        }
+
     def snapshot(self, include_secrets: bool = False) -> dict[str, Any]:
         try:
             plugin_sync = self.sync_claude_enabled_plugins()
@@ -2922,6 +3168,7 @@ class BridgeManager:
             "auto_switch": self._load_auto_switch_config(),
             "plugin_sync": plugin_sync,
             "plugin_status": plugin_status,
+            "claude_attribution_header": self.claude_attribution_header_status(),
         }
 
         if not self.paths.db.exists():
@@ -2987,6 +3234,13 @@ class BridgeManager:
                         "compact_enabled": bool(str(env.get(COMPACT_WINDOW_ENV) or "").strip()),
                         "compact_window_tokens": env.get(COMPACT_WINDOW_ENV) if isinstance(env.get(COMPACT_WINDOW_ENV), str) else "",
                         "compact_threshold_percent": env.get(COMPACT_THRESHOLD_ENV) if isinstance(env.get(COMPACT_THRESHOLD_ENV), str) else "",
+                        "claude_attribution_header": env.get(CLAUDE_CODE_ATTRIBUTION_HEADER_ENV)
+                        if CLAUDE_CODE_ATTRIBUTION_HEADER_ENV in env
+                        else None,
+                        "claude_attribution_status": attribution_env_status(
+                            env.get(CLAUDE_CODE_ATTRIBUTION_HEADER_ENV),
+                            source_present=True,
+                        ),
                     }
                 )
 
@@ -3863,6 +4117,158 @@ class BridgeManager:
                 "backups": [item for item in (backup, omc_path.get("backup")) if item],
             }
 
+    def _repair_attribution_json_file(self, path: Path, label: str) -> dict[str, Any]:
+        result: dict[str, Any] = {"label": label, "path": str(path), "changed": False, "backup": None}
+        try:
+            if path.is_symlink():
+                result.update({"ok": False, "error": "symlink_not_allowed"})
+                return result
+            payload = load_json(path, {}) if path.exists() else {}
+            if not isinstance(payload, dict):
+                payload = {}
+            env = payload.get("env")
+            if not isinstance(env, dict):
+                env = {}
+            before = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            ensure_claude_attribution_default(env, force=True)
+            payload["env"] = env
+            after = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            if before == after:
+                result["ok"] = True
+                result["already_correct"] = True
+                return result
+            backup = self._backup_file(path, "claude-attribution-header") if path.exists() else None
+            dump_json(path, payload)
+            result.update({"ok": True, "changed": True, "backup": backup})
+            return result
+        except Exception as exc:  # noqa: BLE001
+            result.update({"ok": False, "error": f"{type(exc).__name__}: {truncate_log_text(str(exc))}"})
+            return result
+
+    def repair_claude_attribution_header(self) -> dict[str, Any]:
+        with self._lock:
+            file_results = [
+                self._repair_attribution_json_file(DEFAULT_CLAUDE_SETTINGS_PATH, "~/.claude/settings.json"),
+                self._repair_attribution_json_file(
+                    DEFAULT_CCSWITCH_COMMON_CONFIG_PATH,
+                    "~/.ccswitch-common-config.json",
+                ),
+            ]
+            db_backup: str | None = None
+            db_changed = False
+            updated_providers: list[dict[str, Any]] = []
+            already_correct_providers: list[dict[str, Any]] = []
+            skipped_providers: list[dict[str, Any]] = []
+            db_common_changed = False
+            db_common_already_correct = False
+            db_errors: list[str] = []
+
+            if self.paths.db.exists():
+                try:
+                    conn = self._connect()
+                    try:
+                        has_settings = conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
+                        ).fetchone()
+                        if has_settings:
+                            row = conn.execute(
+                                "SELECT value FROM settings WHERE key = 'common_config_claude'"
+                            ).fetchone()
+                            common = self._extract_json(row["value"]) if row else {}
+                            if not isinstance(common, dict):
+                                common = {}
+                            env = common.get("env")
+                            if not isinstance(env, dict):
+                                env = {}
+                            before = json.dumps(common, ensure_ascii=False, sort_keys=True)
+                            ensure_claude_attribution_default(env, force=True)
+                            common["env"] = env
+                            after = json.dumps(common, ensure_ascii=False, sort_keys=True)
+                            if before == after:
+                                db_common_already_correct = True
+                            else:
+                                if not db_backup:
+                                    db_backup = self._backup_file(self.paths.db, "claude-attribution-header")
+                                conn.execute(
+                                    """
+                                    INSERT INTO settings (key, value)
+                                    VALUES ('common_config_claude', ?)
+                                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                                    """,
+                                    (json.dumps(common, ensure_ascii=False),),
+                                )
+                                db_changed = True
+                                db_common_changed = True
+
+                        has_providers = conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'providers'"
+                        ).fetchone()
+                        if has_providers:
+                            columns = self._provider_columns(conn)
+                            if "settings_config" in columns:
+                                rows = conn.execute(
+                                    """
+                                    SELECT id, name, settings_config, meta
+                                    FROM providers
+                                    WHERE app_type = 'claude'
+                                    ORDER BY sort_index ASC, name ASC
+                                    """
+                                ).fetchall()
+                                for row in rows:
+                                    settings = self._extract_json(row["settings_config"])
+                                    meta = self._extract_json(row["meta"])
+                                    env = env_from_json_payload(settings)
+                                    base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
+                                    managed = base_url.startswith(f"{LOCAL_BRIDGE_BASE_URL}/accounts/") or meta.get(
+                                        "codexOauthTransport"
+                                    ) == "local_bridge"
+                                    if not managed:
+                                        skipped_providers.append({"id": row["id"], "name": row["name"], "reason": "not_local_bridge"})
+                                        continue
+                                    before = json.dumps(settings, ensure_ascii=False, sort_keys=True)
+                                    env = copy.deepcopy(env)
+                                    ensure_claude_attribution_default(env, force=True)
+                                    settings["env"] = env
+                                    after = json.dumps(settings, ensure_ascii=False, sort_keys=True)
+                                    if before == after:
+                                        already_correct_providers.append({"id": row["id"], "name": row["name"]})
+                                        continue
+                                    if not db_backup:
+                                        db_backup = self._backup_file(self.paths.db, "claude-attribution-header")
+                                    conn.execute(
+                                        "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = ?",
+                                        (json.dumps(settings, ensure_ascii=False), row["id"], "claude"),
+                                    )
+                                    updated_providers.append({"id": row["id"], "name": row["name"]})
+                                    db_changed = True
+                        if db_changed:
+                            conn.commit()
+                    finally:
+                        conn.close()
+                except Exception as exc:  # noqa: BLE001
+                    db_errors.append(f"{type(exc).__name__}: {truncate_log_text(str(exc))}")
+
+            status = self.claude_attribution_header_status()
+            return {
+                "ok": not db_errors and all(item.get("ok", True) for item in file_results),
+                "message": "Claude Code Attribution Header 修复完成",
+                "changed": any(item.get("changed") for item in file_results) or db_changed,
+                "files": file_results,
+                "db_common": {
+                    "changed": db_common_changed,
+                    "already_correct": db_common_already_correct,
+                    "path": str(self.paths.db),
+                },
+                "updated_providers": updated_providers,
+                "already_correct_providers": already_correct_providers,
+                "skipped_providers": skipped_providers,
+                "errors": db_errors + [str(item.get("error")) for item in file_results if item.get("error")],
+                "backups": [item for item in [*(r.get("backup") for r in file_results), db_backup] if item],
+                "restart_required": True,
+                "restart_message": "重新打开 Claude Code 或新终端后，所有启动路径会读取新的 env。",
+                "status": status,
+            }
+
     def repair_codex_environment_conflicts(self) -> dict[str, Any]:
         config_path = DEFAULT_CODEX_HOME / "config.toml"
         if config_path.is_symlink():
@@ -4579,6 +4985,17 @@ INDEX_HTML = """<!doctype html>
                 <div class="row">
                   <button class="miniBtn" data-action="extract-safe-common-config">安全提取通用配置</button>
                   <button class="miniBtn" data-action="sync-claude-plugins">一键同步插件启用态</button>
+                </div>
+              </div>
+              <div class="panel">
+                <h2>Claude Code Attribution Header</h2>
+                <div id="attributionHeaderStatus" class="sectionHint">检测中...</div>
+                <div class="muted mt10">关闭动态 billing attribution header，不影响 Claude Code 正常功能、模型质量或 git commit attribution。</div>
+                <div id="attributionHeaderPaths" class="muted mt10">-</div>
+                <div class="row">
+                  <button class="miniBtn" data-action="repair-claude-attribution-header">一键修复</button>
+                  <button class="miniBtn" data-action="show-attribution-header-paths">查看配置位置</button>
+                  <button class="miniBtn" data-action="keep-attribution-header">保持当前设置</button>
                 </div>
               </div>
             </div>
@@ -5483,6 +5900,28 @@ INDEX_HTML = """<!doctype html>
       }
       box.innerHTML = `<span class="ok">已同步</span>：已安装 ${esc(status.installed_count || 0)} 个；common ${esc(status.common_enabled_count || 0)} 个；当前 settings ${esc(status.settings_enabled_count || 0)} 个`;
     }
+    function renderAttributionHeader(data) {
+      const box = document.getElementById('attributionHeaderStatus');
+      const paths = document.getElementById('attributionHeaderPaths');
+      if (!box || !paths) return;
+      const payload = data.claude_attribution_header || {};
+      const status = payload.status || 'unknown';
+      const cls = status === 'disabled' ? 'ok' : (status === 'unknown' ? 'muted' : 'warnText');
+      let text = '未检测到 Claude Code 配置。';
+      if (status === 'disabled') {
+        text = '已关闭 Claude Code billing attribution header。第三方/本地模型更容易命中 prompt cache。';
+      } else if (status === 'enabled') {
+        text = 'Claude Code 可能注入动态 x-anthropic-billing-header，建议关闭以减少 cache 失效、token 增加和推理变慢。';
+      } else if (status === 'inconsistent') {
+        text = '不同配置源设置不一致，某些启动方式仍可能注入动态 header。建议一键修复。';
+      }
+      box.innerHTML = `<span class="${cls}">${esc(status)}</span> · ${esc(text)}`;
+      const sources = Array.isArray(payload.sources) ? payload.sources : [];
+      paths.innerHTML = sources.length
+        ? sources.map((item) => `${esc(item.label || item.id || '')}: <span class="${item.status === 'disabled' ? 'ok' : (item.status === 'unknown' ? 'muted' : 'warnText')}">${esc(item.status || '')}</span> · ${esc(humanPath(item.path || ''))}`).join('<br>')
+        : '-';
+      paths.classList.add('hidden');
+    }
     function renderSimpleActuals(data) {
       const box = document.getElementById('simpleClaudeActual');
       const provider = currentClaudeProvider(data);
@@ -5795,6 +6234,27 @@ INDEX_HTML = """<!doctype html>
       log(`环境冲突清理: ${message}`);
       await refreshServices();
       return res;
+    }
+    async function repairClaudeAttributionHeader() {
+      const res = await api('/api/repair-claude-attribution-header', 'POST', {});
+      const changedFiles = (res.files || []).filter((item) => item.changed).length;
+      const updatedProviders = (res.updated_providers || []).length;
+      const message = `${res.message || '修复完成'}：文件 ${changedFiles} 个，provider ${updatedProviders} 个。${res.restart_message || ''}`;
+      const box = document.getElementById('attributionHeaderStatus');
+      if (box) box.innerHTML = `<span class="ok">${esc(message)}</span>`;
+      log(`Attribution Header 修复: ${message}`);
+      await refreshData();
+      return res;
+    }
+    function showAttributionHeaderPaths() {
+      const box = document.getElementById('attributionHeaderPaths');
+      if (box) box.classList.toggle('hidden');
+    }
+    function keepAttributionHeader() {
+      const box = document.getElementById('attributionHeaderStatus');
+      const message = '已保留当前设置；BridgeDeck 不会在本次操作里改动 attribution header。';
+      if (box) box.innerHTML = `<span class="warnText">${esc(message)}</span>`;
+      log(message);
     }
     function setSimpleResult(message, level='') {
       const box = document.getElementById('simpleResult');
@@ -6113,7 +6573,7 @@ INDEX_HTML = """<!doctype html>
     }
     function anthropicAccessEnv(item) {
       const baseUrl = anthropicAccessBaseUrl(item);
-      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark\nANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex\nANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` : '';
+      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark\nANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex\nANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5\nCLAUDE_CODE_ATTRIBUTION_HEADER=0\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` : '';
     }
     function anthropicForcedModelEnv(item) {
       const base = anthropicAccessEnv(item);
@@ -6724,6 +7184,7 @@ INDEX_HTML = """<!doctype html>
       renderDiagnosis(data);
       renderActualCurrentAccounts(data);
       renderPluginSync(data);
+      renderAttributionHeader(data);
       renderSimpleActuals(data);
       renderAutoSwitchConfig(data);
       refreshServices().catch((e) => {
@@ -6961,6 +7422,9 @@ INDEX_HTML = """<!doctype html>
           if (action === 'proxy-diagnosis') return runProxyDiagnosis();
           if (action === 'repair-quota-query') return repairQuotaQuery();
           if (action === 'repair-codex-env-conflicts') return repairCodexEnvConflicts();
+          if (action === 'repair-claude-attribution-header') return repairClaudeAttributionHeader();
+          if (action === 'show-attribution-header-paths') return showAttributionHeaderPaths();
+          if (action === 'keep-attribution-header') return keepAttributionHeader();
           if (action === 'start-local-bridge') return controlLocalBridge('start');
           if (action === 'stop-local-bridge') return controlLocalBridge('stop');
           if (action === 'restart-local-bridge') return controlLocalBridge('restart');
@@ -7342,6 +7806,10 @@ def build_handler(
                     return
                 if self.path == "/api/repair-codex-env-conflicts":
                     result = manager.repair_codex_environment_conflicts()
+                    json_response(self, 200 if result.get("ok", True) else 400, result)
+                    return
+                if self.path == "/api/repair-claude-attribution-header":
+                    result = manager.repair_claude_attribution_header()
                     json_response(self, 200 if result.get("ok", True) else 400, result)
                     return
                 json_response(self, 404, {"ok": False, "error": "Not Found"})

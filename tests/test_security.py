@@ -198,6 +198,11 @@ class FakeManager:
             ],
             "account_matrix": [],
             "current_provider_from_settings": "",
+            "claude_attribution_header": {
+                "status": "disabled",
+                "message": "已关闭 Claude Code billing attribution header。",
+                "sources": [],
+            },
         }
 
     def set_current_provider(self, provider_id: str) -> dict[str, Any]:
@@ -331,6 +336,16 @@ class FakeManager:
 
     def repair_plus_pro(self) -> dict[str, Any]:
         return {"ok": True}
+
+    def repair_claude_attribution_header(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "message": "Claude Code Attribution Header 修复完成",
+            "changed": True,
+            "files": [{"path": f"{Path.home()}/.claude/settings.json", "changed": True}],
+            "updated_providers": [{"id": "provider-1", "name": "Provider"}],
+            "status": {"status": "disabled"},
+        }
 
     def create_or_sync_cli_home(self, account_id: str, target_dir: str, profile_name: str) -> dict[str, Any]:
         return {"ok": True}
@@ -624,6 +639,125 @@ class LocalCodexBridgeCase(unittest.TestCase):
 
         self.assertEqual(normalized["reasoning"]["effort"], "low")
         self.assertEqual(normalized["reasoning"]["summary"], "concise")
+
+    def test_strip_claude_attribution_header_from_system_prompt_prefix(self) -> None:
+        body = {
+            "model": "claude-sonnet-4-6",
+            "system": "x-anthropic-billing-header: cc_version=2.1.116.d8c; cc_entrypoint=cli; cch=c1d6c;\n\nYou are Claude Code.",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+
+        stripped, result = local_codex_bridge.strip_claude_attribution_from_request(
+            body,
+            request_type="messages",
+            provider_kind="proxy",
+        )
+
+        self.assertTrue(result["stripped"])
+        self.assertEqual(result["field"], "system")
+        self.assertEqual(stripped["system"], "You are Claude Code.")
+        self.assertEqual(body["system"].splitlines()[0].startswith("x-anthropic-billing-header"), True)
+
+    def test_strip_claude_attribution_header_does_not_remove_user_mentions(self) -> None:
+        body = {
+            "messages": [
+                {"role": "user", "content": "Please explain x-anthropic-billing-header in plain English."},
+            ]
+        }
+
+        stripped, result = local_codex_bridge.strip_claude_attribution_from_request(
+            body,
+            request_type="chat.completions",
+            provider_kind="proxy",
+        )
+
+        self.assertFalse(result["stripped"])
+        self.assertEqual(stripped, body)
+
+    def test_strip_claude_attribution_header_from_responses_input_system_item(self) -> None:
+        body = {
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "x-anthropic-billing-header: cc_version=2.1.116.d8c; cc_entrypoint=cli; cch=c1d6c;\n\nStable system prompt.",
+                        }
+                    ],
+                },
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            ]
+        }
+
+        stripped, result = local_codex_bridge.strip_claude_attribution_from_request(
+            body,
+            request_type="responses",
+            provider_kind="proxy",
+        )
+
+        self.assertTrue(result["stripped"])
+        self.assertEqual(result["field"], "input[0].content")
+        self.assertEqual(stripped["input"][0]["content"][0]["text"], "Stable system prompt.")
+        self.assertIn("x-anthropic-billing-header", body["input"][0]["content"][0]["text"])
+
+    def test_strip_claude_attribution_header_respects_provider_and_mode(self) -> None:
+        body = {
+            "system": "x-anthropic-billing-header: cc_version=2.1.116.d8c; cc_entrypoint=cli; cch=c1d6c;\n\nOfficial."
+        }
+
+        official, official_result = local_codex_bridge.strip_claude_attribution_from_request(
+            body,
+            request_type="messages",
+            provider_kind="official_anthropic",
+            mode="auto",
+        )
+        forced, forced_result = local_codex_bridge.strip_claude_attribution_from_request(
+            body,
+            request_type="messages",
+            provider_kind="official_anthropic",
+            mode="always",
+        )
+        never, never_result = local_codex_bridge.strip_claude_attribution_from_request(
+            body,
+            request_type="messages",
+            provider_kind="proxy",
+            mode="never",
+        )
+
+        self.assertFalse(official_result["stripped"])
+        self.assertEqual(official, body)
+        self.assertTrue(forced_result["stripped"])
+        self.assertEqual(forced["system"], "Official.")
+        self.assertFalse(never_result["stripped"])
+        self.assertEqual(never, body)
+
+    def test_claude_attribution_strip_log_omits_prompt_text(self) -> None:
+        result = {
+            "stripped": True,
+            "provider_kind": "proxy",
+            "request_type": "messages",
+            "field": "system",
+            "reason": "third_party_or_proxy",
+            "before_len": 100,
+            "after_len": 20,
+            "before_hash": "abc",
+            "after_hash": "def",
+        }
+
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            local_codex_bridge.log_claude_attribution_strip(
+                account_id="acct-1",
+                route_path="/v1/messages",
+                result=result,
+            )
+
+        log_text = stderr.getvalue()
+        self.assertIn("[claude-attribution-strip]", log_text)
+        self.assertIn('"stripped": true', log_text)
+        self.assertIn('"provider_kind": "proxy"', log_text)
+        self.assertNotIn("x-anthropic-billing-header", log_text)
+        self.assertNotIn("You are Claude Code", log_text)
 
     def test_reasoning_heartbeat_defaults_to_comment_not_output_text(self) -> None:
         response = FakeSseResponse(
@@ -1014,9 +1148,20 @@ class LocalCodexBridgeCase(unittest.TestCase):
 
         self.assertEqual(payload["object"], "list")
         self.assertIn("gpt-5.5", by_id)
+        self.assertEqual(by_id["gpt-5.5"]["slug"], "gpt-5.5")
         self.assertEqual(by_id["gpt-5.5"]["context_length"], 272000)
+        self.assertEqual(by_id["gpt-5.5"]["context_window"], 272000)
         self.assertEqual(by_id["gpt-5.5"]["max_completion_tokens"], 128000)
         self.assertEqual(by_id["gpt-5.5"]["thinking"]["levels"], ["low", "medium", "high", "xhigh"])
+        self.assertEqual(by_id["gpt-5.5"]["default_reasoning_level"], "medium")
+        self.assertEqual(
+            [item["effort"] for item in by_id["gpt-5.5"]["supported_reasoning_levels"]],
+            ["low", "medium", "high", "xhigh"],
+        )
+        self.assertEqual(by_id["gpt-5.5"]["shell_type"], "shell_command")
+        self.assertEqual(by_id["gpt-5.5"]["visibility"], "list")
+        self.assertEqual(by_id["gpt-5.5"]["priority"], 100)
+        self.assertIn("fast", by_id["gpt-5.5"]["additional_speed_tiers"])
         self.assertTrue(by_id["gpt-5.5"]["capabilities"]["messages"])
         self.assertTrue(by_id["gpt-5.5"]["capabilities"]["responses"])
         self.assertEqual(by_id["gpt-5.4"]["context_length"], 220000)
@@ -1028,6 +1173,9 @@ class LocalCodexBridgeCase(unittest.TestCase):
         payload = local_codex_bridge.build_models_payload()
         by_id = {item["id"]: item for item in payload["data"]}
 
+        self.assertEqual(payload["models"], payload["data"])
+        self.assertIn("models", payload)
+        self.assertEqual(by_id["claude-opus-4-7"]["slug"], "claude-opus-4-7")
         self.assertEqual(by_id["claude-haiku-4-5"]["bridge_target_model"], "gpt-5.3-codex-spark")
         self.assertEqual(by_id["claude-sonnet-4-6"]["bridge_target_model"], "gpt-5.3-codex")
         self.assertEqual(by_id["claude-opus-4-7"]["bridge_target_model"], "gpt-5.5")
@@ -1065,10 +1213,14 @@ class LocalCodexBridgeCase(unittest.TestCase):
             payload = json.loads(response.read().decode("utf-8"))
 
         by_id = {item["id"]: item for item in payload["data"]}
+        by_codex_id = {item["id"]: item for item in payload["models"]}
         self.assertEqual(response.status, 200)
         self.assertIn("gpt-5.5", by_id)
         self.assertIn("claude-opus-4-7", by_id)
         self.assertEqual(by_id["gpt-5.5"]["context_length"], 272000)
+        self.assertIn("gpt-5.5", by_codex_id)
+        self.assertEqual(by_codex_id["gpt-5.5"]["context_length"], 272000)
+        self.assertEqual(by_codex_id["gpt-5.5"]["thinking"]["levels"], ["low", "medium", "high", "xhigh"])
 
     def test_models_endpoint_accepts_openai_base_url_path_variants(self) -> None:
         server = self.start_local_bridge_server()
@@ -1080,6 +1232,65 @@ class LocalCodexBridgeCase(unittest.TestCase):
 
                 self.assertEqual(response.status, 200)
                 self.assertIn("gpt-5.5", {item["id"] for item in payload["data"]})
+                self.assertIn("gpt-5.5", {item["id"] for item in payload["models"]})
+
+    def test_decode_request_body_accepts_compressed_json(self) -> None:
+        raw = json.dumps({"model": "gpt-5.5", "input": "hi"}).encode("utf-8")
+
+        self.assertEqual(local_codex_bridge.decode_request_body(raw, None), raw)
+        self.assertEqual(
+            local_codex_bridge.decode_request_body(local_codex_bridge.gzip.compress(raw), "gzip"),
+            raw,
+        )
+        self.assertEqual(
+            local_codex_bridge.decode_request_body(local_codex_bridge.zlib.compress(raw), "deflate"),
+            raw,
+        )
+        if local_codex_bridge.zstd is None:
+            self.skipTest("zstd compression module is unavailable")
+        zstd_body = local_codex_bridge.zstd.compress(raw)
+        self.assertEqual(local_codex_bridge.decode_request_body(zstd_body, "zstd"), raw)
+        self.assertEqual(local_codex_bridge.decode_request_body(zstd_body, None), raw)
+
+    def test_responses_endpoint_accepts_zstd_request_body_from_codex_cli(self) -> None:
+        if local_codex_bridge.zstd is None:
+            self.skipTest("zstd compression module is unavailable")
+        server = self.start_local_bridge_server()
+        client = FakeForwardClient(
+            [
+                FakeForwardResponse(
+                    200,
+                    body=(
+                        b"event: response.output_text.delta\n"
+                        b'data: {"type":"response.output_text.delta","delta":"OK"}\n\n'
+                    ),
+                )
+            ]
+        )
+        request_body = {
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "stream": False,
+        }
+        raw_body = json.dumps(request_body).encode("utf-8")
+        compressed_body = local_codex_bridge.zstd.compress(raw_body)
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/accounts/acct-1/v1/responses",
+            data=compressed_body,
+            method="POST",
+        )
+        request.add_header("Content-Type", "application/json")
+        request.add_header("Content-Encoding", "zstd")
+
+        with mock.patch.object(local_codex_bridge, "build_upstream_http_client", return_value=client):
+            with urllib.request.urlopen(request, timeout=5) as response:
+                response_body = json.loads(response.read().decode("utf-8"))
+
+        sent = client.calls[0]["kwargs"]
+        self.assertEqual(response.status, 200)
+        self.assertEqual(sent["json"]["model"], "gpt-5.5")
+        self.assertEqual(sent["json"]["input"][0]["content"][0], {"type": "input_text", "text": "hi"})
+        self.assertEqual(response_body["output"][0]["content"][0]["text"], "OK")
 
     def test_messages_endpoint_posts_translated_responses_request_to_mock_upstream(self) -> None:
         server = self.start_local_bridge_server()
@@ -1864,6 +2075,8 @@ class ServerCase(unittest.TestCase):
         self.assertIn("ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark", html)
         self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex", html)
         self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5", html)
+        self.assertIn("CLAUDE_CODE_ATTRIBUTION_HEADER=0", html)
+        self.assertIn("repair-claude-attribution-header", html)
         self.assertIn("Claude 自动路由", html)
         self.assertIn("强制主模型", html)
         self.assertIn("copy-anthropic-forced-env", html)
@@ -2159,6 +2372,22 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertIn("ENABLE_TOOL_SEARCH", payload["env_keys"])
+
+    def test_repair_claude_attribution_header_endpoint_returns_report(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/repair-claude-attribution-header",
+            method="POST",
+            body={},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"]["status"], "disabled")
+        self.assertEqual(payload["updated_providers"][0]["id"], "provider-1")
 
     def test_proxy_diagnosis_endpoint_returns_status(self) -> None:
         server, _ = self.start_server()
@@ -2907,6 +3136,7 @@ class LauncherCase(unittest.TestCase):
             self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gpt-5.3-codex-spark")
             self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-5.3-codex")
             self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gpt-5.5")
+            self.assertEqual(env["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0")
             self.assertEqual(meta["apiFormat"], "openai_responses")
             self.assertEqual(meta["codexOauthTransport"], "local_bridge")
             self.assertEqual(meta["authBinding"]["authProvider"], "codex_oauth")
@@ -2944,6 +3174,25 @@ class LauncherCase(unittest.TestCase):
 
             self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", settings["env"])
             self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", settings["env"])
+
+    def test_provider_payload_preserves_explicit_attribution_header_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+
+            settings, _ = manager._build_provider_payload(
+                "acct-1",
+                settings_config={
+                    "env": {
+                        "CLAUDE_CODE_ATTRIBUTION_HEADER": "1",
+                        "ANTHROPIC_BASE_URL": "http://old.example.com",
+                        "ANTHROPIC_AUTH_TOKEN": "old-token",
+                    }
+                },
+            )
+
+            env = settings["env"]
+            self.assertEqual(env["CLAUDE_CODE_ATTRIBUTION_HEADER"], "1")
+            self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "local-bridge")
 
     def test_provider_payload_applies_selected_bridge_model_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3171,6 +3420,7 @@ class LauncherCase(unittest.TestCase):
                 {
                     "ENABLE_TOOL_SEARCH": "true",
                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
                 },
             )
             self.assertNotIn("ANTHROPIC_BASE_URL", loaded["env"])
@@ -3188,9 +3438,134 @@ class LauncherCase(unittest.TestCase):
                 conn.close()
             self.assertEqual(db_common["env"]["ENABLE_TOOL_SEARCH"], "true")
             self.assertEqual(db_common["env"]["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1")
+            self.assertEqual(db_common["env"]["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0")
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", db_common["env"])
             self.assertNotIn("ANTHROPIC_MODEL", db_common["env"])
             self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", db_common["env"])
+
+    def test_claude_attribution_header_status_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            common = root / ".ccswitch-common-config.json"
+            settings = root / ".claude" / "settings.json"
+            settings.parent.mkdir(parents=True, exist_ok=True)
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CCSWITCH_COMMON_CONFIG_PATH", common),
+                mock.patch.object(bridgedeck, "DEFAULT_CLAUDE_SETTINGS_PATH", settings),
+            ):
+                self.assertEqual(manager.claude_attribution_header_status()["status"], "unknown")
+
+                settings.write_text(json.dumps({"env": {}}), encoding="utf-8")
+                self.assertEqual(manager.claude_attribution_header_status()["status"], "enabled")
+
+                common.write_text(json.dumps({"env": {"CLAUDE_CODE_ATTRIBUTION_HEADER": "0"}}), encoding="utf-8")
+                settings.write_text(json.dumps({"env": {"CLAUDE_CODE_ATTRIBUTION_HEADER": "0"}}), encoding="utf-8")
+                self.assertEqual(manager.claude_attribution_header_status()["status"], "disabled")
+
+                common.write_text(json.dumps({"env": {"CLAUDE_CODE_ATTRIBUTION_HEADER": "1"}}), encoding="utf-8")
+                self.assertEqual(manager.claude_attribution_header_status()["status"], "inconsistent")
+
+    def test_repair_claude_attribution_header_updates_managed_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            common = root / ".ccswitch-common-config.json"
+            settings = root / ".claude" / "settings.json"
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            settings.write_text(
+                json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://provider.example.com", "KEEP": "1"}}),
+                encoding="utf-8",
+            )
+            common.write_text(
+                json.dumps({"env": {"CLAUDE_CODE_ATTRIBUTION_HEADER": "1", "ENABLE_TOOL_SEARCH": "true"}}),
+                encoding="utf-8",
+            )
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+                conn.execute(
+                    "INSERT INTO settings VALUES (?, ?)",
+                    ("common_config_claude", json.dumps({"env": {"ENABLE_TOOL_SEARCH": "true"}})),
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE providers (
+                        id TEXT,
+                        name TEXT,
+                        app_type TEXT,
+                        settings_config TEXT,
+                        meta TEXT,
+                        sort_index INTEGER
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        "local",
+                        "Local Codex Bridge - Pro",
+                        "claude",
+                        json.dumps(
+                            {
+                                "env": {
+                                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-1",
+                                    "ANTHROPIC_AUTH_TOKEN": "local-bridge",
+                                    "OTHER": "keep",
+                                }
+                            }
+                        ),
+                        json.dumps({"codexOauthTransport": "local_bridge"}),
+                        1,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        "external",
+                        "External",
+                        "claude",
+                        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://example.com", "OTHER": "keep"}}),
+                        "{}",
+                        2,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CCSWITCH_COMMON_CONFIG_PATH", common),
+                mock.patch.object(bridgedeck, "DEFAULT_CLAUDE_SETTINGS_PATH", settings),
+            ):
+                result = manager.repair_claude_attribution_header()
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["changed"])
+            loaded_settings = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertEqual(loaded_settings["env"]["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0")
+            self.assertEqual(loaded_settings["env"]["ANTHROPIC_BASE_URL"], "https://provider.example.com")
+            loaded_common = json.loads(common.read_text(encoding="utf-8"))
+            self.assertEqual(loaded_common["env"]["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0")
+            self.assertEqual(loaded_common["env"]["ENABLE_TOOL_SEARCH"], "true")
+
+            conn = sqlite3.connect(manager.paths.db)
+            try:
+                db_common = json.loads(
+                    conn.execute("SELECT value FROM settings WHERE key = 'common_config_claude'").fetchone()[0]
+                )
+                self.assertEqual(db_common["env"]["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0")
+                rows = {
+                    row[0]: json.loads(row[1])
+                    for row in conn.execute("SELECT id, settings_config FROM providers ORDER BY id").fetchall()
+                }
+            finally:
+                conn.close()
+            self.assertEqual(rows["local"]["env"]["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0")
+            self.assertEqual(rows["local"]["env"]["OTHER"], "keep")
+            self.assertNotIn("CLAUDE_CODE_ATTRIBUTION_HEADER", rows["external"]["env"])
 
     def test_sync_claude_enabled_plugins_merges_installed_into_common_and_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

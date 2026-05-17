@@ -150,12 +150,19 @@ ANTHROPIC_AUTH_TOKEN=local-bridge
 ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark
 ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex
 ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5
+CLAUDE_CODE_ATTRIBUTION_HEADER=0
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
 ```
 
 不要默认设置 `ANTHROPIC_MODEL`。只有你明确要把所有 Claude Code 主请求强制到某个模型时才设置它；留空时，Claude 的 `haiku` / `sonnet` / `opus` slot 路由才会有意义。
 
 BridgeDeck 也会暴露桌面端安全的 Claude 风格模型别名。遇到客户端限制模型名时，可以用页面显示的别名；页面会同时显示“请求模型”和“实际路由模型”。
+
+### Claude Code Attribution Header
+
+Claude Code 可能在 system prompt 中注入动态 `x-anthropic-billing-header`。官方 Anthropic 直连通常影响较小；第三方、本地、代理模型通道会因为动态 `cch` 破坏 prompt cache，导致 token 增加、推理变慢。BridgeDeck 可通过 `CLAUDE_CODE_ATTRIBUTION_HEADER=0` 关闭，并在非官方代理通道做兜底剥离。
+
+这个优化不影响 Claude Code 正常功能、不影响模型质量、不影响 git commit attribution。只有你明确需要官方 attribution 行为时，才关闭该优化。
 
 ## 用量仪表盘
 

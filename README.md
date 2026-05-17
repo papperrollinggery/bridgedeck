@@ -150,12 +150,19 @@ ANTHROPIC_AUTH_TOKEN=local-bridge
 ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark
 ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex
 ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5
+CLAUDE_CODE_ATTRIBUTION_HEADER=0
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
 ```
 
 Do not set `ANTHROPIC_MODEL` unless you intentionally want to force every main Claude Code request to one model. Leaving it unset keeps Claude's `haiku` / `sonnet` / `opus` slot routing meaningful.
 
 BridgeDeck also exposes desktop-safe Claude-style model aliases so clients with model-name restrictions can route to the intended GPT model while the UI still shows both the requested model and actual routed model.
+
+### Claude Code Attribution Header
+
+Claude Code may inject a dynamic `x-anthropic-billing-header` into the system prompt for attribution/billing analytics. On official Anthropic endpoints this is usually harmless. On third-party, local, or proxy model routes, the dynamic `cch` value can break prompt-cache reuse and increase cost/latency. BridgeDeck can disable it by setting `CLAUDE_CODE_ATTRIBUTION_HEADER=0` and can strip the block at the proxy layer for non-official routes.
+
+This does not affect Claude Code core functionality, model quality, or git commit attribution. Disable the optimization only if you intentionally need official attribution behavior.
 
 ## Usage Dashboard
 

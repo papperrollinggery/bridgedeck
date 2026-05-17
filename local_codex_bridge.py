@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import copy
+import gzip
+import hashlib
 import json
 import os
 import queue
@@ -11,6 +14,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+import zlib
 from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +22,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+try:
+    from compression import zstd
+except Exception:  # noqa: BLE001
+    zstd = None  # type: ignore[assignment]
 
 
 AUTH_STORE_PATH = Path.home() / ".cc-switch" / "codex_oauth_auth.json"
@@ -42,6 +51,11 @@ REASONING_PLACEHOLDER_HEARTBEAT_SECS = 8.0
 REASONING_PLACEHOLDER_MODE_ENV = "CODEX_BRIDGE_REASONING_PLACEHOLDER_MODE"
 STREAM_IDLE_LOG_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_LOG_SECS", "20"))
 STREAM_IDLE_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_FAIL_SECS", "300"))
+STRIP_CLAUDE_ATTRIBUTION_HEADER_ENV = "CODEX_BRIDGE_STRIP_CLAUDE_CODE_ATTRIBUTION_HEADER"
+CLAUDE_ATTRIBUTION_HEADER_RE = re.compile(
+    r"^\s*x-anthropic-billing-header\s*:[^\r\n]*(?:\r?\n){0,2}",
+    re.IGNORECASE,
+)
 RETRYABLE_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 SENSITIVE_QUERY_KEYS = {
     "access_token",
@@ -148,6 +162,17 @@ BRIDGE_MODELS: tuple[BridgeModel, ...] = (
     BridgeModel(id="gpt-5.3-codex-spark", display_name="GPT 5.3 Codex Spark", context_length=220000),
 )
 
+REASONING_LEVEL_DESCRIPTIONS = {
+    "low": "Fast responses with lighter reasoning",
+    "medium": "Balances speed and reasoning depth for everyday tasks",
+    "high": "Greater reasoning depth for complex problems",
+    "xhigh": "Extra high reasoning depth for complex problems",
+}
+
+CODEX_MODEL_BASE_INSTRUCTIONS = (
+    "You are Codex, a coding agent. Follow the user's instructions and use the workspace safely."
+)
+
 CLAUDE_DESKTOP_MODEL_ROUTES: tuple[dict[str, Any], ...] = (
     {
         "id": "claude-haiku-4-5",
@@ -175,6 +200,229 @@ CLAUDE_DESKTOP_MODEL_ROUTES: tuple[dict[str, Any], ...] = (
 
 def parse_bool_env(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def decode_request_body(raw_body: bytes, content_encoding: str | None) -> bytes:
+    encoding = str(content_encoding or "").strip().lower()
+    if not raw_body:
+        return raw_body
+    if not encoding and raw_body.startswith(b"\x28\xb5\x2f\xfd"):
+        encoding = "zstd"
+    if encoding in {"", "identity"}:
+        return raw_body
+    if encoding == "gzip":
+        return gzip.decompress(raw_body)
+    if encoding == "deflate":
+        return zlib.decompress(raw_body)
+    if encoding in {"zstd", "zstandard"}:
+        if zstd is None:
+            raise ValueError("zstd request body is not supported by this Python runtime")
+        return zstd.decompress(raw_body)  # type: ignore[union-attr]
+    raise ValueError(f"unsupported request content-encoding: {encoding}")
+
+
+def strip_claude_attribution_mode() -> str:
+    mode = str(os.environ.get(STRIP_CLAUDE_ATTRIBUTION_HEADER_ENV) or "auto").strip().lower()
+    return mode if mode in {"auto", "always", "never"} else "auto"
+
+
+def should_strip_claude_attribution_header(provider_kind: str, mode: str | None = None) -> tuple[bool, str]:
+    normalized_mode = (mode or strip_claude_attribution_mode()).strip().lower()
+    normalized_provider = (provider_kind or "proxy").strip().lower()
+    if normalized_mode == "always":
+        return True, "mode_always"
+    if normalized_mode == "never":
+        return False, "mode_never"
+    if normalized_provider in {"official_anthropic", "anthropic_official", "official"}:
+        return False, "official_anthropic"
+    return True, "third_party_or_proxy"
+
+
+def _prompt_sha12(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12] if value else ""
+
+
+def _strip_claude_attribution_text(value: str) -> tuple[str, bool]:
+    updated = CLAUDE_ATTRIBUTION_HEADER_RE.sub("", value, count=1)
+    return updated, updated != value
+
+
+def _text_len(value: Any) -> int:
+    return len(value) if isinstance(value, str) else 0
+
+
+def _strip_text_block_value(value: Any) -> tuple[Any, bool, int, int, str, str]:
+    if not isinstance(value, str):
+        return value, False, 0, 0, "", ""
+    before_len = len(value)
+    before_hash = _prompt_sha12(value)
+    updated, changed = _strip_claude_attribution_text(value)
+    return updated, changed, before_len, len(updated), before_hash, _prompt_sha12(updated)
+
+
+def _strip_from_content_first_text(content: Any) -> tuple[Any, bool, int, int, str, str]:
+    if isinstance(content, str):
+        return _strip_text_block_value(content)
+    if not isinstance(content, list) or not content:
+        return content, False, _text_len(content), _text_len(content), "", ""
+    first = content[0]
+    cloned = copy.deepcopy(content)
+    if isinstance(first, str):
+        updated, changed, before_len, after_len, before_hash, after_hash = _strip_text_block_value(first)
+        if not changed:
+            return content, False, before_len, after_len, before_hash, after_hash
+        if updated:
+            cloned[0] = updated
+        else:
+            cloned.pop(0)
+        return cloned, True, before_len, after_len, before_hash, after_hash
+    if isinstance(first, dict) and first.get("type") in {"text", "input_text"} and isinstance(first.get("text"), str):
+        updated, changed, before_len, after_len, before_hash, after_hash = _strip_text_block_value(first["text"])
+        if not changed:
+            return content, False, before_len, after_len, before_hash, after_hash
+        if updated:
+            cloned[0]["text"] = updated
+        else:
+            cloned.pop(0)
+        return cloned, True, before_len, after_len, before_hash, after_hash
+    return content, False, 0, 0, "", ""
+
+
+def _strip_from_anthropic_system(system: Any) -> tuple[Any, bool, int, int, str, str]:
+    if isinstance(system, str):
+        return _strip_text_block_value(system)
+    return _strip_from_content_first_text(system)
+
+
+def strip_claude_attribution_from_request(
+    body: dict[str, Any],
+    *,
+    request_type: str,
+    provider_kind: str = "proxy",
+    mode: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    should_strip, reason = should_strip_claude_attribution_header(provider_kind, mode)
+    result = {
+        "stripped": False,
+        "reason": reason,
+        "provider_kind": provider_kind,
+        "request_type": request_type,
+        "before_len": 0,
+        "after_len": 0,
+        "before_hash": "",
+        "after_hash": "",
+    }
+    if not should_strip:
+        return body, result
+
+    updated_body = copy.deepcopy(body)
+    changed = False
+    if isinstance(updated_body.get("system"), (str, list)):
+        system, changed, before_len, after_len, before_hash, after_hash = _strip_from_anthropic_system(updated_body["system"])
+        if changed:
+            updated_body["system"] = system
+            result.update(
+                {
+                    "stripped": True,
+                    "field": "system",
+                    "before_len": before_len,
+                    "after_len": after_len,
+                    "before_hash": before_hash,
+                    "after_hash": after_hash,
+                }
+            )
+            return updated_body, result
+
+    if isinstance(updated_body.get("instructions"), str):
+        instructions, changed, before_len, after_len, before_hash, after_hash = _strip_text_block_value(updated_body["instructions"])
+        if changed:
+            updated_body["instructions"] = instructions
+            result.update(
+                {
+                    "stripped": True,
+                    "field": "instructions",
+                    "before_len": before_len,
+                    "after_len": after_len,
+                    "before_hash": before_hash,
+                    "after_hash": after_hash,
+                }
+            )
+            return updated_body, result
+
+    messages = updated_body.get("messages")
+    if isinstance(messages, list):
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "")
+            if role not in {"system", "developer"}:
+                continue
+            content, changed, before_len, after_len, before_hash, after_hash = _strip_from_content_first_text(message.get("content"))
+            if changed:
+                updated_body["messages"][index]["content"] = content
+                result.update(
+                    {
+                        "stripped": True,
+                        "field": f"messages[{index}].content",
+                        "before_len": before_len,
+                        "after_len": after_len,
+                        "before_hash": before_hash,
+                        "after_hash": after_hash,
+                    }
+                )
+            break
+
+    input_items = updated_body.get("input")
+    if isinstance(input_items, list):
+        for index, item in enumerate(input_items):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "")
+            if role not in {"system", "developer"}:
+                continue
+            content, changed, before_len, after_len, before_hash, after_hash = _strip_from_content_first_text(item.get("content"))
+            if changed:
+                updated_body["input"][index]["content"] = content
+                result.update(
+                    {
+                        "stripped": True,
+                        "field": f"input[{index}].content",
+                        "before_len": before_len,
+                        "after_len": after_len,
+                        "before_hash": before_hash,
+                        "after_hash": after_hash,
+                    }
+                )
+            break
+
+    return updated_body, result
+
+
+def log_claude_attribution_strip(
+    *,
+    account_id: str | None,
+    route_path: str,
+    result: dict[str, Any],
+) -> None:
+    if not result.get("stripped"):
+        return
+    payload = {
+        "account_id": account_id or "default",
+        "route_path": route_path,
+        "provider_kind": result.get("provider_kind") or "",
+        "request_type": result.get("request_type") or "",
+        "field": result.get("field") or "",
+        "stripped": True,
+        "reason": result.get("reason") or "",
+        "before_len": result.get("before_len") or 0,
+        "after_len": result.get("after_len") or 0,
+        "before_hash": result.get("before_hash") or "",
+        "after_hash": result.get("after_hash") or "",
+    }
+    print(
+        f"{log_timestamp()} [claude-attribution-strip] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}",
+        file=sys.stderr,
+    )
 
 
 def stream_max_retries() -> int:
@@ -318,12 +566,38 @@ def model_payload_item(
 ) -> dict[str, Any]:
     item: dict[str, Any] = {
         "id": model_id or model.id,
+        "slug": model_id or model.id,
         "object": "model",
         "type": "model",
         "created": 0,
         "created_at": "2026-05-07T00:00:00Z",
         "owned_by": "openai",
         "display_name": display_name or model.display_name,
+        "description": display_name or model.display_name,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "minimal_client_version": "0.98.0",
+        "availability_nux": None,
+        "upgrade": None,
+        "priority": 100,
+        "base_instructions": CODEX_MODEL_BASE_INSTRUCTIONS,
+        "model_messages": {
+            "instructions_template": CODEX_MODEL_BASE_INSTRUCTIONS,
+            "instructions_variables": {},
+        },
+        "support_verbosity": True,
+        "default_verbosity": "medium",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text_and_image",
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "supports_parallel_tool_calls": True,
+        "supports_image_detail_original": False,
+        "supports_reasoning_summaries": True,
+        "default_reasoning_summary": "none",
+        "experimental_supported_tools": [],
+        "supports_search_tool": True,
+        "additional_speed_tiers": ["fast"],
         "capabilities": {
             "responses": True,
             "messages": True,
@@ -333,10 +607,21 @@ def model_payload_item(
     }
     if model.context_length is not None:
         item["context_length"] = model.context_length
+        item["context_window"] = model.context_length
+        item["max_context_window"] = model.context_length
+        item["auto_compact_token_limit"] = None
     if model.max_completion_tokens is not None:
         item["max_completion_tokens"] = model.max_completion_tokens
     if model.thinking_levels:
-        item["thinking"] = {"levels": list(model.thinking_levels)}
+        levels = list(model.thinking_levels)
+        item["thinking"] = {"levels": levels}
+        item["default_reasoning_level"] = "medium" if "medium" in levels else levels[0]
+        item["supported_reasoning_levels"] = [
+            {"effort": level, "description": REASONING_LEVEL_DESCRIPTIONS.get(level, level)}
+            for level in levels
+        ]
+    else:
+        item["supported_reasoning_levels"] = []
     return item
 
 
@@ -360,6 +645,7 @@ def build_models_payload() -> dict[str, Any]:
     return {
         "object": "list",
         "data": data,
+        "models": data,
         "has_more": False,
         "first_id": data[0]["id"] if data else None,
         "last_id": data[-1]["id"] if data else None,
@@ -2134,7 +2420,8 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
     def _read_json_body(self) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
-        decoded = json.loads(raw_body.decode("utf-8"))
+        decoded_body = decode_request_body(raw_body, self.headers.get("Content-Encoding"))
+        decoded = json.loads(decoded_body.decode("utf-8"))
         if not isinstance(decoded, dict):
             raise ValueError("request body must be a JSON object")
         return decoded
@@ -2169,6 +2456,16 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         request_id = bridge_request_id()
         try:
             request_body = self._read_json_body()
+            request_body, strip_result = strip_claude_attribution_from_request(
+                request_body,
+                request_type="responses",
+                provider_kind="proxy",
+            )
+            log_claude_attribution_strip(
+                account_id=route_account_id or self.headers.get("chatgpt-account-id"),
+                route_path=route_path,
+                result=strip_result,
+            )
             requested_stream = bool(request_body.get("stream", False))
             requested_account_id = route_account_id or self.headers.get("chatgpt-account-id")
             candidate_account_ids, session_key = self._account_candidates(requested_account_id, request_body)
@@ -2207,6 +2504,16 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         request_id = bridge_request_id()
         try:
             request_body = self._read_json_body()
+            request_body, strip_result = strip_claude_attribution_from_request(
+                request_body,
+                request_type="messages",
+                provider_kind="proxy",
+            )
+            log_claude_attribution_strip(
+                account_id=route_account_id or self.headers.get("chatgpt-account-id"),
+                route_path=route_path,
+                result=strip_result,
+            )
             requested_account_id = route_account_id or self.headers.get("chatgpt-account-id")
             candidate_account_ids, session_key = self._account_candidates(requested_account_id, request_body)
             responses_body = anthropic_messages_to_responses(request_body)
@@ -2246,6 +2553,16 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         request_id = bridge_request_id()
         try:
             request_body = self._read_json_body()
+            request_body, strip_result = strip_claude_attribution_from_request(
+                request_body,
+                request_type="chat.completions",
+                provider_kind="proxy",
+            )
+            log_claude_attribution_strip(
+                account_id=route_account_id or self.headers.get("chatgpt-account-id"),
+                route_path=route_path,
+                result=strip_result,
+            )
             requested_account_id = route_account_id or self.headers.get("chatgpt-account-id")
             candidate_account_ids, session_key = self._account_candidates(requested_account_id, request_body)
             responses_body = chat_completions_to_responses(request_body)
