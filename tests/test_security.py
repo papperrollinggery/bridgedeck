@@ -1636,6 +1636,10 @@ class LocalCodexBridgeCase(unittest.TestCase):
     def test_record_bridge_usage_accumulates_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "bridge-state.json"
+            state_path.write_text(
+                json.dumps({"last_stream_error": {"error": "old timeout"}}),
+                encoding="utf-8",
+            )
             with mock.patch.object(local_codex_bridge, "BRIDGE_STATE_PATH", state_path):
                 local_codex_bridge.record_bridge_usage(
                     account_id="acct-1",
@@ -1683,6 +1687,7 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(payload["usage_events"][0]["client_label"], "Claude Desktop 3P")
         self.assertTrue(payload["usage_events"][0]["desktop_route"])
         self.assertEqual(payload["usage_events"][1]["status_code"], 200)
+        self.assertNotIn("last_stream_error", payload)
 
     def test_chat_stream_converts_response_text_delta_and_done(self) -> None:
         chunks = [

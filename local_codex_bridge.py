@@ -1172,6 +1172,7 @@ def record_bridge_usage(
     events = state.get("usage_events") if isinstance(state.get("usage_events"), list) else []
     events.append(event)
     state["usage_events"] = events[-MAX_USAGE_EVENTS:]
+    state.pop("last_stream_error", None)
     _write_bridge_state(state)
 
 
