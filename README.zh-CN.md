@@ -115,9 +115,17 @@ BridgeDeck 只把 refresh token 写入 CC Switch 兼容的 OAuth 账号池，不
 
 ### 设置全局 Codex CLI 账号
 
-只在工具直接调用默认 `codex` 命令、无法传入自定义命令时使用，例如 Desktop 集成、tmux/OMC shim。
+只在工具直接调用固定 `codex-current.command` 或 tmux/OMC shim 时使用。
 
-BridgeDeck 会先备份，再只把选中账号的 `base_url` 写入 `~/.codex/config.toml`。不会写入 `access_token`、`refresh_token` 或 `id_token`。
+这个动作不会改 Codex Desktop 原生的 `~/.codex/config.toml`，只更新 launcher/shim 路径，也不会写入 `access_token`、`refresh_token` 或 `id_token`。
+
+### Codex Desktop 临时 Bridge 模式
+
+Codex Desktop 默认应保持原生。只有需要紧急测试本地 bridge 时，才在 UI 里显式开启临时 Bridge 模式。该模式会带备份写入带标记的 `model_provider = "bridgedeck"` 配置块，并可用“恢复原生”撤销。
+
+### Codex 原生代理修复
+
+当 Codex Desktop 卡在连接或 WebSocket 重连时，BridgeDeck 可以只修复 `~/.codex/.env`，补齐 HTTP/HTTPS/ALL/WS/WSS 代理变量。该功能不修改 `~/.codex/config.toml`、模型、思考等级、fast mode 或 provider。修复后需要重启 Codex Desktop。
 
 ## 本地 API 接入
 

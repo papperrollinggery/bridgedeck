@@ -1417,9 +1417,12 @@ def normalize_request_body(body: dict[str, Any]) -> dict[str, Any]:
                 "[bridge-normalize] reasoning.effort minimal -> low (model=gpt-5.4)",
                 file=sys.stderr,
             )
+        if not supports_reasoning_summary_model(model_name):
+            reasoning.pop("summary", None)
         summary_mode = reasoning_summary_mode()
         if (
             summary_mode != "off"
+            and supports_reasoning_summary_model(model_name)
             and isinstance(effort, str)
             and effort.strip().lower() not in {"", "none"}
             and not isinstance(reasoning.get("summary"), str)
@@ -1582,6 +1585,11 @@ def supports_reasoning_effort_model(model: str) -> bool:
         return False
     rest = model_lower[4:]
     return bool(rest) and rest[0].isdigit() and rest[0] >= "5"
+
+
+def supports_reasoning_summary_model(model: str) -> bool:
+    model_lower = model.strip().lower()
+    return model_lower not in {"gpt-5.3-codex-spark"}
 
 
 def normalize_codex_model_and_effort(model: str) -> tuple[str, str | None]:

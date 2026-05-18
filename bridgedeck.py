@@ -122,8 +122,31 @@ CANONICAL_BRIDGE_NAMES = (
 MANAGED_CODEX_SHIM_MARKER = "BridgeDeck managed codex-current shim"
 MANAGED_CODEX_PATH_START = "# >>> BridgeDeck codex shim >>>"
 MANAGED_CODEX_PATH_END = "# <<< BridgeDeck codex shim <<<"
+MANAGED_CODEX_DESKTOP_BRIDGE_START = "# >>> BridgeDeck temporary Codex Desktop bridge >>>"
+MANAGED_CODEX_DESKTOP_BRIDGE_END = "# <<< BridgeDeck temporary Codex Desktop bridge <<<"
 PROXY_DIAG_OPENAI_URL = "https://api.openai.com/v1/models"
 PROXY_DIAG_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
+CODEX_PROXY_LOOKUP_KEYS = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy")
+CODEX_NATIVE_PROXY_REQUIRED_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "WS_PROXY",
+    "WSS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "ws_proxy",
+    "wss_proxy",
+    "NO_PROXY",
+    "no_proxy",
+)
+CODEX_NATIVE_NO_PROXY_VALUE = "localhost,127.0.0.1,::1"
+CODEX_NATIVE_PROXY_CANDIDATES = (
+    "http://127.0.0.1:1087",
+    "http://127.0.0.1:7890",
+    "http://127.0.0.1:6789",
+)
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -382,6 +405,61 @@ def strip_toml_section_keys(text: str, section: str, keys: tuple[str, ...]) -> t
                 continue
         output.append(line)
     return "".join(output), sorted(set(removed))
+
+
+def strip_managed_codex_desktop_bridge(text: str) -> tuple[str, bool]:
+    pattern = re.compile(
+        rf"\n?{re.escape(MANAGED_CODEX_DESKTOP_BRIDGE_START)}.*?{re.escape(MANAGED_CODEX_DESKTOP_BRIDGE_END)}\n?",
+        re.DOTALL,
+    )
+    updated, count = pattern.subn("\n", text)
+    return updated.lstrip("\n"), count > 0
+
+
+def strip_legacy_bridgedeck_provider_config(text: str) -> tuple[str, list[str]]:
+    removed: list[str] = []
+    output: list[str] = []
+    skip_section = False
+    legacy_provider = bool(re.search(r'(?m)^\s*model_provider\s*=\s*["\']bridgedeck["\']\s*$', text))
+    top_level_key_pattern = re.compile(r'^\s*(model_provider)\s*=\s*["\']bridgedeck["\']\s*$')
+    legacy_static_key_pattern = re.compile(r"^\s*(model|model_reasoning_effort|service_tier)\s*=")
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            skip_section = stripped == "[model_providers.bridgedeck]"
+            if skip_section:
+                removed.append("model_providers.bridgedeck")
+                continue
+        if skip_section:
+            continue
+        if top_level_key_pattern.match(line):
+            removed.append("model_provider")
+            continue
+        if legacy_provider and legacy_static_key_pattern.match(line):
+            removed.append(legacy_static_key_pattern.match(line).group(1))  # type: ignore[union-attr]
+            continue
+        output.append(line)
+    return "".join(output), sorted(set(removed))
+
+
+def codex_desktop_bridge_block(account_id: str) -> str:
+    base_url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1"
+    return "\n".join(
+        [
+            MANAGED_CODEX_DESKTOP_BRIDGE_START,
+            'model_provider = "bridgedeck"',
+            "",
+            "[model_providers.bridgedeck]",
+            'name = "OpenAI"',
+            f'base_url = "{base_url}"',
+            'wire_api = "responses"',
+            'experimental_bearer_token = "local-bridge"',
+            "requires_openai_auth = false",
+            "supports_websockets = false",
+            MANAGED_CODEX_DESKTOP_BRIDGE_END,
+            "",
+        ]
+    )
 
 
 def bridge_account_id_from_base_url(base_url: str) -> str:
@@ -704,17 +782,86 @@ def load_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def proxy_url_from_env_values(values: dict[str, str]) -> str:
+    for key in CODEX_PROXY_LOOKUP_KEYS:
+        value = str(values.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def detect_codex_proxy_url() -> tuple[str, str]:
     env_file = load_env_file(DEFAULT_CODEX_HOME / ".env")
-    for key in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"):
-        value = str(env_file.get(key) or "").strip()
-        if value:
-            return value, str(DEFAULT_CODEX_HOME / ".env")
-    for key in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"):
+    env_proxy = proxy_url_from_env_values(env_file)
+    if env_proxy:
+        return env_proxy, str(DEFAULT_CODEX_HOME / ".env")
+    for key in CODEX_PROXY_LOOKUP_KEYS:
         value = str(os.environ.get(key) or "").strip()
         if value:
             return value, f"env:{key}"
     return "", ""
+
+
+def choose_codex_native_proxy_url() -> tuple[str, str]:
+    env_path = DEFAULT_CODEX_HOME / ".env"
+    file_proxy = proxy_url_from_env_values(load_env_file(env_path))
+    if file_proxy:
+        host, port = parse_proxy_target(file_proxy)
+        if host and port and tcp_open(host, port):
+            return file_proxy, str(env_path)
+    for key in CODEX_PROXY_LOOKUP_KEYS:
+        value = str(os.environ.get(key) or "").strip()
+        if not value:
+            continue
+        host, port = parse_proxy_target(value)
+        if host and port and tcp_open(host, port):
+            return value, f"env:{key}"
+    for value in CODEX_NATIVE_PROXY_CANDIDATES:
+        host, port = parse_proxy_target(value)
+        if host and port and tcp_open(host, port):
+            return value, "detected-listener"
+    if file_proxy:
+        return file_proxy, str(env_path)
+    for key in CODEX_PROXY_LOOKUP_KEYS:
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value, f"env:{key}"
+    return "", ""
+
+
+def codex_native_proxy_required_values(proxy_url: str) -> dict[str, str]:
+    return {
+        "HTTP_PROXY": proxy_url,
+        "HTTPS_PROXY": proxy_url,
+        "ALL_PROXY": proxy_url,
+        "WS_PROXY": proxy_url,
+        "WSS_PROXY": proxy_url,
+        "http_proxy": proxy_url,
+        "https_proxy": proxy_url,
+        "all_proxy": proxy_url,
+        "ws_proxy": proxy_url,
+        "wss_proxy": proxy_url,
+        "NO_PROXY": CODEX_NATIVE_NO_PROXY_VALUE,
+        "no_proxy": CODEX_NATIVE_NO_PROXY_VALUE,
+    }
+
+
+def update_env_text_with_values(original: str, replacements: dict[str, str]) -> str:
+    output: list[str] = []
+    for raw_line in original.splitlines():
+        stripped = raw_line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in replacements:
+                continue
+        output.append(raw_line.rstrip("\n"))
+    while output and not output[-1].strip():
+        output.pop()
+    if output:
+        output.append("")
+    for key in CODEX_NATIVE_PROXY_REQUIRED_KEYS:
+        output.append(f"{key}={replacements[key]}")
+    return "\n".join(output) + "\n"
 
 
 def parse_proxy_target(proxy_url: str) -> tuple[str, int]:
@@ -1927,6 +2074,11 @@ class BridgeManager:
             "config_path": str(config_path),
             "base_url": "",
             "account_id": "",
+            "model_provider": "",
+            "model": "",
+            "model_reasoning_effort": "",
+            "service_tier": "",
+            "bridge_mode": "native",
             "managed_by": "unknown",
             "risk_flags": [],
         }
@@ -1940,10 +2092,32 @@ class BridgeManager:
         match = re.search(r'^\s*base_url\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
         if match:
             data["base_url"] = match.group(1)
+        provider_match = re.search(r'^\s*model_provider\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+        if provider_match:
+            data["model_provider"] = provider_match.group(1)
+        model_match = re.search(r'^\s*model\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+        if model_match:
+            data["model"] = model_match.group(1)
+        effort_match = re.search(r'^\s*model_reasoning_effort\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+        if effort_match:
+            data["model_reasoning_effort"] = effort_match.group(1)
+        tier_match = re.search(r'^\s*service_tier\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+        if tier_match:
+            data["service_tier"] = tier_match.group(1)
+        provider_base_match = re.search(
+            r'(?ms)^\s*\[model_providers\.bridgedeck\].*?^\s*base_url\s*=\s*["\']([^"\']+)["\']',
+            text,
+        )
+        if provider_base_match and not data["base_url"]:
+            data["base_url"] = provider_base_match.group(1)
         account_match = re.search(r"/accounts/([^/?#]+)/v1", data["base_url"])
         if account_match:
             data["account_id"] = account_match.group(1)
-        if CC_SWITCH_BASE_URL in data["base_url"]:
+        if MANAGED_CODEX_DESKTOP_BRIDGE_START in text or data["model_provider"] == "bridgedeck":
+            data["bridge_mode"] = "bridgedeck_provider"
+            data["managed_by"] = "bridgedeck_provider"
+            data["risk_flags"].append("desktop_bridgedeck_provider")
+        elif CC_SWITCH_BASE_URL in data["base_url"]:
             data["managed_by"] = "cc_switch"
         elif LOCAL_BRIDGE_BASE_URL in data["base_url"]:
             data["managed_by"] = "bridgedeck_or_local_bridge"
@@ -1952,6 +2126,12 @@ class BridgeManager:
             data["managed_by"] = "custom"
         else:
             data["managed_by"] = "default"
+        if data["model"]:
+            data["risk_flags"].append("desktop_static_model")
+        if data["model_reasoning_effort"]:
+            data["risk_flags"].append("desktop_static_reasoning_effort")
+        if data["service_tier"]:
+            data["risk_flags"].append("desktop_static_service_tier")
         return data
 
     def _list_codex_providers(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -2160,10 +2340,118 @@ class BridgeManager:
             },
         }
 
+    def codex_native_proxy_status(self) -> dict[str, Any]:
+        env_path = DEFAULT_CODEX_HOME / ".env"
+        if env_path.is_symlink():
+            return {
+                "ok": False,
+                "status": "blocked",
+                "message": "~/.codex/.env 是符号链接，BridgeDeck 不会修改",
+                "env_path": str(env_path),
+                "proxy_url": "",
+                "proxy_url_masked": "",
+                "proxy_host": "",
+                "proxy_port": 0,
+                "proxy_running": False,
+                "missing_keys": list(CODEX_NATIVE_PROXY_REQUIRED_KEYS),
+                "mismatched_keys": [],
+                "repair_available": False,
+                "restart_required": False,
+            }
+        values = load_env_file(env_path)
+        file_proxy_url = proxy_url_from_env_values(values)
+        repair_proxy_url, repair_source = choose_codex_native_proxy_url()
+        proxy_url = file_proxy_url or repair_proxy_url
+        proxy_host, proxy_port = parse_proxy_target(proxy_url)
+        proxy_running = bool(proxy_host and proxy_port and tcp_open(proxy_host, proxy_port))
+        repair_host, repair_port = parse_proxy_target(repair_proxy_url)
+        repair_running = bool(repair_host and repair_port and tcp_open(repair_host, repair_port))
+        required_values = codex_native_proxy_required_values(proxy_url) if proxy_url else {}
+        missing_keys = [key for key in CODEX_NATIVE_PROXY_REQUIRED_KEYS if not values.get(key)]
+        mismatched_keys = [
+            key
+            for key in CODEX_NATIVE_PROXY_REQUIRED_KEYS
+            if values.get(key) and required_values.get(key) and values.get(key) != required_values[key]
+        ]
+        if not env_path.exists():
+            status = "missing"
+            message = "未发现 ~/.codex/.env，Codex Desktop 可能拿不到显式代理"
+        elif not proxy_url:
+            status = "missing"
+            message = "~/.codex/.env 未配置 Codex 代理"
+        elif not proxy_running:
+            status = "proxy_down"
+            message = "Codex 原生代理端口不可达"
+        elif missing_keys or mismatched_keys:
+            status = "incomplete"
+            message = "Codex 原生代理缺少 WS/WSS 或代理变量不一致"
+        else:
+            status = "ok"
+            message = "Codex 原生代理变量已齐全"
+        return {
+            "ok": status == "ok",
+            "status": status,
+            "message": message,
+            "env_path": str(env_path),
+            "exists": env_path.exists(),
+            "proxy_url": proxy_url,
+            "proxy_url_masked": mask_url_credentials(proxy_url),
+            "proxy_source": str(env_path) if file_proxy_url else repair_source,
+            "proxy_host": proxy_host,
+            "proxy_port": proxy_port,
+            "proxy_running": proxy_running,
+            "missing_keys": missing_keys,
+            "mismatched_keys": mismatched_keys,
+            "required_keys": list(CODEX_NATIVE_PROXY_REQUIRED_KEYS),
+            "repair_proxy_url": repair_proxy_url,
+            "repair_proxy_url_masked": mask_url_credentials(repair_proxy_url),
+            "repair_available": repair_running,
+            "restart_required": status in {"ok", "incomplete"},
+        }
+
+    def repair_codex_native_proxy(self) -> dict[str, Any]:
+        env_path = DEFAULT_CODEX_HOME / ".env"
+        if env_path.is_symlink():
+            raise ValueError("~/.codex/.env 不能是符号链接")
+        proxy_url, proxy_source = choose_codex_native_proxy_url()
+        proxy_host, proxy_port = parse_proxy_target(proxy_url)
+        if not proxy_url or not proxy_host or not proxy_port or not tcp_open(proxy_host, proxy_port):
+            raise ValueError("未检测到可用代理端口，先启动本地代理后再修复")
+        DEFAULT_CODEX_HOME.mkdir(parents=True, exist_ok=True)
+        os.chmod(DEFAULT_CODEX_HOME, 0o700)
+        original = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        updated = update_env_text_with_values(original, codex_native_proxy_required_values(proxy_url))
+        mode_before = env_path.stat().st_mode & 0o777 if env_path.exists() else None
+        changed = updated != original
+        permission_changed = mode_before != 0o600
+        backup = self._backup_file(env_path, "codex-native-proxy") if env_path.exists() and (changed or permission_changed) else None
+        if changed:
+            write_private_text_file(env_path, updated)
+        elif env_path.exists() and permission_changed:
+            os.chmod(env_path, 0o600)
+        status = self.codex_native_proxy_status()
+        return {
+            "ok": True,
+            "changed": changed or permission_changed,
+            "message": "Codex 原生代理已修复" if changed or permission_changed else "Codex 原生代理已是最新",
+            "env_path": str(env_path),
+            "backup": backup,
+            "proxy_url": proxy_url,
+            "proxy_url_masked": mask_url_credentials(proxy_url),
+            "proxy_source": proxy_source,
+            "proxy_host": proxy_host,
+            "proxy_port": proxy_port,
+            "env_keys": list(CODEX_NATIVE_PROXY_REQUIRED_KEYS),
+            "restart_required": True,
+            "restart_message": "完全退出并重启 Codex Desktop 后，新的 ~/.codex/.env 才会被进程读取。",
+            "status": status,
+        }
+
     def proxy_diagnosis(self) -> dict[str, Any]:
         proxy_url, proxy_source = detect_codex_proxy_url()
         proxy_host, proxy_port = parse_proxy_target(proxy_url)
         proxy_running = bool(proxy_host and proxy_port and tcp_open(proxy_host, proxy_port))
+        native_proxy_status = self.codex_native_proxy_status()
 
         checks: list[dict[str, Any]] = [
             {
@@ -2178,6 +2466,13 @@ class BridgeManager:
                 "label": "本地代理监听",
                 "status": "ok" if proxy_running else "failed",
                 "detail": f"{proxy_host}:{proxy_port}" if proxy_running else (f"{proxy_host}:{proxy_port} 不可达" if proxy_host and proxy_port else "未解析到代理地址"),
+            },
+            {
+                "id": "codex_native_proxy_env",
+                "label": "Codex 原生代理 env",
+                "status": native_proxy_status["status"],
+                "detail": native_proxy_status["message"],
+                "missing_keys": native_proxy_status["missing_keys"],
             },
         ]
 
@@ -2292,11 +2587,19 @@ class BridgeManager:
                 "更换节点后重测 chatgpt.com/backend-api/codex",
                 "检查该节点是否只允许基础 API，不兼容 Codex 后端事件流",
             ]
+        elif native_proxy_status.get("status") == "incomplete":
+            status = "native_proxy_incomplete"
+            message = "Codex 原生代理缺少 WS/WSS，WebSocket 可能仍会断链"
+            recommendations = [
+                "点击“修复 Codex 原生代理”补齐 ~/.codex/.env",
+                "完全退出并重启 Codex.app 后重测",
+            ]
 
         return {
             "ok": True,
             "status": status,
             "message": message,
+            "codex_native_proxy": native_proxy_status,
             "proxy": {
                 "source": proxy_source,
                 "url": mask_url_credentials(proxy_url),
@@ -4079,42 +4382,114 @@ class BridgeManager:
             if not isinstance(account_payload, dict):
                 raise ValueError(f"未找到账号: {account_id}")
 
+            current_launcher = self.write_current_codex_launcher(account_id)
+            omc_shims = self.write_omc_codex_shims()
+            omc_path = self.ensure_omc_codex_path()
+            return {
+                "ok": True,
+                "message": "全局 Codex CLI 固定入口已设置",
+                "account_id": account_id,
+                "email": account_payload.get("email", ""),
+                "config_path": str(DEFAULT_CODEX_HOME / "config.toml"),
+                "current_launcher": current_launcher["launcher"],
+                "omc_codex_shims": omc_shims["paths"],
+                "omc_codex_path": omc_path,
+                "base_url": current_launcher["base_url"],
+                "affected": ["codex-current.command", "OMC/tmux codex"],
+                "desktop_affected": False,
+                "removed_env_keys": [],
+                "backups": [item for item in (omc_path.get("backup"),) if item],
+            }
+
+    def enable_codex_desktop_bridge_mode(self, account_id: str) -> dict[str, Any]:
+        account_id = account_id.strip()
+        if not account_id:
+            raise ValueError("account_id 不能为空")
+        with self._lock:
+            store = self._load_auth_store_raw()
+            accounts = store.get("accounts")
+            if not isinstance(accounts, dict):
+                raise ValueError("auth store 缺少 accounts")
+            account_payload = accounts.get(account_id)
+            if not isinstance(account_payload, dict):
+                raise ValueError(f"未找到账号: {account_id}")
             config_path = DEFAULT_CODEX_HOME / "config.toml"
             if config_path.is_symlink():
                 raise ValueError("~/.codex/config.toml 不能是符号链接")
             DEFAULT_CODEX_HOME.mkdir(parents=True, exist_ok=True)
             os.chmod(DEFAULT_CODEX_HOME, 0o700)
-            backup = self._backup_file(config_path, "set-default-codex") if config_path.exists() else None
             original = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-            original, removed_env_keys = strip_toml_section_keys(
-                original,
-                "shell_environment_policy.set",
-                CODEX_GLOBAL_ENV_CONFLICT_KEYS,
-            )
-            base_url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1"
-            line = f'base_url = "{base_url}"'
-            pattern = re.compile(r'(?m)^\s*base_url\s*=\s*["\'][^"\']*["\']\s*$')
-            if pattern.search(original):
-                updated = pattern.sub(line, original, count=1)
-            else:
-                updated = f"{line}\n{original}" if original else f"{line}\n"
-            current_launcher = self.write_current_codex_launcher(account_id)
-            omc_shims = self.write_omc_codex_shims()
-            omc_path = self.ensure_omc_codex_path()
+            cleaned, stripped_managed = strip_managed_codex_desktop_bridge(original)
+            cleaned, stripped_legacy_keys = strip_legacy_bridgedeck_provider_config(cleaned)
+            block = codex_desktop_bridge_block(account_id)
+            updated = f"{block}{cleaned.lstrip()}" if cleaned.strip() else block
+            if updated == original:
+                return {
+                    "ok": True,
+                    "changed": False,
+                    "message": "Codex Desktop 临时 Bridge 模式已是当前配置",
+                    "account_id": account_id,
+                    "config_path": str(config_path),
+                    "base_url": f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1",
+                    "backup": None,
+                    "stripped_managed": stripped_managed,
+                    "stripped_legacy_keys": stripped_legacy_keys,
+                }
+            backup = self._backup_file(config_path, "codex-desktop-bridge-mode") if config_path.exists() else None
             write_private_text_file(config_path, updated)
             return {
                 "ok": True,
-                "message": "默认 Codex 账号已设置",
+                "changed": True,
+                "message": "已开启 Codex Desktop 临时 Bridge 模式",
                 "account_id": account_id,
                 "email": account_payload.get("email", ""),
                 "config_path": str(config_path),
-                "current_launcher": current_launcher["launcher"],
-                "omc_codex_shims": omc_shims["paths"],
-                "omc_codex_path": omc_path,
-                "base_url": base_url,
-                "affected": ["Paperclip", "Codex Desktop", "default codex", "codex-current.command", "OMC/tmux codex"],
-                "removed_env_keys": removed_env_keys,
-                "backups": [item for item in (backup, omc_path.get("backup")) if item],
+                "base_url": f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1",
+                "backup": backup,
+                "stripped_managed": stripped_managed,
+                "stripped_legacy_keys": stripped_legacy_keys,
+                "restart_required": True,
+            }
+
+    def restore_codex_desktop_native_mode(self) -> dict[str, Any]:
+        with self._lock:
+            config_path = DEFAULT_CODEX_HOME / "config.toml"
+            if config_path.is_symlink():
+                raise ValueError("~/.codex/config.toml 不能是符号链接")
+            if not config_path.exists():
+                return {
+                    "ok": True,
+                    "changed": False,
+                    "message": "Codex Desktop 已是原生配置",
+                    "config_path": str(config_path),
+                    "backup": None,
+                    "removed": [],
+                }
+            original = config_path.read_text(encoding="utf-8")
+            updated, stripped_managed = strip_managed_codex_desktop_bridge(original)
+            updated, stripped_legacy_keys = strip_legacy_bridgedeck_provider_config(updated)
+            removed = [*stripped_legacy_keys]
+            if stripped_managed:
+                removed.append("managed_bridge_block")
+            if updated == original:
+                return {
+                    "ok": True,
+                    "changed": False,
+                    "message": "Codex Desktop 已是原生配置",
+                    "config_path": str(config_path),
+                    "backup": None,
+                    "removed": [],
+                }
+            backup = self._backup_file(config_path, "codex-desktop-native-mode")
+            write_private_text_file(config_path, updated)
+            return {
+                "ok": True,
+                "changed": True,
+                "message": "已恢复 Codex Desktop 原生配置",
+                "config_path": str(config_path),
+                "backup": backup,
+                "removed": sorted(set(removed)),
+                "restart_required": True,
             }
 
     def _repair_attribution_json_file(self, path: Path, label: str) -> dict[str, Any]:
@@ -4596,6 +4971,17 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     proxy = redacted.get("proxy")
     if isinstance(proxy, dict) and proxy.get("url"):
         proxy["url"] = "<redacted>"
+    native_proxy = redacted.get("codex_native_proxy")
+    if isinstance(native_proxy, dict):
+        native_proxy["env_path"] = redact_path_value(native_proxy.get("env_path"))
+        if native_proxy.get("proxy_url"):
+            native_proxy["proxy_url"] = "<redacted>"
+        if native_proxy.get("proxy_url_masked"):
+            native_proxy["proxy_url_masked"] = "<redacted>"
+        if native_proxy.get("repair_proxy_url"):
+            native_proxy["repair_proxy_url"] = "<redacted>"
+        if native_proxy.get("repair_proxy_url_masked"):
+            native_proxy["repair_proxy_url_masked"] = "<redacted>"
     return redacted
 
 
@@ -4943,7 +5329,7 @@ INDEX_HTML = """<!doctype html>
                 <div id="overviewClaudeMeta" class="overviewMeta">-</div>
               </div>
               <div class="overviewCard">
-                <div class="overviewLabel">全局 Codex CLI / Desktop</div>
+                <div class="overviewLabel">Codex Desktop / 全局 CLI</div>
                 <div id="overviewDesktopMain" class="overviewMain">检测中...</div>
                 <div id="overviewDesktopMeta" class="overviewMeta">-</div>
               </div>
@@ -5122,7 +5508,7 @@ INDEX_HTML = """<!doctype html>
                 <div class="toolCard">
                   <div>
                     <div class="toolName">全局 Codex CLI</div>
-                    <div class="toolText">给 Paperclip、Codex Desktop、OMC/tmux 和直接运行 codex 使用。</div>
+                    <div class="toolText">只给 codex-current.command 和 OMC/tmux 使用，不改 Codex Desktop。</div>
                     <div class="toolSelect">
                       <label for="simpleDefaultAccount">全局 Codex CLI 用哪个账号</label>
                       <select id="simpleDefaultAccount"></select>
@@ -5132,18 +5518,22 @@ INDEX_HTML = """<!doctype html>
                       <button class="miniBtn" data-action="refresh">刷新</button>
                     </div>
                   </div>
-                  <button class="warn" data-action="simple-default-codex">设为全局 Codex CLI</button>
+                  <button class="warn" data-action="simple-default-codex">设为全局 Codex CLI 固定入口</button>
                 </div>
                 <div class="toolCard">
                   <div>
                     <div class="toolName">Codex Desktop</div>
-                    <div class="toolText">桌面版跟随全局 Codex CLI，这里只显示检测结果。</div>
+                    <div class="toolText">默认保持原生。临时 Bridge 模式会写 provider，可一键恢复。</div>
                     <div class="actualRow">
                       <div class="actualLine" id="simpleDesktopActual">当前实际：检测中...</div>
                       <button class="miniBtn" data-action="refresh">刷新</button>
                     </div>
                   </div>
-                  <button data-action="scroll" data-target="statusCard">查看桌面版状态</button>
+                  <div class="apiEnvActions">
+                    <button class="miniBtn warn" data-action="enable-desktop-bridge-mode">临时接入 BridgeDeck</button>
+                    <button class="miniBtn" data-action="restore-desktop-native-mode">恢复原生</button>
+                    <button class="miniBtn" data-action="scroll" data-target="statusCard">查看状态</button>
+                  </div>
                 </div>
               </div>
               <div class="simpleResult" id="simpleResult">三种入口可以选择不同账号。</div>
@@ -5391,6 +5781,8 @@ INDEX_HTML = """<!doctype html>
               <div class="row">
                 <button class="miniBtn" data-action="refresh-services">刷新服务</button>
                 <button class="miniBtn" data-action="proxy-diagnosis">诊断代理链路</button>
+                <button class="miniBtn" data-action="codex-native-proxy-status">诊断 Codex 原生代理</button>
+                <button class="miniBtn" data-action="repair-codex-native-proxy">修复 Codex 原生代理</button>
                 <button class="miniBtn" data-action="repair-quota-query">一键修复额度查询</button>
                 <button class="miniBtn" data-action="repair-codex-env-conflicts">清理环境冲突</button>
                 <button class="miniBtn" data-action="start-local-bridge">启动 Local Bridge</button>
@@ -5398,7 +5790,7 @@ INDEX_HTML = """<!doctype html>
                 <button class="miniBtn warn" data-action="stop-local-bridge">停止 Local Bridge</button>
                 <button class="miniBtn warn" data-action="stop-bridgedeck-ui">关闭 BridgeDeck UI</button>
               </div>
-              <div id="serviceMessage" class="muted mt10">关闭 BridgeDeck UI 只停 8899，不影响 8876 Local Bridge。</div>
+              <div id="serviceMessage" class="muted mt10">关闭 BridgeDeck UI 只停 8899，不影响 8876 Local Bridge。Codex 原生代理修复只改 ~/.codex/.env，不改模型、provider 或 config.toml。</div>
               <div id="proxyDiagnosis" class="recommend">未诊断</div>
             </div>
           </section>
@@ -5413,7 +5805,7 @@ INDEX_HTML = """<!doctype html>
             </div>
             <div class="card guideSection" id="statusCard" data-guide="status">
               <h2>账号状态检查</h2>
-              <div class="sectionHint">自动检测 Claude Code、单独 Codex CLI、全局 Codex CLI 当前状态。Desktop 跟随全局 Codex CLI。</div>
+              <div class="sectionHint">自动检测 Claude Code、单独 Codex CLI、全局 Codex CLI 当前状态。Codex Desktop 默认保持原生。</div>
               <div class="tableWrap">
                 <table id="accountMatrixTable">
                   <thead>
@@ -5507,7 +5899,8 @@ INDEX_HTML = """<!doctype html>
           'Claude Code 卡片只影响 Claude Code 当前账号。',
           '“当前实际”显示 CC Switch 当前 Claude Provider。',
           '单独 Codex CLI 只生成独立启动器，不改变全局默认。',
-          '全局 Codex CLI 给 Paperclip、Codex Desktop、直接运行 codex 用。',
+          '全局 Codex CLI 只生成固定入口和 OMC/tmux shim，不改 Codex Desktop。',
+          'Codex Desktop 临时 Bridge 模式必须手动开启，随时可恢复原生。',
           '三个入口可以同号，也可以不同号。',
           '下方高级区只在排查时使用。'
         ]
@@ -5953,7 +6346,11 @@ INDEX_HTML = """<!doctype html>
       }
       const desktopBox = document.getElementById('simpleDesktopActual');
       if (desktopBox) {
-        desktopBox.innerHTML = `当前实际：<strong>${esc(desktopAccountText(data))}</strong><br><span class="ok">${esc(desktopModeText(data))}</span>`;
+        const desktop = data.codex_desktop || {};
+        const risk = (desktop.risk_flags || []).includes('desktop_bridgedeck_provider');
+        const staticFlags = (desktop.risk_flags || []).filter((flag) => String(flag).startsWith('desktop_static_'));
+        const extras = staticFlags.length ? `<br><span class="warnText">检测到静态项：${esc(staticFlags.join(', '))}</span>` : '';
+        desktopBox.innerHTML = `当前实际：<strong>${esc(desktopAccountText(data))}</strong><br><span class="${risk ? 'warnText' : 'ok'}">${esc(desktopModeText(data))}</span>${extras}`;
       }
       renderApiAccess();
     }
@@ -6176,6 +6573,33 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('serviceMessage').textContent = payload.message || '代理诊断完成';
       log(`代理诊断: ${payload.status || 'unknown'} / ${payload.message || ''}`);
       return payload;
+    }
+    function nativeProxyMessage(payload) {
+      const missing = Array.isArray(payload.missing_keys) && payload.missing_keys.length
+        ? `缺少 ${payload.missing_keys.join(', ')}`
+        : '';
+      const port = payload.proxy_port ? `端口 ${payload.proxy_port}` : '';
+      const restart = payload.restart_required ? '；修复或变更后需完全重启 Codex Desktop' : '';
+      return [payload.message || 'Codex 原生代理状态未知', port, missing].filter(Boolean).join(' · ') + restart;
+    }
+    async function runCodexNativeProxyStatus() {
+      const payload = await api('/api/codex-native-proxy-status');
+      const message = nativeProxyMessage(payload);
+      document.getElementById('serviceMessage').textContent = message;
+      const box = document.getElementById('proxyDiagnosis');
+      if (box) box.innerHTML = `<b>Codex 原生代理：${esc(payload.status || 'unknown')}</b><br>${esc(message)}`;
+      log(`Codex 原生代理: ${payload.status || 'unknown'} / ${message}`);
+      return payload;
+    }
+    async function repairCodexNativeProxy() {
+      const res = await api('/api/repair-codex-native-proxy', 'POST', {});
+      const status = res.status || {};
+      const message = `${res.message || 'Codex 原生代理修复完成'}。${res.restart_message || '完全重启 Codex Desktop 后生效。'}`;
+      document.getElementById('serviceMessage').textContent = message;
+      const box = document.getElementById('proxyDiagnosis');
+      if (box) box.innerHTML = `<b>${esc(message)}</b><br>${esc(nativeProxyMessage(status))}`;
+      log(`Codex 原生代理修复: ${message}`);
+      return res;
     }
     async function controlLocalBridge(action) {
       let res;
@@ -6879,7 +7303,7 @@ INDEX_HTML = """<!doctype html>
     }
     function renderAccounts(data) {
       const accounts = data.accounts || [];
-      const actualGlobalAccount = data.codex_desktop ? data.codex_desktop.account_id : '';
+      const actualGlobalAccount = data.current_codex_launcher ? data.current_codex_launcher.account_id : '';
       lastAccounts = accounts;
       const sel = document.getElementById('account');
       const cliSel = document.getElementById('cliAccount');
@@ -6966,7 +7390,7 @@ INDEX_HTML = """<!doctype html>
         const item = accounts[simpleDefaultSel.selectedIndex];
         if (!item) return;
         applyGlobalCodexAccount(item);
-        setSimpleResult(`全局 Codex CLI 已选择 ${accountLabel(item)}。点击按钮后才会写入默认配置。`);
+        setSimpleResult(`全局 Codex CLI 已选择 ${accountLabel(item)}。点击按钮后只写固定入口，不改 Codex Desktop。`);
       };
       renderApiAccess();
       renderCliAccounts(accounts);
@@ -7035,6 +7459,7 @@ INDEX_HTML = """<!doctype html>
         default: '默认配置',
         custom: '自定义配置',
         cc_switch: 'CC Switch',
+        bridgedeck_provider: 'BridgeDeck 临时模式',
         bridgedeck_or_local_bridge: 'BridgeDeck 本地桥',
         unknown: '未知'
       };
@@ -7144,10 +7569,10 @@ INDEX_HTML = """<!doctype html>
         advice.push(`发现 ${staleHomes.length} 个旧 CLI tokenful profile：建议迁移为 launcher-only。`);
       }
       if (desktop.account_id || desktop.managed_by) {
-        advice.push(`默认 Codex Desktop/CLI：${desktopAccountText(data)}，${desktopModeText(data)}。`);
+        advice.push(`Codex Desktop：${desktopAccountText(data)}，${desktopModeText(data)}。`);
       } else {
         state = state === 'badState' ? state : 'warnState';
-        advice.push('未检测到 Codex Desktop/默认 CLI 接管状态。');
+        advice.push('未检测到 Codex Desktop 配置状态。');
       }
       if (launcher.exists || launcher.account_id) {
         advice.push(`固定入口/OMC/tmux：${currentLauncherAccountText(data)}，${currentLauncherModeText(data)}；${omcShimText(data)}。`);
@@ -7257,13 +7682,31 @@ INDEX_HTML = """<!doctype html>
       if (!item) return setSimpleResult('先选择一个账号。', 'warn');
       applyGlobalCodexAccount(item);
       document.getElementById('simpleResult').dataset.touched = '1';
-      setSimpleResult(`正在把全局 Codex CLI 设为 ${accountLabel(item)}...`);
+      setSimpleResult(`正在把全局 Codex CLI 固定入口设为 ${accountLabel(item)}...`);
       const res = await api('/api/set-default-codex', 'POST', { account_id: item.account_id });
       await refreshData();
       const currentLauncher = res.current_launcher ? `；固定入口：${humanPath(res.current_launcher)}` : '';
       const omcText = (res.omc_codex_shims || []).length ? '；OMC/tmux 已接管 codex' : '';
-      setSimpleResult(`完成：全局 Codex 已设为 ${accountLabel(item)}${currentLauncher}${omcText}。`, 'ok');
-      log(`${res.message}: ${humanPath(res.config_path)}${currentLauncher}`);
+      setSimpleResult(`完成：全局 Codex CLI 固定入口已设为 ${accountLabel(item)}${currentLauncher}${omcText}；Codex Desktop 未改动。`, 'ok');
+      log(`${res.message}: ${currentLauncher || humanPath(res.current_launcher || '')}`);
+    }
+    async function enableDesktopBridgeMode() {
+      const item = selectedAccount('simpleDefaultAccount') || selectedAccount('simpleApiAccount') || selectedAccount('simpleClaudeAccount');
+      if (!item) return setSimpleResult('先选择一个账号。', 'warn');
+      if (!confirm('临时 Bridge 模式会写入 ~/.codex/config.toml 的 model_provider=bridgedeck。仅用于救急测试，之后可点“恢复原生”。继续？')) return;
+      setSimpleResult(`正在开启 Codex Desktop 临时 Bridge 模式：${accountLabel(item)}...`);
+      const res = await api('/api/codex-desktop-bridge-mode', 'POST', { account_id: item.account_id });
+      await refreshData();
+      const backup = res.backup ? `；备份：${humanPath(res.backup)}` : '';
+      setSimpleResult(`${res.message}：${accountLabel(item)}${backup}。重启 Codex Desktop 后生效。`, 'warn');
+      log(`${res.message}: ${humanPath(res.config_path)}${backup}`);
+    }
+    async function restoreDesktopNativeMode() {
+      const res = await api('/api/codex-desktop-native-mode', 'POST', {});
+      await refreshData();
+      const backup = res.backup ? `；备份：${humanPath(res.backup)}` : '';
+      setSimpleResult(`${res.message}${backup}。重启 Codex Desktop 后生效。`, res.changed ? 'ok' : '');
+      log(`${res.message}: ${humanPath(res.config_path)}；removed=${(res.removed || []).join(', ') || '-'}`);
     }
     async function migrateCliHome() {
       const accountId = document.getElementById('cliAccount').value;
@@ -7388,6 +7831,8 @@ INDEX_HTML = """<!doctype html>
           if (action === 'simple-claude') return simpleClaude();
           if (action === 'simple-cli') return simpleCli();
           if (action === 'simple-default-codex') return simpleDefaultCodex();
+          if (action === 'enable-desktop-bridge-mode') return enableDesktopBridgeMode();
+          if (action === 'restore-desktop-native-mode') return restoreDesktopNativeMode();
           if (action === 'copy-api-key') return copyApiKey();
           if (action === 'copy-api-base-url') return copyApiBaseUrl();
           if (action === 'copy-api-env') return copyApiEnv();
@@ -7420,6 +7865,8 @@ INDEX_HTML = """<!doctype html>
           if (action === 'apply-bridge-dedupe') return dedupeBridgeProviders(true);
           if (action === 'refresh-services') return refreshServices();
           if (action === 'proxy-diagnosis') return runProxyDiagnosis();
+          if (action === 'codex-native-proxy-status') return runCodexNativeProxyStatus();
+          if (action === 'repair-codex-native-proxy') return repairCodexNativeProxy();
           if (action === 'repair-quota-query') return repairQuotaQuery();
           if (action === 'repair-codex-env-conflicts') return repairCodexEnvConflicts();
           if (action === 'repair-claude-attribution-header') return repairClaudeAttributionHeader();
@@ -7595,6 +8042,21 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
+            if parsed.path == "/api/codex-native-proxy-status":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    payload = manager.codex_native_proxy_status()
+                    if not allow_sensitive:
+                        payload = redact_snapshot({"codex_native_proxy": payload})["codex_native_proxy"]
+                    json_response(self, 200, payload)
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
             if parsed.path == "/api/quotas":
                 try:
                     if not self._valid_fetch_metadata():
@@ -7743,6 +8205,15 @@ def build_handler(
                     result = manager.set_default_codex_account(account_id)
                     json_response(self, 200, result)
                     return
+                if self.path == "/api/codex-desktop-bridge-mode":
+                    account_id = str(payload.get("account_id") or "")
+                    result = manager.enable_codex_desktop_bridge_mode(account_id)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/codex-desktop-native-mode":
+                    result = manager.restore_codex_desktop_native_mode()
+                    json_response(self, 200, result)
+                    return
                 if self.path == "/api/migrate-cli-launcher":
                     account_id = str(payload.get("account_id") or "")
                     target_dir = str(payload.get("target_dir") or "")
@@ -7806,6 +8277,10 @@ def build_handler(
                     return
                 if self.path == "/api/repair-codex-env-conflicts":
                     result = manager.repair_codex_environment_conflicts()
+                    json_response(self, 200 if result.get("ok", True) else 400, result)
+                    return
+                if self.path == "/api/repair-codex-native-proxy":
+                    result = manager.repair_codex_native_proxy()
                     json_response(self, 200 if result.get("ok", True) else 400, result)
                     return
                 if self.path == "/api/repair-claude-attribution-header":

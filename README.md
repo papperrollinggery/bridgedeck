@@ -115,9 +115,17 @@ Generated launchers route through the local bridge and do not copy OAuth tokens 
 
 ### Set the Global Codex CLI Account
 
-Use this only for tools that call the default `codex` command and cannot pass a custom command, such as Desktop integrations or tmux/OMC shims.
+Use this only for tools that call the fixed `codex-current.command` path or tmux/OMC shims.
 
-BridgeDeck writes only the selected `base_url` into `~/.codex/config.toml` after making a backup. It does not write `access_token`, `refresh_token`, or `id_token`.
+BridgeDeck does not change Codex Desktop's native `~/.codex/config.toml` for this action. It only updates the launcher/shim path and does not write `access_token`, `refresh_token`, or `id_token`.
+
+### Temporary Codex Desktop Bridge Mode
+
+Codex Desktop should stay native by default. If you need an emergency local bridge test, use the explicit temporary Bridge mode in the UI. It writes a marked `model_provider = "bridgedeck"` block with a backup and can be reverted with `Restore native`.
+
+### Codex Native Proxy Repair
+
+For Codex Desktop connection stalls, BridgeDeck can repair `~/.codex/.env` with HTTP/HTTPS/ALL/WS/WSS proxy variables. This does not change `~/.codex/config.toml`, model selection, reasoning effort, fast mode, or provider settings. Restart Codex Desktop after repairing.
 
 ## Local API Access
 

@@ -275,6 +275,7 @@ class FakeManager:
             "ok": True,
             "status": "healthy",
             "message": "代理链路可用，问题更像 Codex.app 事件会话层重连",
+            "codex_native_proxy": self.codex_native_proxy_status(),
             "proxy": {
                 "source": f"{Path.home()}/.codex/.env",
                 "url": "http://127.0.0.1:1087",
@@ -294,6 +295,31 @@ class FakeManager:
                 {"label": "chatgpt.com Codex 流式探测", "status": "ok", "detail": "HTTP 200"},
             ],
             "recommendations": ["完全退出并重启 Codex.app 后重测"],
+        }
+
+    def codex_native_proxy_status(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "status": "ok",
+            "message": "Codex 原生代理变量已齐全",
+            "env_path": f"{Path.home()}/.codex/.env",
+            "proxy_url": "http://127.0.0.1:1087",
+            "proxy_url_masked": "http://127.0.0.1:1087",
+            "proxy_port": 1087,
+            "proxy_running": True,
+            "missing_keys": [],
+            "mismatched_keys": [],
+            "restart_required": True,
+        }
+
+    def repair_codex_native_proxy(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "changed": True,
+            "message": "Codex 原生代理已修复",
+            "env_keys": list(bridgedeck.CODEX_NATIVE_PROXY_REQUIRED_KEYS),
+            "status": self.codex_native_proxy_status(),
+            "restart_required": True,
         }
 
     def sync_claude_enabled_plugins(self) -> dict[str, Any]:
@@ -358,7 +384,13 @@ class FakeManager:
         return {"ok": True}
 
     def set_default_codex_account(self, account_id: str) -> dict[str, Any]:
-        return {"ok": True}
+        return {"ok": True, "account_id": account_id, "desktop_affected": False}
+
+    def enable_codex_desktop_bridge_mode(self, account_id: str) -> dict[str, Any]:
+        return {"ok": True, "account_id": account_id, "message": "已开启 Codex Desktop 临时 Bridge 模式"}
+
+    def restore_codex_desktop_native_mode(self) -> dict[str, Any]:
+        return {"ok": True, "changed": True, "message": "已恢复 Codex Desktop 原生配置"}
 
     def health(self) -> dict[str, Any]:
         return {"ok": True, "status": "ok", "risk_flags": []}
@@ -625,6 +657,22 @@ class LocalCodexBridgeCase(unittest.TestCase):
         normalized = local_codex_bridge.normalize_request_body(body)
 
         self.assertEqual(normalized["reasoning"]["summary"], "concise")
+        self.assertNotIn("reasoning.summary", normalized["include"])
+        self.assertIn("reasoning.encrypted_content", normalized["include"])
+
+    def test_normalize_strips_reasoning_summary_for_codex_spark(self) -> None:
+        body = {
+            "model": "gpt-5.3-codex-spark",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "stream": True,
+            "reasoning": {"effort": "low", "summary": "concise"},
+            "include": ["reasoning.summary"],
+        }
+
+        normalized = local_codex_bridge.normalize_request_body(body)
+
+        self.assertEqual(normalized["reasoning"]["effort"], "low")
+        self.assertNotIn("summary", normalized["reasoning"])
         self.assertNotIn("reasoning.summary", normalized["include"])
         self.assertIn("reasoning.encrypted_content", normalized["include"])
 
@@ -2080,6 +2128,9 @@ class ServerCase(unittest.TestCase):
         self.assertIn("refreshData(true)", html)
         self.assertIn("单独 Codex CLI", html)
         self.assertIn("全局 Codex CLI", html)
+        self.assertIn("Codex Desktop 临时 Bridge 模式", html)
+        self.assertIn('data-action="enable-desktop-bridge-mode"', html)
+        self.assertIn('data-action="restore-desktop-native-mode"', html)
         self.assertIn("codex-current.command", html)
         self.assertIn("OMC/tmux 已接管 codex", html)
         self.assertIn("当前实际", html)
@@ -2140,7 +2191,10 @@ class ServerCase(unittest.TestCase):
         self.assertIn('data-action="preview-bridge-dedupe"', html)
         self.assertIn('data-action="apply-bridge-dedupe"', html)
         self.assertIn('data-action="proxy-diagnosis"', html)
+        self.assertIn('data-action="codex-native-proxy-status"', html)
+        self.assertIn('data-action="repair-codex-native-proxy"', html)
         self.assertIn('id="proxyDiagnosis"', html)
+        self.assertIn("不改模型、provider 或 config.toml", html)
         self.assertIn('id="anthropicAccessToken"', html)
         self.assertIn('id="anthropicAccessBaseUrl"', html)
         self.assertIn("ANTHROPIC_AUTH_TOKEN", html)
@@ -2153,7 +2207,7 @@ class ServerCase(unittest.TestCase):
         self.assertIn("return apiAccessBaseUrl(item);", html)
         self.assertNotIn("__LOCAL_BRIDGE_BASE_URL__", html)
         self.assertIn('id="actualCurrentAccounts"', html)
-        self.assertIn("const actualGlobalAccount = data.codex_desktop", html)
+        self.assertIn("const actualGlobalAccount = data.current_codex_launcher", html)
         self.assertIn("row.account_id === desktopAccount ? '默认' : '备用'", html)
         self.assertIn("固定入口/OMC/tmux", html)
         self.assertIn("~/.codex/auth.json token", html)
@@ -2165,6 +2219,29 @@ class ServerCase(unittest.TestCase):
         self.assertNotIn("今天用哪个账号", html)
         self.assertNotIn("默认 Codex Desktop/CLI：只检测", html)
         self.assertNotIn("只检测，不由 BridgeDeck 接管", html)
+
+    def test_codex_desktop_mode_endpoints_require_explicit_post(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/codex-desktop-bridge-mode",
+            method="POST",
+            body={"account_id": "acct-1"},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["message"], "已开启 Codex Desktop 临时 Bridge 模式")
+
+        status, payload = self.request(
+            server,
+            "/api/codex-desktop-native-mode",
+            method="POST",
+            body={},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["message"], "已恢复 Codex Desktop 原生配置")
 
     def test_quota_summary_marks_limit_states(self) -> None:
         payload = {
@@ -2424,6 +2501,32 @@ class ServerCase(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["status"], "healthy")
         self.assertEqual(payload["proxy"]["port"], 1087)
+        self.assertEqual(payload["codex_native_proxy"]["status"], "ok")
+
+    def test_codex_native_proxy_endpoints_return_status_and_repair(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/codex-native-proxy-status",
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["proxy_port"], 1087)
+
+        status, payload = self.request(
+            server,
+            "/api/repair-codex-native-proxy",
+            method="POST",
+            body={},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertIn("WS_PROXY", payload["env_keys"])
 
     def test_dedupe_bridge_providers_endpoint_defaults_to_preview(self) -> None:
         server, _ = self.start_server()
@@ -2640,6 +2743,84 @@ class ServerCase(unittest.TestCase):
 
         self.assertEqual(value, "http://127.0.0.1:1087")
         self.assertEqual(source, str(codex_home / ".env"))
+
+    def test_codex_native_proxy_status_marks_missing_websocket_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = bridgedeck.BridgeManager(
+                bridgedeck.ManagerPaths(
+                    db=root / ".cc-switch" / "cc-switch.db",
+                    settings=root / ".cc-switch" / "settings.json",
+                    auth_store=root / ".cc-switch" / "codex_oauth_auth.json",
+                )
+            )
+            codex_home = root / ".codex"
+            codex_home.mkdir(parents=True)
+            (codex_home / ".env").write_text(
+                "\n".join(
+                    [
+                        "HTTP_PROXY=http://127.0.0.1:1087",
+                        "HTTPS_PROXY=http://127.0.0.1:1087",
+                        "ALL_PROXY=http://127.0.0.1:1087",
+                        "http_proxy=http://127.0.0.1:1087",
+                        "https_proxy=http://127.0.0.1:1087",
+                        "all_proxy=http://127.0.0.1:1087",
+                        "NO_PROXY=127.0.0.1,localhost,::1",
+                        "no_proxy=127.0.0.1,localhost,::1",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(bridgedeck, "tcp_open", return_value=True),
+            ):
+                status = manager.codex_native_proxy_status()
+
+        self.assertEqual(status["status"], "incomplete")
+        self.assertIn("WS_PROXY", status["missing_keys"])
+        self.assertIn("WSS_PROXY", status["missing_keys"])
+
+    def test_repair_codex_native_proxy_env_adds_ws_keys_and_preserves_unrelated_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = bridgedeck.BridgeManager(
+                bridgedeck.ManagerPaths(
+                    db=root / ".cc-switch" / "cc-switch.db",
+                    settings=root / ".cc-switch" / "settings.json",
+                    auth_store=root / ".cc-switch" / "codex_oauth_auth.json",
+                )
+            )
+            codex_home = root / ".codex"
+            codex_home.mkdir(parents=True)
+            env_path = codex_home / ".env"
+            config_path = codex_home / "config.toml"
+            env_path.write_text(
+                "CUSTOM_FLAG=keep\nHTTP_PROXY=http://127.0.0.1:1087\nNO_PROXY=old\n",
+                encoding="utf-8",
+            )
+            os.chmod(env_path, 0o644)
+            config_path.write_text('model = "gpt-5.5"\nmodel_reasoning_effort = "xhigh"\n', encoding="utf-8")
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(bridgedeck, "tcp_open", side_effect=lambda host, port, timeout=0.25: port == 1087),
+            ):
+                result = manager.repair_codex_native_proxy()
+
+            body = env_path.read_text(encoding="utf-8")
+            self.assertTrue(result["changed"])
+            self.assertIn("CUSTOM_FLAG=keep", body)
+            self.assertIn("WS_PROXY=http://127.0.0.1:1087", body)
+            self.assertIn("WSS_PROXY=http://127.0.0.1:1087", body)
+            self.assertIn("ws_proxy=http://127.0.0.1:1087", body)
+            self.assertIn("wss_proxy=http://127.0.0.1:1087", body)
+            self.assertIn("NO_PROXY=localhost,127.0.0.1,::1", body)
+            self.assertNotIn("127.0.0.1:6789", body)
+            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(config_path.read_text(encoding="utf-8"), 'model = "gpt-5.5"\nmodel_reasoning_effort = "xhigh"\n')
 
     def test_probe_remote_url_uses_explicit_proxy_handler(self) -> None:
         class FakeResponse:
@@ -4248,7 +4429,7 @@ class LauncherCase(unittest.TestCase):
             self.assertEqual(status["managed_by"], "cc_switch")
             self.assertEqual(config.read_text(encoding="utf-8"), original)
 
-    def test_set_default_codex_account_writes_only_base_url(self) -> None:
+    def test_set_default_codex_account_writes_launcher_only_and_leaves_desktop_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manager = self.make_manager(root)
@@ -4289,15 +4470,16 @@ class LauncherCase(unittest.TestCase):
             launcher = launcher_dir / "codex-current.command"
             launcher_body = launcher.read_text(encoding="utf-8")
             self.assertTrue(result["ok"])
-            self.assertIn('base_url = "http://127.0.0.1:8876/accounts/acct-1/v1"', body)
+            self.assertIn('base_url = "http://127.0.0.1:15721/v1"', body)
+            self.assertNotIn('base_url = "http://127.0.0.1:8876/accounts/acct-1/v1"', body)
             self.assertIn('model = "gpt-5.5"', body)
-            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", body)
-            self.assertNotIn("ANTHROPIC_BASE_URL", body)
+            self.assertIn("ANTHROPIC_AUTH_TOKEN", body)
+            self.assertIn("ANTHROPIC_BASE_URL", body)
             self.assertIn("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", body)
-            self.assertEqual(result["removed_env_keys"], ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"])
+            self.assertEqual(result["removed_env_keys"], [])
             self.assertNotIn("secret-refresh-token", body)
             self.assertNotIn("access_token", body)
-            self.assertTrue(result["backups"])
+            self.assertFalse(result["desktop_affected"])
             self.assertEqual(result["current_launcher"], str(launcher))
             self.assertIn('export OPENAI_API_KEY="local-bridge"', launcher_body)
             self.assertIn('base_url="http://127.0.0.1:8876/accounts/acct-1/v1"', launcher_body)
@@ -4312,6 +4494,79 @@ class LauncherCase(unittest.TestCase):
                 shim_body = path.read_text(encoding="utf-8")
                 self.assertIn(bridgedeck.MANAGED_CODEX_SHIM_MARKER, shim_body)
                 self.assertIn(str(launcher), shim_body)
+
+    def test_codex_desktop_bridge_mode_is_explicit_and_restorable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text('notify = ["done"]\n', encoding="utf-8")
+
+            with mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home):
+                enabled = manager.enable_codex_desktop_bridge_mode("acct-1")
+                status = manager._codex_desktop_status()
+
+            body = config.read_text(encoding="utf-8")
+            self.assertTrue(enabled["changed"])
+            self.assertIn(bridgedeck.MANAGED_CODEX_DESKTOP_BRIDGE_START, body)
+            self.assertIn('model_provider = "bridgedeck"', body)
+            self.assertIn("[model_providers.bridgedeck]", body)
+            self.assertIn('base_url = "http://127.0.0.1:8876/accounts/acct-1/v1"', body)
+            self.assertIn('experimental_bearer_token = "local-bridge"', body)
+            self.assertIn('supports_websockets = false', body)
+            self.assertNotIn('model = "gpt-5.5"', body)
+            self.assertNotIn('service_tier = "fast"', body)
+            self.assertEqual(status["managed_by"], "bridgedeck_provider")
+            self.assertEqual(status["account_id"], "acct-1")
+
+            with mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home):
+                restored = manager.restore_codex_desktop_native_mode()
+
+            self.assertTrue(restored["changed"])
+            self.assertEqual(config.read_text(encoding="utf-8"), 'notify = ["done"]\n')
+            self.assertIn("managed_bridge_block", restored["removed"])
+
+    def test_restore_codex_desktop_native_mode_removes_legacy_bridgedeck_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text(
+                '\n'.join(
+                    [
+                        'model_provider = "bridgedeck"',
+                        'model = "gpt-5.5"',
+                        'model_reasoning_effort = "xhigh"',
+                        'service_tier = "fast"',
+                        "",
+                        "[model_providers.bridgedeck]",
+                        'name = "OpenAI"',
+                        'base_url = "http://127.0.0.1:8876/accounts/acct-1/v1"',
+                        'wire_api = "responses"',
+                        "",
+                        "[features]",
+                        "hooks = true",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home):
+                result = manager.restore_codex_desktop_native_mode()
+
+            body = config.read_text(encoding="utf-8")
+            self.assertTrue(result["changed"])
+            self.assertNotIn("bridgedeck", body)
+            self.assertNotIn('model = "gpt-5.5"', body)
+            self.assertNotIn("model_reasoning_effort", body)
+            self.assertNotIn("service_tier", body)
+            self.assertIn("[features]", body)
+            self.assertIn("hooks = true", body)
 
     def test_set_default_codex_account_does_not_change_config_if_launcher_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
