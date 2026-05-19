@@ -3282,6 +3282,19 @@ class LauncherCase(unittest.TestCase):
                     "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     ("desktop-1", "claude-desktop", "Local Codex Bridge - Pro", settings, meta, None, 1, 1),
                 )
+                external_settings = json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_BASE_URL": "https://api.example.test/anthropic",
+                            "ANTHROPIC_AUTH_TOKEN": "test-token",
+                        }
+                    }
+                )
+                external_meta = json.dumps({"apiFormat": "anthropic", "claudeDesktopMode": "proxy"})
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("desktop-2", "claude-desktop", "External Model", external_settings, external_meta, None, 0, 2),
+                )
 
             with (
                 mock.patch.object(manager, "sync_claude_enabled_plugins", return_value={"ok": True, "changed": False}),
@@ -3291,11 +3304,16 @@ class LauncherCase(unittest.TestCase):
                 snapshot = manager.snapshot(include_secrets=False)
 
         self.assertEqual(len(snapshot["providers"]), 1)
-        self.assertEqual(len(snapshot["claude_desktop_providers"]), 1)
-        desktop = snapshot["claude_desktop_providers"][0]
+        self.assertEqual(len(snapshot["claude_desktop_providers"]), 2)
+        desktop = next(item for item in snapshot["claude_desktop_providers"] if item["id"] == "desktop-1")
         self.assertEqual(desktop["surface"], "claude_desktop")
+        self.assertEqual(desktop["desktop_route_scope"], "local_bridge")
         self.assertFalse(desktop["desktop_routes_ok"])
         self.assertGreater(snapshot["ccswitch_315"]["desktop_route_issue_count"], 0)
+        external = next(item for item in snapshot["claude_desktop_providers"] if item["id"] == "desktop-2")
+        self.assertEqual(external["desktop_route_scope"], "unmanaged")
+        self.assertTrue(external["desktop_routes_ok"])
+        self.assertEqual(external["desktop_route_issues"], [])
 
     def test_repair_ccswitch_315_desktop_routes_previews_then_applies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

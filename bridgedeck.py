@@ -2314,8 +2314,22 @@ class BridgeManager:
             account_id = bridge_account_id_from_env(env)
         auth_token = env.get("ANTHROPIC_AUTH_TOKEN") if isinstance(env.get("ANTHROPIC_AUTH_TOKEN"), str) else ""
         forced_model = env.get("ANTHROPIC_MODEL") if isinstance(env.get("ANTHROPIC_MODEL"), str) else ""
+        base_url = env.get("ANTHROPIC_BASE_URL") if isinstance(env.get("ANTHROPIC_BASE_URL"), str) else ""
         routes = meta.get("claudeDesktopModelRoutes") if isinstance(meta.get("claudeDesktopModelRoutes"), dict) else {}
-        _normalized_meta, route_issues, route_changed = normalize_claude_desktop_routes(meta, env)
+        desktop_route_scope = "unmanaged"
+        route_issues: list[dict[str, Any]] = []
+        route_changed = False
+        if app_type == "claude-desktop":
+            managed_desktop_bridge = bool(
+                account_id
+                and (
+                    base_url.startswith(f"{LOCAL_BRIDGE_BASE_URL}/accounts/")
+                    or meta.get("codexOauthTransport") == "local_bridge"
+                )
+            )
+            if managed_desktop_bridge:
+                desktop_route_scope = "local_bridge"
+                _normalized_meta, route_issues, route_changed = normalize_claude_desktop_routes(meta, env)
 
         return {
             "id": row["id"],
@@ -2329,11 +2343,12 @@ class BridgeManager:
             "api_format": meta.get("apiFormat") if isinstance(meta.get("apiFormat"), str) else "",
             "desktop_mode": meta.get("claudeDesktopMode") if isinstance(meta.get("claudeDesktopMode"), str) else "",
             "desktop_routes": routes,
+            "desktop_route_scope": desktop_route_scope,
             "desktop_route_issues": route_issues if app_type == "claude-desktop" else [],
             "desktop_routes_ok": (not route_changed) if app_type == "claude-desktop" else True,
             "desktop_requires_local_routing": app_type == "claude-desktop" and meta.get("claudeDesktopMode") == "proxy",
             "account_id": account_id,
-            "base_url": env.get("ANTHROPIC_BASE_URL") if isinstance(env.get("ANTHROPIC_BASE_URL"), str) else "",
+            "base_url": base_url,
             "model": forced_model,
             "routing_mode": "forced" if forced_model else "claude_auto",
             "model_is_legacy_default": forced_model == DEFAULT_BRIDGE_PROVIDER_MODEL,
