@@ -1252,6 +1252,38 @@ class LocalCodexBridgeCase(unittest.TestCase):
 
                 self.assertEqual(body["model"], expected)
 
+    def test_prepare_upstream_responses_body_only_emits_prompt_cache_key_with_session_identity(self) -> None:
+        body = {
+            "model": "gpt-5.5",
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "lookup",
+                    "arguments": '{"b":2,"a":1}',
+                }
+            ],
+        }
+
+        without_session, without_meta = local_codex_bridge.prepare_upstream_responses_body(body, session_key=None)
+        with_session, with_meta = local_codex_bridge.prepare_upstream_responses_body(body, session_key="x-session-id:thread-1")
+
+        self.assertNotIn("prompt_cache_key", without_session)
+        self.assertFalse(without_meta["prompt_cache_key_present"])
+        self.assertIn("prompt_cache_key", with_session)
+        self.assertTrue(with_meta["prompt_cache_key_present"])
+        self.assertEqual(with_meta["cache_key_source"], "session_identity")
+        self.assertEqual(with_session["input"][0]["arguments"], '{"a":1,"b":2}')
+
+    def test_prompt_cache_key_can_be_disabled_by_env(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_BRIDGE_PROMPT_CACHE_KEY": "never"}):
+            body, meta = local_codex_bridge.prepare_upstream_responses_body(
+                {"model": "gpt-5.5"},
+                session_key="x-session-id:thread-1",
+            )
+
+        self.assertNotIn("prompt_cache_key", body)
+        self.assertEqual(meta["cache_key_source"], "disabled")
+
     def test_models_endpoint_is_account_scoped_and_ignores_sensitive_query(self) -> None:
         server = self.start_local_bridge_server()
         request = urllib.request.Request(
@@ -1535,6 +1567,37 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn('"content":"hi"', body)
         self.assertIn("data: [DONE]", body)
         self.assertNotIn("response.output_text.delta", body)
+
+    def test_responses_forward_adds_prompt_cache_key_from_session_header(self) -> None:
+        server = self.start_local_bridge_server()
+        client = FakeForwardClient(
+            [
+                FakeForwardResponse(
+                    200,
+                    body=(
+                        b"event: response.completed\n"
+                        b'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
+                    ),
+                )
+            ]
+        )
+
+        with mock.patch.object(local_codex_bridge, "build_upstream_http_client", return_value=client):
+            status, _body, _headers = self.post_local_bridge_json(
+                server,
+                "/accounts/acct-1/v1/responses",
+                {
+                    "model": "gpt-5.5",
+                    "stream": True,
+                    "input": [{"type": "function_call", "name": "lookup", "arguments": '{"z":1,"a":2}'}],
+                },
+                headers={"Accept": "text/event-stream", "x-session-id": "thread-1"},
+            )
+
+        sent_body = client.calls[0]["kwargs"]["json"]
+        self.assertEqual(status, 200)
+        self.assertIn("prompt_cache_key", sent_body)
+        self.assertEqual(sent_body["input"][0]["arguments"], '{"a":2,"z":1}')
 
     def test_anthropic_messages_request_maps_text_tools_and_thinking_to_responses(self) -> None:
         payload = local_codex_bridge.anthropic_messages_to_responses(
@@ -3170,6 +3233,134 @@ class LauncherCase(unittest.TestCase):
         self.assertTrue(providers[0]["embedded_token_stale"])
         self.assertFalse(providers[0]["token_mismatch"])
 
+    def test_snapshot_lists_claude_desktop_surface_and_route_issues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(manager.paths.db) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE providers (
+                        id TEXT,
+                        app_type TEXT,
+                        name TEXT,
+                        settings_config TEXT,
+                        meta TEXT,
+                        provider_type TEXT,
+                        is_current BOOLEAN,
+                        sort_index INTEGER
+                    )
+                    """
+                )
+                settings = json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-1",
+                            "ANTHROPIC_AUTH_TOKEN": "local-bridge",
+                            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.3-codex-spark",
+                            "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.3-codex",
+                            "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-5.5",
+                        }
+                    }
+                )
+                meta = json.dumps(
+                    {
+                        "apiFormat": "openai_responses",
+                        "claudeDesktopMode": "proxy",
+                        "authBinding": {"source": "managed_account", "authProvider": "codex_oauth", "accountId": "acct-1"},
+                        "claudeDesktopModelRoutes": {
+                            "claude-opus-4-7": {"model": "gpt-5.5", "labelOverride": "gpt-5.5"}
+                        },
+                    }
+                )
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("code-1", "claude", "Local Codex Bridge - Pro", settings, json.dumps({}), None, 1, 1),
+                )
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("desktop-1", "claude-desktop", "Local Codex Bridge - Pro", settings, meta, None, 1, 1),
+                )
+
+            with (
+                mock.patch.object(manager, "sync_claude_enabled_plugins", return_value={"ok": True, "changed": False}),
+                mock.patch.object(manager, "claude_plugin_sync_status", return_value={"ok": True}),
+                mock.patch.object(manager, "claude_attribution_header_status", return_value={"ok": True, "status": "disabled"}),
+            ):
+                snapshot = manager.snapshot(include_secrets=False)
+
+        self.assertEqual(len(snapshot["providers"]), 1)
+        self.assertEqual(len(snapshot["claude_desktop_providers"]), 1)
+        desktop = snapshot["claude_desktop_providers"][0]
+        self.assertEqual(desktop["surface"], "claude_desktop")
+        self.assertFalse(desktop["desktop_routes_ok"])
+        self.assertGreater(snapshot["ccswitch_315"]["desktop_route_issue_count"], 0)
+
+    def test_repair_ccswitch_315_desktop_routes_previews_then_applies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            manager.paths.db.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(manager.paths.db) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE providers (
+                        id TEXT,
+                        app_type TEXT,
+                        name TEXT,
+                        settings_config TEXT,
+                        meta TEXT,
+                        provider_type TEXT,
+                        is_current BOOLEAN,
+                        sort_index INTEGER
+                    )
+                    """
+                )
+                settings = json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-1",
+                            "ANTHROPIC_AUTH_TOKEN": "local-bridge",
+                            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.3-codex-spark",
+                            "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.3-codex",
+                            "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-5.5",
+                        }
+                    }
+                )
+                meta = json.dumps(
+                    {
+                        "apiFormat": "openai_responses",
+                        "claudeDesktopMode": "proxy",
+                        "authBinding": {"source": "managed_account", "authProvider": "codex_oauth", "accountId": "acct-1"},
+                        "claudeDesktopModelRoutes": {
+                            "claude-opus-4-7": {"model": "gpt-5.5", "labelOverride": "gpt-5.5"}
+                        },
+                    }
+                )
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("desktop-1", "claude-desktop", "Local Codex Bridge - Pro", settings, meta, None, 1, 1),
+                )
+
+            preview = manager.repair_ccswitch_315_desktop_routes(apply=False)
+            with sqlite3.connect(manager.paths.db) as conn:
+                before_meta = json.loads(conn.execute("SELECT meta FROM providers WHERE id='desktop-1'").fetchone()[0])
+            applied = manager.repair_ccswitch_315_desktop_routes(apply=True)
+            with sqlite3.connect(manager.paths.db) as conn:
+                after_meta = json.loads(conn.execute("SELECT meta FROM providers WHERE id='desktop-1'").fetchone()[0])
+
+        self.assertFalse(preview["apply"])
+        self.assertTrue(preview["plan"][0]["changed"])
+        self.assertNotIn("claude-haiku-4-5", before_meta["claudeDesktopModelRoutes"])
+        self.assertTrue(applied["apply"])
+        self.assertEqual(applied["updated"][0]["id"], "desktop-1")
+        routes = after_meta["claudeDesktopModelRoutes"]
+        self.assertEqual(routes["claude-haiku-4-5"]["model"], "gpt-5.3-codex-spark")
+        self.assertEqual(routes["claude-sonnet-4-6"]["model"], "gpt-5.3-codex")
+        self.assertEqual(routes["claude-opus-4-7"]["model"], "gpt-5.5")
+        self.assertFalse(routes["claude-opus-4-7"]["supports1m"])
+
     def test_create_cli_launcher_does_not_refresh_or_write_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4502,7 +4693,7 @@ class LauncherCase(unittest.TestCase):
             codex_home = root / ".codex"
             codex_home.mkdir()
             config = codex_home / "config.toml"
-            config.write_text('notify = ["done"]\n', encoding="utf-8")
+            config.write_text('model = "gpt-5.5"\nmodel_reasoning_effort = "xhigh"\nnotify = ["done"]\n', encoding="utf-8")
 
             with mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home):
                 enabled = manager.enable_codex_desktop_bridge_mode("acct-1")
@@ -4517,9 +4708,12 @@ class LauncherCase(unittest.TestCase):
             self.assertIn('experimental_bearer_token = "local-bridge"', body)
             self.assertIn('supports_websockets = false', body)
             self.assertNotIn('model = "gpt-5.5"', body)
+            self.assertNotIn("model_reasoning_effort", body)
             self.assertNotIn('service_tier = "fast"', body)
             self.assertEqual(status["managed_by"], "bridgedeck_provider")
             self.assertEqual(status["account_id"], "acct-1")
+            self.assertIn("model", enabled["stripped_legacy_keys"])
+            self.assertIn("model_reasoning_effort", enabled["stripped_legacy_keys"])
 
             with mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home):
                 restored = manager.restore_codex_desktop_native_mode()
@@ -4527,6 +4721,40 @@ class LauncherCase(unittest.TestCase):
             self.assertTrue(restored["changed"])
             self.assertEqual(config.read_text(encoding="utf-8"), 'notify = ["done"]\n')
             self.assertIn("managed_bridge_block", restored["removed"])
+
+    def test_restore_codex_desktop_native_mode_removes_static_native_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text(
+                "\n".join(
+                    [
+                        'model = "gpt-5.5"',
+                        'model_reasoning_effort = "xhigh"',
+                        'service_tier = "fast"',
+                        "",
+                        "[features]",
+                        "hooks = true",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home):
+                result = manager.restore_codex_desktop_native_mode()
+
+            body = config.read_text(encoding="utf-8")
+            self.assertTrue(result["changed"])
+            self.assertNotIn('model = "gpt-5.5"', body)
+            self.assertNotIn("model_reasoning_effort", body)
+            self.assertNotIn("service_tier", body)
+            self.assertIn("[features]", body)
+            self.assertIn("hooks = true", body)
+            self.assertEqual(result["removed"], ["model", "model_reasoning_effort", "service_tier"])
 
     def test_restore_codex_desktop_native_mode_removes_legacy_bridgedeck_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

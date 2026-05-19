@@ -119,6 +119,31 @@ CANONICAL_BRIDGE_NAMES = (
     "Local Codex Bridge - Pro",
     "Local Codex Bridge - Pro 20x",
 )
+PROVIDER_SURFACE_APP_TYPES = {
+    "claude_code": "claude",
+    "claude_desktop": "claude-desktop",
+}
+PROVIDER_APP_TYPE_SURFACES = {value: key for key, value in PROVIDER_SURFACE_APP_TYPES.items()}
+CLAUDE_DESKTOP_ROUTE_SPECS = (
+    {
+        "alias": "claude-haiku-4-5",
+        "slot": "haiku",
+        "env": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "default_model": "gpt-5.3-codex-spark",
+    },
+    {
+        "alias": "claude-sonnet-4-6",
+        "slot": "sonnet",
+        "env": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "default_model": "gpt-5.3-codex",
+    },
+    {
+        "alias": "claude-opus-4-7",
+        "slot": "opus",
+        "env": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "default_model": "gpt-5.5",
+    },
+)
 MANAGED_CODEX_SHIM_MARKER = "BridgeDeck managed codex-current shim"
 MANAGED_CODEX_PATH_START = "# >>> BridgeDeck codex shim >>>"
 MANAGED_CODEX_PATH_END = "# <<< BridgeDeck codex shim <<<"
@@ -349,6 +374,87 @@ def clear_forced_bridge_model_from_env(env: dict[str, Any]) -> str:
     return model if isinstance(model, str) else ""
 
 
+def provider_surface_app_type(surface: str | None) -> str:
+    normalized = str(surface or "claude_code").strip().lower().replace("-", "_")
+    if normalized in PROVIDER_SURFACE_APP_TYPES:
+        return PROVIDER_SURFACE_APP_TYPES[normalized]
+    if normalized in PROVIDER_APP_TYPE_SURFACES:
+        return normalized
+    raise ValueError(f"不支持的 provider surface: {surface}")
+
+
+def provider_surface_for_app_type(app_type: str | None) -> str:
+    return PROVIDER_APP_TYPE_SURFACES.get(str(app_type or "").strip(), str(app_type or "").strip() or "unknown")
+
+
+def bridge_model_context_tokens(model_id: str | None) -> int:
+    option = bridge_model_option(model_id)
+    if option and option.get("context_tokens"):
+        return int(option["context_tokens"])
+    return 0
+
+
+def bridge_model_supports_1m(model_id: str | None) -> bool:
+    return bridge_model_context_tokens(model_id) >= 1_000_000
+
+
+def claude_desktop_routes_from_env(env: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    routes: dict[str, dict[str, Any]] = {}
+    for spec in CLAUDE_DESKTOP_ROUTE_SPECS:
+        model = normalize_openai_model_id(env.get(spec["env"]) or spec["default_model"])
+        routes[spec["alias"]] = {
+            "model": model,
+            "labelOverride": model,
+            "supports1m": bridge_model_supports_1m(model),
+        }
+    return routes
+
+
+def normalize_claude_desktop_routes(meta: dict[str, Any], env: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    next_meta = copy.deepcopy(meta)
+    routes = next_meta.get("claudeDesktopModelRoutes")
+    current_routes = routes if isinstance(routes, dict) else {}
+    expected = claude_desktop_routes_from_env(env)
+    issues: list[dict[str, Any]] = []
+    changed = False
+
+    if next_meta.get("apiFormat") != "openai_responses":
+        issues.append({"field": "meta.apiFormat", "current": next_meta.get("apiFormat"), "expected": "openai_responses"})
+        next_meta["apiFormat"] = "openai_responses"
+        changed = True
+    if next_meta.get("claudeDesktopMode") != "proxy":
+        issues.append({"field": "meta.claudeDesktopMode", "current": next_meta.get("claudeDesktopMode"), "expected": "proxy"})
+        next_meta["claudeDesktopMode"] = "proxy"
+        changed = True
+
+    normalized_routes = copy.deepcopy(current_routes)
+    for alias, wanted in expected.items():
+        existing = normalized_routes.get(alias)
+        if not isinstance(existing, dict):
+            issues.append({"field": f"route.{alias}", "current": "missing", "expected": wanted})
+            normalized_routes[alias] = copy.deepcopy(wanted)
+            changed = True
+            continue
+        next_route = copy.deepcopy(existing)
+        for key, wanted_value in wanted.items():
+            if next_route.get(key) != wanted_value:
+                issues.append(
+                    {
+                        "field": f"route.{alias}.{key}",
+                        "current": next_route.get(key),
+                        "expected": wanted_value,
+                    }
+                )
+                next_route[key] = wanted_value
+                changed = True
+        normalized_routes[alias] = next_route
+
+    if next_meta.get("claudeDesktopModelRoutes") != normalized_routes:
+        next_meta["claudeDesktopModelRoutes"] = normalized_routes
+        changed = True
+    return next_meta, issues, changed
+
+
 def common_provider_env(env: dict[str, Any]) -> dict[str, Any]:
     common = {
         str(key): copy.deepcopy(value)
@@ -416,26 +522,28 @@ def strip_managed_codex_desktop_bridge(text: str) -> tuple[str, bool]:
     return updated.lstrip("\n"), count > 0
 
 
-def strip_legacy_bridgedeck_provider_config(text: str) -> tuple[str, list[str]]:
+def strip_legacy_bridgedeck_provider_config(text: str, *, remove_static_keys: bool = False) -> tuple[str, list[str]]:
     removed: list[str] = []
     output: list[str] = []
     skip_section = False
     legacy_provider = bool(re.search(r'(?m)^\s*model_provider\s*=\s*["\']bridgedeck["\']\s*$', text))
     top_level_key_pattern = re.compile(r'^\s*(model_provider)\s*=\s*["\']bridgedeck["\']\s*$')
     legacy_static_key_pattern = re.compile(r"^\s*(model|model_reasoning_effort|service_tier)\s*=")
+    in_top_level = True
     for line in text.splitlines(keepends=True):
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
+            in_top_level = False
             skip_section = stripped == "[model_providers.bridgedeck]"
             if skip_section:
                 removed.append("model_providers.bridgedeck")
                 continue
         if skip_section:
             continue
-        if top_level_key_pattern.match(line):
+        if in_top_level and top_level_key_pattern.match(line):
             removed.append("model_provider")
             continue
-        if legacy_provider and legacy_static_key_pattern.match(line):
+        if in_top_level and (legacy_provider or remove_static_keys) and legacy_static_key_pattern.match(line):
             removed.append(legacy_static_key_pattern.match(line).group(1))  # type: ignore[union-attr]
             continue
         output.append(line)
@@ -998,6 +1106,9 @@ def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dic
             "last_status_code": safe_int(usage.get("last_status_code"), 0),
             "last_bridge_port": safe_int(usage.get("last_bridge_port"), 0),
             "last_client_label": str(usage.get("last_client_label") or ""),
+            "last_session_id": str(usage.get("last_session_id") or ""),
+            "last_prompt_cache_key_present": bool(usage.get("last_prompt_cache_key_present")),
+            "last_cache_key_source": str(usage.get("last_cache_key_source") or ""),
             "last_updated_at": usage.get("last_updated_at"),
         }
     events = payload.get("usage_events")
@@ -1018,6 +1129,9 @@ def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dic
                 "client_port": safe_int(item.get("client_port"), 0),
                 "client_label": str(item.get("client_label") or ""),
                 "desktop_route": bool(item.get("desktop_route")),
+                "session_id": str(item.get("session_id") or ""),
+                "prompt_cache_key_present": bool(item.get("prompt_cache_key_present")),
+                "cache_key_source": str(item.get("cache_key_source") or ""),
                 "duration_ms": safe_int(item.get("duration_ms"), 0),
                 "input_tokens": safe_int(item.get("input_tokens"), 0),
                 "output_tokens": safe_int(item.get("output_tokens"), 0),
@@ -2184,6 +2298,110 @@ class BridgeManager:
             )
         return providers
 
+    def _provider_public_row(self, row: sqlite3.Row, *, include_secrets: bool = False) -> dict[str, Any]:
+        app_type = str(row["app_type"] or "claude") if "app_type" in row.keys() else "claude"
+        surface = provider_surface_for_app_type(app_type)
+        meta = self._extract_json(row["meta"])
+        settings = self._extract_json(row["settings_config"])
+        env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+        account_id = ""
+        auth_binding = meta.get("authBinding")
+        if isinstance(auth_binding, dict):
+            value = auth_binding.get("accountId")
+            if isinstance(value, str):
+                account_id = value
+        if not account_id:
+            account_id = bridge_account_id_from_env(env)
+        auth_token = env.get("ANTHROPIC_AUTH_TOKEN") if isinstance(env.get("ANTHROPIC_AUTH_TOKEN"), str) else ""
+        forced_model = env.get("ANTHROPIC_MODEL") if isinstance(env.get("ANTHROPIC_MODEL"), str) else ""
+        routes = meta.get("claudeDesktopModelRoutes") if isinstance(meta.get("claudeDesktopModelRoutes"), dict) else {}
+        _normalized_meta, route_issues, route_changed = normalize_claude_desktop_routes(meta, env)
+
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "surface": surface,
+            "app_type": app_type,
+            "provider_type": row["provider_type"] or "" if "provider_type" in row.keys() else "",
+            "is_current": bool(row["is_current"]) if "is_current" in row.keys() else False,
+            "sort_index": row["sort_index"] if "sort_index" in row.keys() else 0,
+            "meta_provider_type": meta.get("providerType") if isinstance(meta.get("providerType"), str) else "",
+            "api_format": meta.get("apiFormat") if isinstance(meta.get("apiFormat"), str) else "",
+            "desktop_mode": meta.get("claudeDesktopMode") if isinstance(meta.get("claudeDesktopMode"), str) else "",
+            "desktop_routes": routes,
+            "desktop_route_issues": route_issues if app_type == "claude-desktop" else [],
+            "desktop_routes_ok": (not route_changed) if app_type == "claude-desktop" else True,
+            "desktop_requires_local_routing": app_type == "claude-desktop" and meta.get("claudeDesktopMode") == "proxy",
+            "account_id": account_id,
+            "base_url": env.get("ANTHROPIC_BASE_URL") if isinstance(env.get("ANTHROPIC_BASE_URL"), str) else "",
+            "model": forced_model,
+            "routing_mode": "forced" if forced_model else "claude_auto",
+            "model_is_legacy_default": forced_model == DEFAULT_BRIDGE_PROVIDER_MODEL,
+            "haiku_model": env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), str) else "",
+            "sonnet_model": env.get("ANTHROPIC_DEFAULT_SONNET_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"), str) else "",
+            "opus_model": env.get("ANTHROPIC_DEFAULT_OPUS_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL"), str) else "",
+            "max_context_tokens": env.get(MAX_CONTEXT_TOKENS_ENV) if isinstance(env.get(MAX_CONTEXT_TOKENS_ENV), str) else "",
+            "auth_token": auth_token if include_secrets else "",
+            "auth_token_masked": mask_token(auth_token),
+            "compact_enabled": bool(str(env.get(COMPACT_WINDOW_ENV) or "").strip()),
+            "compact_window_tokens": env.get(COMPACT_WINDOW_ENV) if isinstance(env.get(COMPACT_WINDOW_ENV), str) else "",
+            "compact_threshold_percent": env.get(COMPACT_THRESHOLD_ENV) if isinstance(env.get(COMPACT_THRESHOLD_ENV), str) else "",
+            "claude_attribution_header": env.get(CLAUDE_CODE_ATTRIBUTION_HEADER_ENV)
+            if CLAUDE_CODE_ATTRIBUTION_HEADER_ENV in env
+            else None,
+            "claude_attribution_status": attribution_env_status(
+                env.get(CLAUDE_CODE_ATTRIBUTION_HEADER_ENV),
+                source_present=True,
+            ),
+        }
+
+    def _list_surface_providers(
+        self,
+        conn: sqlite3.Connection,
+        surface: str,
+        *,
+        include_secrets: bool = False,
+    ) -> list[dict[str, Any]]:
+        app_type = provider_surface_app_type(surface)
+        rows = conn.execute(
+            """
+            SELECT id, app_type, name, provider_type, is_current, sort_index, meta, settings_config
+            FROM providers
+            WHERE app_type = ?
+            ORDER BY sort_index ASC, name ASC
+            """,
+            (app_type,),
+        ).fetchall()
+        return [self._provider_public_row(row, include_secrets=include_secrets) for row in rows]
+
+    def _ccswitch_315_status(
+        self,
+        providers: list[dict[str, Any]],
+        desktop_providers: list[dict[str, Any]],
+        codex_providers: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        issues: list[dict[str, Any]] = []
+        for provider in desktop_providers:
+            if provider.get("account_id") and not provider.get("desktop_routes_ok"):
+                issues.append(
+                    {
+                        "severity": "warn",
+                        "surface": "claude_desktop",
+                        "provider_id": provider.get("id"),
+                        "provider_name": provider.get("name"),
+                        "message": "Claude Desktop 路由字段缺失或和 BridgeDeck 账号映射不一致",
+                    }
+                )
+        return {
+            "ok": not any(item.get("severity") == "error" for item in issues),
+            "claude_provider_count": len(providers),
+            "claude_desktop_provider_count": len(desktop_providers),
+            "codex_provider_count": len(codex_providers),
+            "desktop_route_issue_count": sum(1 for item in desktop_providers if item.get("desktop_route_issues")),
+            "local_bridge_desktop_count": sum(1 for item in desktop_providers if item.get("account_id")),
+            "issues": issues,
+        }
+
     def _account_matrix(
         self,
         accounts: list[dict[str, Any]],
@@ -2294,6 +2512,13 @@ class BridgeManager:
         for provider in snapshot.get("codex_providers", []):
             if isinstance(provider, dict) and provider.get("token_mismatch"):
                 risk_flags.append("codex_provider_mismatch")
+        ccswitch_315 = snapshot.get("ccswitch_315") if isinstance(snapshot.get("ccswitch_315"), dict) else {}
+        if ccswitch_315.get("desktop_route_issue_count"):
+            risk_flags.append("claude_desktop_route_mismatch")
+        codex_desktop = snapshot.get("codex_desktop", {}) if isinstance(snapshot.get("codex_desktop"), dict) else {}
+        for flag in codex_desktop.get("risk_flags", []):
+            if flag in {"desktop_static_model", "desktop_static_reasoning_effort", "desktop_static_service_tier"}:
+                risk_flags.append(str(flag))
         status = "ok" if not risk_flags else str(risk_flags[0])
         return {
             "ok": True,
@@ -2301,6 +2526,8 @@ class BridgeManager:
             "risk_flags": sorted(set(risk_flags)),
             "account_matrix": snapshot.get("account_matrix", []),
             "codex_desktop": snapshot.get("codex_desktop", {}),
+            "ccswitch_315": ccswitch_315,
+            "claude_desktop_providers": snapshot.get("claude_desktop_providers", []),
         }
 
     def services(self, *, server_port: int = DEFAULT_PORT) -> dict[str, Any]:
@@ -2899,12 +3126,18 @@ class BridgeManager:
             return binding["accountId"].strip()
         return ""
 
-    def _select_existing_bridge_provider_for_account(self, conn: sqlite3.Connection, account_id: str) -> sqlite3.Row | None:
+    def _select_existing_bridge_provider_for_account(
+        self,
+        conn: sqlite3.Connection,
+        account_id: str,
+        *,
+        app_type: str = "claude",
+    ) -> sqlite3.Row | None:
         rows = conn.execute(
             """
             SELECT id, name, settings_config, meta, sort_index
             FROM providers
-            WHERE app_type = 'claude'
+            WHERE app_type = ?
             ORDER BY
               CASE
                 WHEN name = 'Local Codex Bridge - Plus' THEN 0
@@ -2914,7 +3147,8 @@ class BridgeManager:
               END,
               sort_index ASC,
               name ASC
-            """
+            """,
+            (app_type,),
         ).fetchall()
         for row in rows:
             if self._provider_row_bridge_account_id(row) == account_id:
@@ -3197,12 +3431,34 @@ class BridgeManager:
 
         return settings, m
 
-    def _pick_template_provider(self, conn: sqlite3.Connection) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _build_desktop_provider_payload(
+        self,
+        account_id: str,
+        *,
+        settings_config: dict[str, Any] | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+        settings, m = self._build_provider_payload(
+            account_id,
+            settings_config=settings_config,
+            meta=meta,
+            clear_forced_model=False,
+        )
+        env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+        normalized_meta, issues, _changed = normalize_claude_desktop_routes(m, env)
+        return settings, normalized_meta, issues
+
+    def _pick_template_provider(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        app_type: str = "claude",
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT settings_config, meta
             FROM providers
-            WHERE app_type = 'claude'
+            WHERE app_type = ?
             ORDER BY
               CASE
                 WHEN name = 'Local Codex Bridge - Pro' THEN 0
@@ -3211,7 +3467,8 @@ class BridgeManager:
               END,
               sort_index ASC
             LIMIT 1
-            """
+            """,
+            (app_type,),
         ).fetchall()
         if not rows:
             return {}, {}
@@ -3346,9 +3603,9 @@ class BridgeManager:
                     if has_providers:
                         rows = conn.execute(
                             """
-                            SELECT id, name, settings_config, meta
+                            SELECT id, name, settings_config, meta, app_type
                             FROM providers
-                            WHERE app_type = 'claude'
+                            WHERE app_type IN ('claude', 'claude-desktop')
                             ORDER BY sort_index ASC, name ASC
                             """
                         ).fetchall()
@@ -3361,7 +3618,12 @@ class BridgeManager:
                                 "codexOauthTransport"
                             ) == "local_bridge"
                             if not managed:
-                                skipped_providers.append({"id": row["id"], "name": row["name"], "reason": "not_local_bridge"})
+                                skipped_providers.append({
+                                    "id": row["id"],
+                                    "name": row["name"],
+                                    "app_type": row["app_type"],
+                                    "reason": "not_local_bridge",
+                                })
                                 continue
                             sources.append(
                                 self._attribution_source(
@@ -3370,7 +3632,7 @@ class BridgeManager:
                                     path=str(self.paths.db),
                                     value=env.get(CLAUDE_CODE_ATTRIBUTION_HEADER_ENV),
                                     present=True,
-                                    scope="provider",
+                                    scope=f"provider:{row['app_type']}",
                                     provider_id=str(row["id"]),
                                     provider_name=str(row["name"]),
                                 )
@@ -3458,6 +3720,7 @@ class BridgeManager:
             },
             "accounts": self._load_accounts(),
             "providers": [],
+            "claude_desktop_providers": [],
             "codex_providers": [],
             "cli_homes": self._known_cli_homes(),
             "cli_launchers": self._known_cli_launchers(),
@@ -3472,6 +3735,7 @@ class BridgeManager:
             "plugin_sync": plugin_sync,
             "plugin_status": plugin_status,
             "claude_attribution_header": self.claude_attribution_header_status(),
+            "ccswitch_315": {},
         }
 
         if not self.paths.db.exists():
@@ -3486,68 +3750,18 @@ class BridgeManager:
             return data
 
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, name, provider_type, is_current, sort_index, meta, settings_config
-                FROM providers
-                WHERE app_type = 'claude'
-                ORDER BY sort_index ASC, name ASC
-                """
-            ).fetchall()
-
-            for row in rows:
-                meta = self._extract_json(row["meta"])
-                settings = self._extract_json(row["settings_config"])
-                env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
-                account_id = ""
-                auth_binding = meta.get("authBinding")
-                if isinstance(auth_binding, dict):
-                    value = auth_binding.get("accountId")
-                    if isinstance(value, str):
-                        account_id = value
-                if not account_id:
-                    account_id = bridge_account_id_from_env(env)
-                auth_token = (
-                    env.get("ANTHROPIC_AUTH_TOKEN")
-                    if isinstance(env.get("ANTHROPIC_AUTH_TOKEN"), str)
-                    else ""
-                )
-                forced_model = env.get("ANTHROPIC_MODEL") if isinstance(env.get("ANTHROPIC_MODEL"), str) else ""
-
-                data["providers"].append(
-                    {
-                        "id": row["id"],
-                        "name": row["name"],
-                        "provider_type": row["provider_type"] or "",
-                        "is_current": bool(row["is_current"]),
-                        "sort_index": row["sort_index"],
-                        "meta_provider_type": meta.get("providerType") if isinstance(meta.get("providerType"), str) else "",
-                        "api_format": meta.get("apiFormat") if isinstance(meta.get("apiFormat"), str) else "",
-                        "account_id": account_id,
-                        "base_url": env.get("ANTHROPIC_BASE_URL") if isinstance(env.get("ANTHROPIC_BASE_URL"), str) else "",
-                        "model": forced_model,
-                        "routing_mode": "forced" if forced_model else "claude_auto",
-                        "model_is_legacy_default": forced_model == DEFAULT_BRIDGE_PROVIDER_MODEL,
-                        "haiku_model": env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), str) else "",
-                        "sonnet_model": env.get("ANTHROPIC_DEFAULT_SONNET_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"), str) else "",
-                        "opus_model": env.get("ANTHROPIC_DEFAULT_OPUS_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL"), str) else "",
-                        "max_context_tokens": env.get(MAX_CONTEXT_TOKENS_ENV) if isinstance(env.get(MAX_CONTEXT_TOKENS_ENV), str) else "",
-                        "auth_token": auth_token if include_secrets else "",
-                        "auth_token_masked": mask_token(auth_token),
-                        "compact_enabled": bool(str(env.get(COMPACT_WINDOW_ENV) or "").strip()),
-                        "compact_window_tokens": env.get(COMPACT_WINDOW_ENV) if isinstance(env.get(COMPACT_WINDOW_ENV), str) else "",
-                        "compact_threshold_percent": env.get(COMPACT_THRESHOLD_ENV) if isinstance(env.get(COMPACT_THRESHOLD_ENV), str) else "",
-                        "claude_attribution_header": env.get(CLAUDE_CODE_ATTRIBUTION_HEADER_ENV)
-                        if CLAUDE_CODE_ATTRIBUTION_HEADER_ENV in env
-                        else None,
-                        "claude_attribution_status": attribution_env_status(
-                            env.get(CLAUDE_CODE_ATTRIBUTION_HEADER_ENV),
-                            source_present=True,
-                        ),
-                    }
-                )
-
+            data["providers"] = self._list_surface_providers(conn, "claude_code", include_secrets=include_secrets)
+            data["claude_desktop_providers"] = self._list_surface_providers(
+                conn,
+                "claude_desktop",
+                include_secrets=include_secrets,
+            )
             data["codex_providers"] = self._list_codex_providers(conn)
+            data["ccswitch_315"] = self._ccswitch_315_status(
+                data["providers"],
+                data["claude_desktop_providers"],
+                data["codex_providers"],
+            )
 
         data["account_matrix"] = self._account_matrix(
             data["accounts"],
@@ -3703,6 +3917,190 @@ class BridgeManager:
                 "provider_name": provider_name,
                 "set_current": set_current,
                 "backups": [db_bak, settings_bak],
+            }
+
+    def create_or_update_desktop_provider(
+        self,
+        account_id: str,
+        provider_name: str,
+        set_current: bool = False,
+    ) -> dict[str, Any]:
+        if not account_id.strip():
+            raise ValueError("account_id 不能为空")
+        if not provider_name.strip():
+            raise ValueError("provider_name 不能为空")
+
+        account_ids = {item["account_id"] for item in self._load_accounts()}
+        if account_id not in account_ids:
+            raise ValueError(f"未找到账号: {account_id}")
+
+        with self._lock:
+            db_bak = self._backup_file(self.paths.db, "create-desktop-provider")
+            with self._connect() as conn:
+                columns = self._provider_columns(conn)
+                existing = self._select_existing_bridge_provider_for_account(
+                    conn,
+                    account_id,
+                    app_type="claude-desktop",
+                )
+                if not existing:
+                    existing = conn.execute(
+                        """
+                        SELECT id, name, settings_config, meta, sort_index
+                        FROM providers
+                        WHERE app_type = 'claude-desktop' AND name = ? LIMIT 1
+                        """,
+                        (provider_name,),
+                    ).fetchone()
+                if existing:
+                    provider_id = str(existing["id"])
+                    provider_name = str(existing["name"])
+                    current_settings = self._extract_json(existing["settings_config"])
+                    current_meta = self._extract_json(existing["meta"])
+                else:
+                    provider_id = str(uuid.uuid4())
+                    current_settings, current_meta = self._pick_template_provider(conn, app_type="claude-desktop")
+
+                new_settings, new_meta, route_issues = self._build_desktop_provider_payload(
+                    account_id,
+                    settings_config=current_settings,
+                    meta=current_meta,
+                )
+                settings_text = json.dumps(new_settings, ensure_ascii=False)
+                meta_text = json.dumps(new_meta, ensure_ascii=False)
+                if existing:
+                    updates = {
+                        "settings_config": settings_text,
+                        "meta": meta_text,
+                        "provider_type": None,
+                    }
+                    assignments = []
+                    values: list[Any] = []
+                    for key, value in updates.items():
+                        if key in columns:
+                            assignments.append(f"{key} = ?")
+                            values.append(value)
+                    values.extend([provider_id, "claude-desktop"])
+                    conn.execute(
+                        f"UPDATE providers SET {', '.join(assignments)} WHERE id = ? AND app_type = ?",
+                        values,
+                    )
+                else:
+                    row = {
+                        "id": provider_id,
+                        "app_type": "claude-desktop",
+                        "name": provider_name,
+                        "settings_config": settings_text,
+                        "meta": meta_text,
+                        "provider_type": None,
+                        "created_at": int(time.time()),
+                        "sort_index": conn.execute(
+                            "SELECT COALESCE(MAX(sort_index), 0) + 1 FROM providers WHERE app_type = 'claude-desktop'"
+                        ).fetchone()[0],
+                        "icon": "openai",
+                        "icon_color": "#10A37F",
+                        "is_current": 0,
+                        "in_failover_queue": 0,
+                        "cost_multiplier": "1.0",
+                    }
+                    insert_cols = [c for c in row.keys() if c in columns]
+                    placeholders = ", ".join(["?"] * len(insert_cols))
+                    conn.execute(
+                        f"INSERT INTO providers ({', '.join(insert_cols)}) VALUES ({placeholders})",
+                        [row[c] for c in insert_cols],
+                    )
+                if set_current and "is_current" in columns:
+                    conn.execute("UPDATE providers SET is_current = 0 WHERE app_type = 'claude-desktop'")
+                    conn.execute(
+                        "UPDATE providers SET is_current = 1 WHERE app_type = 'claude-desktop' AND id = ?",
+                        (provider_id,),
+                    )
+                conn.commit()
+
+            return {
+                "ok": True,
+                "message": "Claude Desktop provider 已创建/更新",
+                "provider_id": provider_id,
+                "provider_name": provider_name,
+                "set_current": set_current,
+                "route_issues_fixed": route_issues,
+                "backups": [db_bak],
+            }
+
+    def repair_ccswitch_315_desktop_routes(self, *, apply: bool = False) -> dict[str, Any]:
+        with self._lock:
+            if not self.paths.db.exists():
+                return {"ok": True, "apply": apply, "plan": [], "updated": [], "backups": [], "message": "cc-switch 数据库不存在"}
+            db_bak = self._backup_file(self.paths.db, "ccswitch-315-desktop-routes") if apply else None
+            updated: list[dict[str, Any]] = []
+            skipped: list[dict[str, Any]] = []
+            conn = self._connect()
+            try:
+                columns = self._provider_columns(conn)
+                if "settings_config" not in columns or "meta" not in columns:
+                    raise RuntimeError("providers 表缺少 settings_config/meta 字段")
+                rows = conn.execute(
+                    """
+                    SELECT id, app_type, name, provider_type, is_current, sort_index, settings_config, meta
+                    FROM providers
+                    WHERE app_type = 'claude-desktop'
+                    ORDER BY sort_index ASC, name ASC
+                    """
+                ).fetchall()
+                plan: list[dict[str, Any]] = []
+                for row in rows:
+                    settings = self._extract_json(row["settings_config"])
+                    meta = self._extract_json(row["meta"])
+                    env = env_from_json_payload(settings)
+                    base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
+                    account_id = self._provider_row_bridge_account_id(row)
+                    managed = base_url.startswith(f"{LOCAL_BRIDGE_BASE_URL}/accounts/") or meta.get(
+                        "codexOauthTransport"
+                    ) == "local_bridge"
+                    if not managed or not account_id:
+                        skipped.append({"id": row["id"], "name": row["name"], "reason": "not_local_bridge"})
+                        continue
+                    next_settings, next_meta, issues = self._build_desktop_provider_payload(
+                        account_id,
+                        settings_config=settings,
+                        meta=meta,
+                    )
+                    before = json.dumps({"settings": settings, "meta": meta}, ensure_ascii=False, sort_keys=True)
+                    after = json.dumps({"settings": next_settings, "meta": next_meta}, ensure_ascii=False, sort_keys=True)
+                    changed = before != after
+                    item = {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "account_id": account_id,
+                        "changed": changed,
+                        "issues": issues,
+                        "expected_routes": next_meta.get("claudeDesktopModelRoutes", {}),
+                    }
+                    plan.append(item)
+                    if apply and changed:
+                        conn.execute(
+                            "UPDATE providers SET settings_config = ?, meta = ? WHERE id = ? AND app_type = ?",
+                            (
+                                json.dumps(next_settings, ensure_ascii=False),
+                                json.dumps(next_meta, ensure_ascii=False),
+                                row["id"],
+                                "claude-desktop",
+                            ),
+                        )
+                        updated.append({"id": row["id"], "name": row["name"]})
+                if apply and updated:
+                    conn.commit()
+            finally:
+                conn.close()
+
+            return {
+                "ok": True,
+                "apply": apply,
+                "message": "Claude Desktop 3.15 路由修复完成" if apply else "Claude Desktop 3.15 路由修复预览",
+                "plan": plan,
+                "updated": updated,
+                "skipped": skipped,
+                "backups": [db_bak] if db_bak else [],
             }
 
     def patch_provider(self, provider_id: str) -> dict[str, Any]:
@@ -4420,7 +4818,7 @@ class BridgeManager:
             os.chmod(DEFAULT_CODEX_HOME, 0o700)
             original = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
             cleaned, stripped_managed = strip_managed_codex_desktop_bridge(original)
-            cleaned, stripped_legacy_keys = strip_legacy_bridgedeck_provider_config(cleaned)
+            cleaned, stripped_legacy_keys = strip_legacy_bridgedeck_provider_config(cleaned, remove_static_keys=True)
             block = codex_desktop_bridge_block(account_id)
             updated = f"{block}{cleaned.lstrip()}" if cleaned.strip() else block
             if updated == original:
@@ -4467,7 +4865,7 @@ class BridgeManager:
                 }
             original = config_path.read_text(encoding="utf-8")
             updated, stripped_managed = strip_managed_codex_desktop_bridge(original)
-            updated, stripped_legacy_keys = strip_legacy_bridgedeck_provider_config(updated)
+            updated, stripped_legacy_keys = strip_legacy_bridgedeck_provider_config(updated, remove_static_keys=True)
             removed = [*stripped_legacy_keys]
             if stripped_managed:
                 removed.append("managed_bridge_block")
@@ -4583,9 +4981,9 @@ class BridgeManager:
                             if "settings_config" in columns:
                                 rows = conn.execute(
                                     """
-                                    SELECT id, name, settings_config, meta
+                                    SELECT id, name, settings_config, meta, app_type
                                     FROM providers
-                                    WHERE app_type = 'claude'
+                                    WHERE app_type IN ('claude', 'claude-desktop')
                                     ORDER BY sort_index ASC, name ASC
                                     """
                                 ).fetchall()
@@ -4598,7 +4996,12 @@ class BridgeManager:
                                         "codexOauthTransport"
                                     ) == "local_bridge"
                                     if not managed:
-                                        skipped_providers.append({"id": row["id"], "name": row["name"], "reason": "not_local_bridge"})
+                                        skipped_providers.append({
+                                            "id": row["id"],
+                                            "name": row["name"],
+                                            "app_type": row["app_type"],
+                                            "reason": "not_local_bridge",
+                                        })
                                         continue
                                     before = json.dumps(settings, ensure_ascii=False, sort_keys=True)
                                     env = copy.deepcopy(env)
@@ -4612,9 +5015,9 @@ class BridgeManager:
                                         db_backup = self._backup_file(self.paths.db, "claude-attribution-header")
                                     conn.execute(
                                         "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = ?",
-                                        (json.dumps(settings, ensure_ascii=False), row["id"], "claude"),
+                                        (json.dumps(settings, ensure_ascii=False), row["id"], row["app_type"]),
                                     )
-                                    updated_providers.append({"id": row["id"], "name": row["name"]})
+                                    updated_providers.append({"id": row["id"], "name": row["name"], "app_type": row["app_type"]})
                                     db_changed = True
                         if db_changed:
                             conn.commit()
@@ -4880,6 +5283,12 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             account["label"] = mask_email_value(account.get("label"))
             account["default_cli_home"] = redact_path_value(account.get("default_cli_home"))
     for provider in redacted.get("providers", []):
+        if isinstance(provider, dict):
+            provider["account_id"] = mask_id_value(provider.get("account_id"))
+            provider["base_url"] = re.sub(r"/accounts/[^/?#]+", "/accounts/<redacted>", str(provider.get("base_url") or ""))
+            provider["auth_token"] = ""
+            provider["auth_token_masked"] = mask_token(provider.get("auth_token_masked"))
+    for provider in redacted.get("claude_desktop_providers", []):
         if isinstance(provider, dict):
             provider["account_id"] = mask_id_value(provider.get("account_id"))
             provider["base_url"] = re.sub(r"/accounts/[^/?#]+", "/accounts/<redacted>", str(provider.get("base_url") or ""))
@@ -5523,7 +5932,7 @@ INDEX_HTML = """<!doctype html>
                 <div class="toolCard">
                   <div>
                     <div class="toolName">Codex Desktop</div>
-                    <div class="toolText">默认保持原生。临时 Bridge 模式会写 provider，可一键恢复。</div>
+                    <div class="toolText">默认保持原生。恢复原生会移除 BridgeDeck provider 和静态模型/思考等级残留；代理修复只写 .env。</div>
                     <div class="actualRow">
                       <div class="actualLine" id="simpleDesktopActual">当前实际：检测中...</div>
                       <button class="miniBtn" data-action="refresh">刷新</button>
@@ -5531,7 +5940,7 @@ INDEX_HTML = """<!doctype html>
                   </div>
                   <div class="apiEnvActions">
                     <button class="miniBtn warn" data-action="enable-desktop-bridge-mode">临时接入 BridgeDeck</button>
-                    <button class="miniBtn" data-action="restore-desktop-native-mode">恢复原生</button>
+                    <button class="miniBtn" data-action="restore-desktop-native-mode">恢复原生/清理静态项</button>
                     <button class="miniBtn" data-action="scroll" data-target="statusCard">查看状态</button>
                   </div>
                 </div>
@@ -5827,6 +6236,21 @@ INDEX_HTML = """<!doctype html>
                   <tbody></tbody>
                 </table>
               </div>
+              <div class="row mt10">
+                <button class="miniBtn" data-action="preview-ccswitch-315-desktop-routes">预览 Claude Desktop 3.15 路由修复</button>
+                <button class="miniBtn warn" data-action="apply-ccswitch-315-desktop-routes">应用 Claude Desktop 3.15 路由修复</button>
+              </div>
+              <div class="tableWrap mt10">
+                <table id="claudeDesktopProvidersTable">
+                  <thead>
+                    <tr>
+                      <th class="nameCol">Claude Desktop Provider</th><th class="smallCol">当前</th><th class="accountCol">账号</th><th class="urlCol">路由</th><th class="smallCol">状态</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+              <div id="ccswitch315Status" class="recommend mt10"></div>
               <div id="diagnosis" class="recommend"></div>
               <div class="muted mt10">已配置 CLI 目录：这里只显示已经存在的 CODEX_HOME。</div>
               <div class="tableWrap mt10">
@@ -6142,7 +6566,8 @@ INDEX_HTML = """<!doctype html>
       const route = String(event.request_type || event.route_path || '-').trim();
       const source = String(event.source || 'proxy').trim();
       const portText = port > 0 ? `:${port}` : '-';
-      return `<span class="usageEntryMain">${esc(client)}</span><span class="usageMeta">${esc(portText)} / ${esc(route)}</span><span class="usageTag">${esc(source)}</span>`;
+      const cacheKey = event.prompt_cache_key_present ? 'cache key: on' : `cache key: ${event.cache_key_source || 'none'}`;
+      return `<span class="usageEntryMain">${esc(client)}</span><span class="usageMeta">${esc(portText)} / ${esc(route)} / ${esc(cacheKey)}</span><span class="usageTag">${esc(source)}</span>`;
     }
     function setMetricIcon(id, state) {
       const el = document.getElementById(id);
@@ -7446,6 +7871,39 @@ INDEX_HTML = """<!doctype html>
         body.appendChild(tr);
       });
     }
+    function renderClaudeDesktopProviders(data) {
+      const body = document.querySelector('#claudeDesktopProvidersTable tbody');
+      if (!body) return;
+      body.innerHTML = '';
+      const providers = data.claude_desktop_providers || [];
+      providers.forEach((p) => {
+        const routes = p.desktop_routes || {};
+        const routeText = ['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-7'].map((key) => {
+          const item = routes[key] || {};
+          const oneM = item.supports1m === true ? '1m' : 'std';
+          return `${key} -> ${item.model || '-'} (${oneM})`;
+        }).join('\\n');
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${esc(p.name || '')}<br><span class="muted">${esc(p.api_format || '-')} / ${esc(p.desktop_mode || '-')}</span></td>
+          <td>${p.is_current ? '<span class="ok">当前</span>' : '<span class="muted">备用</span>'}</td>
+          <td class="mono">${esc(maskId(p.account_id || ''))}</td>
+          <td class="mono">${esc(routeText).split('\\n').join('<br>')}</td>
+          <td>${p.desktop_routes_ok ? '<span class="ok">ok</span>' : '<span class="warnText">需修复</span>'}</td>
+        `;
+        body.appendChild(tr);
+      });
+      if (!providers.length) {
+        body.innerHTML = '<tr><td colspan="5">未检测到 Claude Desktop provider。</td></tr>';
+      }
+      const status = data.ccswitch_315 || {};
+      const box = document.getElementById('ccswitch315Status');
+      if (box) {
+        const issueCount = Number(status.desktop_route_issue_count || 0);
+        box.className = `recommend ${issueCount ? 'warnState' : 'okState'}`;
+        box.textContent = `CC Switch 3.15：Claude Code ${status.claude_provider_count || 0} 个，Claude Desktop ${status.claude_desktop_provider_count || 0} 个，Desktop 路由问题 ${issueCount} 个。`;
+      }
+    }
     function statusText(value) {
       const map = {
         ok: 'ok',
@@ -7511,7 +7969,7 @@ INDEX_HTML = """<!doctype html>
     }
     function renderHealth(data) {
       const accountCount = data.accounts.length;
-      const providerCount = data.providers.length;
+      const providerCount = data.providers.length + (data.claude_desktop_providers || []).length;
       const mismatchCount = data.codex_providers.filter((p) => p.token_mismatch).length;
       const staleCount = data.cli_homes.filter((h) => (h.risk_flags || []).includes('stale_cli_token_profile')).length;
       const cliHomeCount = data.cli_homes.length;
@@ -7605,6 +8063,7 @@ INDEX_HTML = """<!doctype html>
       renderAccountMatrix(data);
       renderProviders(data);
       renderCodexProviders(data);
+      renderClaudeDesktopProviders(data);
       renderCliHomes(data);
       renderDiagnosis(data);
       renderActualCurrentAccounts(data);
@@ -7813,6 +8272,19 @@ INDEX_HTML = """<!doctype html>
       log(`${res.message}: ${JSON.stringify(res.patched)}`);
       await refreshData();
     }
+    function desktopRoutePlanText(plan) {
+      if (!plan || !plan.length) return '没有需要修复的 Claude Desktop Local Bridge provider';
+      return plan.map((item) => {
+        const issueCount = (item.issues || []).length;
+        return `${item.name}: ${item.changed ? `修复 ${issueCount} 项` : '已正确'}`;
+      }).join(' | ');
+    }
+    async function repairCcswitch315DesktopRoutes(apply=false) {
+      if (apply && !confirm('只会修复 Claude Desktop Local Bridge provider 的 3.15 路由字段，并先备份。继续？')) return;
+      const res = await api('/api/ccswitch-315-desktop-routes', 'POST', { apply });
+      log(apply ? `${res.message}: 更新 ${res.updated.length} 个；${desktopRoutePlanText(res.plan)}` : desktopRoutePlanText(res.plan));
+      await refreshData();
+    }
     function bindActions() {
       document.addEventListener('click', (event) => {
         const button = event.target.closest('button[data-action]');
@@ -7863,6 +8335,8 @@ INDEX_HTML = """<!doctype html>
           if (action === 'create-missing-bridges') return createMissingBridges();
           if (action === 'preview-bridge-dedupe') return dedupeBridgeProviders(false);
           if (action === 'apply-bridge-dedupe') return dedupeBridgeProviders(true);
+          if (action === 'preview-ccswitch-315-desktop-routes') return repairCcswitch315DesktopRoutes(false);
+          if (action === 'apply-ccswitch-315-desktop-routes') return repairCcswitch315DesktopRoutes(true);
           if (action === 'refresh-services') return refreshServices();
           if (action === 'proxy-diagnosis') return runProxyDiagnosis();
           if (action === 'codex-native-proxy-status') return runCodexNativeProxyStatus();
@@ -8188,6 +8662,10 @@ def build_handler(
                     return
                 if self.path == "/api/repair-plus-pro":
                     result = manager.repair_plus_pro()
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/ccswitch-315-desktop-routes":
+                    result = manager.repair_ccswitch_315_desktop_routes(apply=bool(payload.get("apply", False)))
                     json_response(self, 200, result)
                     return
                 if self.path in {"/api/create-cli-home", "/api/create-cli-launcher"}:
