@@ -2375,7 +2375,100 @@ def iter_anthropic_messages_sse(chunks: Any, *, message_id: str, model: str) -> 
     )
 
     text_block_open = False
+    text_block_index: int | None = None
+    next_content_index = 0
+    active_tool_blocks: dict[str, dict[str, Any]] = {}
+    output_index_to_item_id: dict[int, str] = {}
+    saw_tool_use = False
     stopped = False
+
+    def close_text_block() -> bytes | None:
+        nonlocal text_block_open, text_block_index
+        if not text_block_open:
+            return None
+        text_block_open = False
+        index = text_block_index if isinstance(text_block_index, int) else 0
+        text_block_index = None
+        return _sse_event("content_block_stop", {"type": "content_block_stop", "index": index})
+
+    def start_tool_block(item: dict[str, Any], payload: dict[str, Any]) -> bytes | None:
+        nonlocal next_content_index, saw_tool_use
+        item_id = item.get("id") or payload.get("item_id")
+        call_id = item.get("call_id") or payload.get("call_id") or item_id
+        name = item.get("name") or payload.get("name")
+        if not isinstance(item_id, str) or not item_id:
+            item_id = f"fc_{uuid.uuid4().hex[:12]}"
+        if item_id in active_tool_blocks:
+            return None
+        if not isinstance(call_id, str) or not call_id:
+            call_id = item_id
+        if not isinstance(name, str) or not name:
+            name = "unknown_tool"
+        output_index = payload.get("output_index")
+        if isinstance(output_index, int):
+            output_index_to_item_id[output_index] = item_id
+        index = next_content_index
+        next_content_index += 1
+        active_tool_blocks[item_id] = {
+            "index": index,
+            "id": call_id,
+            "name": name,
+            "delta_seen": False,
+            "closed": False,
+        }
+        saw_tool_use = True
+        return _sse_event(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": {},
+                },
+            },
+        )
+
+    def tool_item_id(payload: dict[str, Any]) -> str | None:
+        item_id = payload.get("item_id")
+        if isinstance(item_id, str) and item_id:
+            return item_id
+        output_index = payload.get("output_index")
+        if isinstance(output_index, int):
+            mapped = output_index_to_item_id.get(output_index)
+            if mapped:
+                return mapped
+        item = payload.get("item")
+        if isinstance(item, dict):
+            item_id = item.get("id")
+            if isinstance(item_id, str) and item_id:
+                return item_id
+        return None
+
+    def ensure_tool_block(payload: dict[str, Any]) -> tuple[str, list[bytes]]:
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            item = {"id": payload.get("item_id"), "call_id": payload.get("call_id"), "name": payload.get("name")}
+        item_id = tool_item_id(payload)
+        if not item_id:
+            item_id = f"fc_{uuid.uuid4().hex[:12]}"
+            item["id"] = item_id
+        chunks_out: list[bytes] = []
+        started = start_tool_block(item, payload)
+        if started:
+            chunks_out.append(started)
+        return item_id, chunks_out
+
+    def close_tool_block(item_id: str | None) -> bytes | None:
+        if not item_id:
+            return None
+        block = active_tool_blocks.get(item_id)
+        if not block or block.get("closed"):
+            return None
+        block["closed"] = True
+        return _sse_event("content_block_stop", {"type": "content_block_stop", "index": block["index"]})
     for chunk in chunks:
         if not chunk:
             continue
@@ -2387,38 +2480,104 @@ def iter_anthropic_messages_sse(chunks: Any, *, message_id: str, model: str) -> 
             if not isinstance(payload, dict):
                 continue
             if event_name == "response.output_text.delta":
+                nonlocal_text_index = text_block_index
                 delta = payload.get("delta")
                 if not isinstance(delta, str) or not delta:
                     continue
                 if not text_block_open:
                     text_block_open = True
+                    index = next_content_index
+                    next_content_index += 1
+                    text_block_index = index
                     yield _sse_event(
                         "content_block_start",
                         {
                             "type": "content_block_start",
-                            "index": 0,
+                            "index": index,
                             "content_block": {"type": "text", "text": ""},
                         },
                     )
+                    nonlocal_text_index = index
+                text_index = text_block_index if isinstance(text_block_index, int) else nonlocal_text_index
+                if not isinstance(text_index, int):
+                    text_index = 0
                 yield _sse_event(
                     "content_block_delta",
                     {
                         "type": "content_block_delta",
-                        "index": 0,
+                        "index": text_index,
                         "delta": {"type": "text_delta", "text": delta},
                     },
                 )
+            elif event_name == "response.output_item.added":
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get("type") == "function_call":
+                    closing = close_text_block()
+                    if closing:
+                        yield closing
+                    started = start_tool_block(item, payload)
+                    if started:
+                        yield started
+            elif event_name == "response.function_call_arguments.delta":
+                delta = payload.get("delta")
+                if not isinstance(delta, str) or not delta:
+                    continue
+                item_id, started_chunks = ensure_tool_block(payload)
+                for started in started_chunks:
+                    yield started
+                block = active_tool_blocks.get(item_id)
+                if not block:
+                    continue
+                block["delta_seen"] = True
+                yield _sse_event(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block["index"],
+                        "delta": {"type": "input_json_delta", "partial_json": delta},
+                    },
+                )
+            elif event_name in {"response.function_call_arguments.done", "response.output_item.done"}:
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get("type") != "function_call":
+                    continue
+                item_id, started_chunks = ensure_tool_block(payload)
+                for started in started_chunks:
+                    yield started
+                block = active_tool_blocks.get(item_id)
+                if not block:
+                    continue
+                arguments = payload.get("arguments")
+                if not isinstance(arguments, str) and isinstance(item, dict):
+                    arguments = item.get("arguments")
+                if isinstance(arguments, str) and arguments and not block.get("delta_seen"):
+                    block["delta_seen"] = True
+                    yield _sse_event(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block["index"],
+                            "delta": {"type": "input_json_delta", "partial_json": arguments},
+                        },
+                    )
+                stopped_tool = close_tool_block(item_id)
+                if stopped_tool:
+                    yield stopped_tool
             elif event_name == "response.completed":
-                if text_block_open:
-                    text_block_open = False
-                    yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+                closing = close_text_block()
+                if closing:
+                    yield closing
+                for item_id in list(active_tool_blocks):
+                    stopped_tool = close_tool_block(item_id)
+                    if stopped_tool:
+                        yield stopped_tool
                 response_obj = payload.get("response")
                 usage = _usage_to_anthropic(response_obj.get("usage") if isinstance(response_obj, dict) else None)
                 yield _sse_event(
                     "message_delta",
                     {
                         "type": "message_delta",
-                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "delta": {"stop_reason": "tool_use" if saw_tool_use else "end_turn", "stop_sequence": None},
                         "usage": {"output_tokens": usage["output_tokens"]},
                     },
                 )
@@ -2438,13 +2597,18 @@ def iter_anthropic_messages_sse(chunks: Any, *, message_id: str, model: str) -> 
                 )
                 stopped = True
     if not stopped:
-        if text_block_open:
-            yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+        closing = close_text_block()
+        if closing:
+            yield closing
+        for item_id in list(active_tool_blocks):
+            stopped_tool = close_tool_block(item_id)
+            if stopped_tool:
+                yield stopped_tool
         yield _sse_event(
             "message_delta",
             {
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "delta": {"stop_reason": "tool_use" if saw_tool_use else "end_turn", "stop_sequence": None},
                 "usage": {"output_tokens": 0},
             },
         )

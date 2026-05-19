@@ -2120,6 +2120,72 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertNotIn("response.output_text.delta", body)
         self.assertNotIn("思考等级", body)
 
+    def test_anthropic_stream_converts_function_call_arguments_to_tool_use(self) -> None:
+        chunks = [
+            (
+                b"event: response.output_item.added\n"
+                b'data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":""},"output_index":0}\n\n'
+            ),
+            (
+                b"event: response.function_call_arguments.delta\n"
+                b'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\\\"file_path\\\":"}\n\n'
+            ),
+            (
+                b"event: response.function_call_arguments.delta\n"
+                b'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"\\\"/tmp/a\\\"}"}\n\n'
+            ),
+            (
+                b"event: response.function_call_arguments.done\n"
+                b'data: {"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":0,"arguments":"{\\\"file_path\\\":\\\"/tmp/a\\\"}"}\n\n'
+            ),
+            (
+                b"event: response.completed\n"
+                b'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"output_tokens":3}}}\n\n'
+            ),
+        ]
+
+        body = b"".join(
+            local_codex_bridge.iter_anthropic_messages_sse(
+                iter(chunks),
+                message_id="msg_1",
+                model="gpt-5.5",
+            )
+        ).decode("utf-8")
+
+        self.assertIn('"type":"tool_use"', body)
+        self.assertIn('"id":"call_1"', body)
+        self.assertIn('"name":"Read"', body)
+        self.assertIn('"type":"input_json_delta"', body)
+        self.assertIn('"partial_json":"{\\"file_path\\":"', body)
+        self.assertIn('"partial_json":"\\"/tmp/a\\"}"', body)
+        self.assertIn('"stop_reason":"tool_use"', body)
+        self.assertNotIn("response.function_call_arguments.delta", body)
+
+    def test_anthropic_stream_converts_completed_function_call_without_deltas(self) -> None:
+        chunks = [
+            (
+                b"event: response.output_item.done\n"
+                b'data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Write","arguments":"{\\\"path\\\":\\\"/tmp/a\\\"}"},"output_index":0}\n\n'
+            ),
+            (
+                b"event: response.completed\n"
+                b'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"output_tokens":3}}}\n\n'
+            ),
+        ]
+
+        body = b"".join(
+            local_codex_bridge.iter_anthropic_messages_sse(
+                iter(chunks),
+                message_id="msg_1",
+                model="gpt-5.5",
+            )
+        ).decode("utf-8")
+
+        self.assertIn('"type":"tool_use"', body)
+        self.assertIn('"name":"Write"', body)
+        self.assertIn('"partial_json":"{\\"path\\":\\"/tmp/a\\"}"', body)
+        self.assertIn('"stop_reason":"tool_use"', body)
+
     def test_bridge_listen_host_rejects_non_loopback_by_default(self) -> None:
         self.assertEqual(local_codex_bridge.resolve_listen_host("127.0.0.1"), "127.0.0.1")
         self.assertEqual(local_codex_bridge.resolve_listen_host("localhost"), "localhost")
