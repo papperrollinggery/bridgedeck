@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.21
+
+- Fixed Claude Code stream idle regressions by disabling the tool-call runaway guard by default.
+- Coalesced Anthropic tool argument streaming so long OpenAI Responses function-call deltas are buffered with ping keepalives and emitted once as complete tool input.
+- Added stream diagnostics for requested/actual reasoning effort and tool-argument buffering metrics.
+- Kept Codex Desktop and CC Switch model routing untouched during the stream fix.
+
 ## 0.2.20
 
 - Prevented Codex global shell environment settings from reintroducing `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` conflicts in CC Switch.

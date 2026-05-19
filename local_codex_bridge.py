@@ -58,6 +58,8 @@ STREAM_IDLE_PARTIAL_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_P
 STREAM_LONG_WARNING_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_LONG_WARNING_SECS", "240"))
 STREAM_TOOL_CALL_GUARD_MODE_ENV = "CODEX_BRIDGE_STREAM_TOOL_CALL_GUARD"
 STREAM_TOOL_CALL_WALL_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_TOOL_CALL_WALL_FAIL_SECS", "240"))
+ANTHROPIC_TOOL_ARGS_MODE_ENV = "CODEX_BRIDGE_ANTHROPIC_TOOL_ARGS_MODE"
+ANTHROPIC_TOOL_ARG_PING_SECS = float(os.environ.get("CODEX_BRIDGE_ANTHROPIC_TOOL_ARG_PING_SECS", "5"))
 STREAM_STATE_UPDATE_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_STATE_UPDATE_SECS", "5"))
 STRIP_CLAUDE_ATTRIBUTION_HEADER_ENV = "CODEX_BRIDGE_STRIP_CLAUDE_CODE_ATTRIBUTION_HEADER"
 CLAUDE_ATTRIBUTION_HEADER_RE = re.compile(
@@ -132,6 +134,11 @@ class BridgeStreamMetrics:
     first_visible_after_ms: int | None = None
     last_event_name: str = ""
     long_stream_warning_logged: bool = False
+    tool_args_mode: str = ""
+    tool_arg_delta_events: int = 0
+    tool_arg_buffer_chars: int = 0
+    tool_arg_ping_events: int = 0
+    tool_arg_coalesced_calls: int = 0
 
 
 @dataclass(frozen=True)
@@ -1070,9 +1077,9 @@ def response_failed_sse(
 
 
 def stream_tool_call_guard_mode() -> str:
-    raw = os.environ.get(STREAM_TOOL_CALL_GUARD_MODE_ENV, "auto").strip().lower()
+    raw = os.environ.get(STREAM_TOOL_CALL_GUARD_MODE_ENV, "off").strip().lower()
     aliases = {
-        "": "auto",
+        "": "off",
         "1": "auto",
         "true": "auto",
         "yes": "auto",
@@ -1087,7 +1094,7 @@ def stream_tool_call_guard_mode() -> str:
     }
     raw = aliases.get(raw, raw)
     if raw not in {"auto", "protective", "off"}:
-        return "auto"
+        return "off"
     return raw
 
 
@@ -1097,11 +1104,40 @@ def stream_tool_call_guard_seconds() -> float:
     return max(0.0, STREAM_TOOL_CALL_WALL_FAIL_SECS)
 
 
+def anthropic_tool_args_mode() -> str:
+    raw = os.environ.get(ANTHROPIC_TOOL_ARGS_MODE_ENV, "coalesce").strip().lower()
+    aliases = {
+        "": "coalesce",
+        "1": "coalesce",
+        "true": "coalesce",
+        "yes": "coalesce",
+        "on": "coalesce",
+        "buffer": "coalesce",
+        "buffered": "coalesce",
+        "collapse": "coalesce",
+        "0": "stream",
+        "false": "stream",
+        "no": "stream",
+        "off": "stream",
+        "passthrough": "stream",
+        "raw": "stream",
+    }
+    raw = aliases.get(raw, raw)
+    if raw not in {"coalesce", "stream"}:
+        return "coalesce"
+    return raw
+
+
+def anthropic_tool_arg_ping_seconds() -> float:
+    return max(0.0, ANTHROPIC_TOOL_ARG_PING_SECS)
+
+
 def log_bridge_stream_summary(
     *,
     account_id: str,
     requested_model: str | None,
     requested_effort: str | None,
+    actual_effort: str | None,
     request_id: str,
     started_at: float,
     upstream_request_id: str | None,
@@ -1113,16 +1149,23 @@ def log_bridge_stream_summary(
         "client_disconnected": metrics.client_disconnected,
         "downstream_writes": metrics.downstream_writes,
         "duration_s": round(time.monotonic() - started_at, 3),
-        "effort": requested_effort or "unknown",
+        "actual_effort": actual_effort or requested_effort or "unknown",
+        "effort": actual_effort or requested_effort or "unknown",
         "heartbeats": state.emitted_count,
         "idle_timeout_seen": metrics.idle_timeout_seen,
         "first_visible_after_ms": metrics.first_visible_after_ms,
         "last_event_name": metrics.last_event_name,
         "model": requested_model or "unknown",
         "reasoning_events": metrics.reasoning_events,
+        "requested_effort": requested_effort or "unknown",
         "request_id": request_id,
         "terminal_event_seen": metrics.terminal_event_seen,
         "terminal_events": metrics.terminal_events,
+        "tool_arg_buffer_chars": metrics.tool_arg_buffer_chars,
+        "tool_arg_coalesced_calls": metrics.tool_arg_coalesced_calls,
+        "tool_arg_delta_events": metrics.tool_arg_delta_events,
+        "tool_arg_ping_events": metrics.tool_arg_ping_events,
+        "tool_args_mode": metrics.tool_args_mode or anthropic_tool_args_mode(),
         "tool_events": metrics.tool_events,
         "upstream_events": metrics.upstream_events,
         "visible_text_events": metrics.visible_text_events,
@@ -1140,6 +1183,7 @@ def log_bridge_long_stream_warning(
     account_id: str,
     requested_model: str | None,
     requested_effort: str | None,
+    actual_effort: str | None,
     request_id: str,
     started_at: float,
     upstream_request_id: str | None,
@@ -1148,13 +1192,20 @@ def log_bridge_long_stream_warning(
     payload = {
         "account_id": account_id,
         "duration_s": round(time.monotonic() - started_at, 3),
-        "effort": requested_effort or "unknown",
+        "actual_effort": actual_effort or requested_effort or "unknown",
+        "effort": actual_effort or requested_effort or "unknown",
         "first_visible_after_ms": metrics.first_visible_after_ms,
         "last_event_name": metrics.last_event_name,
         "model": requested_model or "unknown",
         "reasoning_events": metrics.reasoning_events,
+        "requested_effort": requested_effort or "unknown",
         "request_id": request_id,
         "terminal_event_seen": metrics.terminal_event_seen,
+        "tool_arg_buffer_chars": metrics.tool_arg_buffer_chars,
+        "tool_arg_coalesced_calls": metrics.tool_arg_coalesced_calls,
+        "tool_arg_delta_events": metrics.tool_arg_delta_events,
+        "tool_arg_ping_events": metrics.tool_arg_ping_events,
+        "tool_args_mode": metrics.tool_args_mode or anthropic_tool_args_mode(),
         "tool_events": metrics.tool_events,
         "upstream_events": metrics.upstream_events,
         "visible_text_events": metrics.visible_text_events,
@@ -2356,7 +2407,13 @@ def _prepend_chunk(first_chunk: bytes, chunks: Any) -> Any:
         yield chunk
 
 
-def iter_anthropic_messages_sse(chunks: Any, *, message_id: str, model: str) -> Any:
+def iter_anthropic_messages_sse(
+    chunks: Any,
+    *,
+    message_id: str,
+    model: str,
+    metrics: BridgeStreamMetrics | None = None,
+) -> Any:
     yield _sse_event(
         "message_start",
         {
@@ -2378,9 +2435,14 @@ def iter_anthropic_messages_sse(chunks: Any, *, message_id: str, model: str) -> 
     text_block_index: int | None = None
     next_content_index = 0
     active_tool_blocks: dict[str, dict[str, Any]] = {}
+    pending_tool_calls: dict[str, dict[str, Any]] = {}
     output_index_to_item_id: dict[int, str] = {}
     saw_tool_use = False
     stopped = False
+    tool_args_mode = anthropic_tool_args_mode()
+    last_tool_arg_ping_at = 0.0
+    if metrics is not None:
+        metrics.tool_args_mode = tool_args_mode
 
     def close_text_block() -> bytes | None:
         nonlocal text_block_open, text_block_index
@@ -2430,6 +2492,98 @@ def iter_anthropic_messages_sse(chunks: Any, *, message_id: str, model: str) -> 
                 },
             },
         )
+
+    def remember_tool_call(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            item = {"id": payload.get("item_id"), "call_id": payload.get("call_id"), "name": payload.get("name")}
+        item_id = tool_item_id(payload)
+        if not item_id:
+            item_id = item.get("id") if isinstance(item.get("id"), str) and item.get("id") else f"fc_{uuid.uuid4().hex[:12]}"
+            item["id"] = item_id
+        output_index = payload.get("output_index")
+        if isinstance(output_index, int):
+            output_index_to_item_id[output_index] = item_id
+        pending = pending_tool_calls.setdefault(item_id, {"item": item, "parts": [], "emitted": False})
+        if isinstance(item, dict):
+            existing = pending.get("item", {})
+            pending["item"] = {
+                **(existing if isinstance(existing, dict) else {}),
+                **{key: value for key, value in item.items() if value is not None},
+            }
+        return item_id, pending
+
+    def ensure_pending_tool_block(payload: dict[str, Any]) -> tuple[str, dict[str, Any], list[bytes]]:
+        item_id, pending = remember_tool_call(payload)
+        item = pending.get("item")
+        if not isinstance(item, dict):
+            item = {"id": item_id}
+        item = dict(item)
+        item.setdefault("id", item_id)
+        chunks_out: list[bytes] = []
+        started = start_tool_block(item, payload)
+        if started:
+            chunks_out.append(started)
+        return item_id, pending, chunks_out
+
+    def emit_tool_call(item_id: str, pending: dict[str, Any], payload: dict[str, Any] | None = None) -> list[bytes]:
+        if pending.get("emitted"):
+            return []
+        pending["emitted"] = True
+        payload = payload or {}
+        item = pending.get("item")
+        if not isinstance(item, dict):
+            item = {"id": item_id}
+        item = dict(item)
+        item.setdefault("id", item_id)
+        chunks_out: list[bytes] = []
+        started = start_tool_block(item, payload)
+        if started:
+            chunks_out.append(started)
+        block = active_tool_blocks.get(item_id)
+        if not block:
+            return chunks_out
+        arguments = payload.get("arguments")
+        payload_item = payload.get("item")
+        if not isinstance(arguments, str) and isinstance(payload_item, dict):
+            arguments = payload_item.get("arguments")
+        if not isinstance(arguments, str):
+            parts = pending.get("parts")
+            arguments = "".join(part for part in parts if isinstance(part, str)) if isinstance(parts, list) else ""
+        if not arguments:
+            arguments = "{}"
+        block["delta_seen"] = True
+        if metrics is not None:
+            metrics.tool_arg_coalesced_calls += 1
+        chunks_out.append(
+            _sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block["index"],
+                    "delta": {"type": "input_json_delta", "partial_json": arguments},
+                },
+            )
+        )
+        stopped_tool = close_tool_block(item_id)
+        if stopped_tool:
+            chunks_out.append(stopped_tool)
+        return chunks_out
+
+    def maybe_tool_arg_ping() -> bytes | None:
+        nonlocal last_tool_arg_ping_at
+        interval = anthropic_tool_arg_ping_seconds()
+        if interval <= 0:
+            if metrics is not None:
+                metrics.tool_arg_ping_events += 1
+            return _sse_event("ping", {"type": "ping"})
+        now = time.monotonic()
+        if last_tool_arg_ping_at <= 0 or now - last_tool_arg_ping_at >= interval:
+            last_tool_arg_ping_at = now
+            if metrics is not None:
+                metrics.tool_arg_ping_events += 1
+            return _sse_event("ping", {"type": "ping"})
+        return None
 
     def tool_item_id(payload: dict[str, Any]) -> str | None:
         item_id = payload.get("item_id")
@@ -2515,12 +2669,28 @@ def iter_anthropic_messages_sse(chunks: Any, *, message_id: str, model: str) -> 
                     closing = close_text_block()
                     if closing:
                         yield closing
-                    started = start_tool_block(item, payload)
-                    if started:
-                        yield started
+                    if tool_args_mode == "stream":
+                        started = start_tool_block(item, payload)
+                        if started:
+                            yield started
+                    else:
+                        _item_id, _pending, started_chunks = ensure_pending_tool_block(payload)
+                        for started in started_chunks:
+                            yield started
             elif event_name == "response.function_call_arguments.delta":
                 delta = payload.get("delta")
                 if not isinstance(delta, str) or not delta:
+                    continue
+                if tool_args_mode == "coalesce":
+                    _item_id, pending, started_chunks = ensure_pending_tool_block(payload)
+                    for started in started_chunks:
+                        yield started
+                    parts = pending.setdefault("parts", [])
+                    if isinstance(parts, list):
+                        parts.append(delta)
+                    ping = maybe_tool_arg_ping()
+                    if ping:
+                        yield ping
                     continue
                 item_id, started_chunks = ensure_tool_block(payload)
                 for started in started_chunks:
@@ -2540,6 +2710,11 @@ def iter_anthropic_messages_sse(chunks: Any, *, message_id: str, model: str) -> 
             elif event_name in {"response.function_call_arguments.done", "response.output_item.done"}:
                 item = payload.get("item")
                 if isinstance(item, dict) and item.get("type") != "function_call":
+                    continue
+                if tool_args_mode == "coalesce":
+                    item_id, pending = remember_tool_call(payload)
+                    for emitted in emit_tool_call(item_id, pending, payload):
+                        yield emitted
                     continue
                 item_id, started_chunks = ensure_tool_block(payload)
                 for started in started_chunks:
@@ -2567,6 +2742,10 @@ def iter_anthropic_messages_sse(chunks: Any, *, message_id: str, model: str) -> 
                 closing = close_text_block()
                 if closing:
                     yield closing
+                if tool_args_mode == "coalesce":
+                    for item_id, pending in list(pending_tool_calls.items()):
+                        for emitted in emit_tool_call(item_id, pending, {"item_id": item_id}):
+                            yield emitted
                 for item_id in list(active_tool_blocks):
                     stopped_tool = close_tool_block(item_id)
                     if stopped_tool:
@@ -2600,6 +2779,10 @@ def iter_anthropic_messages_sse(chunks: Any, *, message_id: str, model: str) -> 
         closing = close_text_block()
         if closing:
             yield closing
+        if tool_args_mode == "coalesce":
+            for item_id, pending in list(pending_tool_calls.items()):
+                for emitted in emit_tool_call(item_id, pending, {"item_id": item_id}):
+                    yield emitted
         for item_id in list(active_tool_blocks):
             stopped_tool = close_tool_block(item_id)
             if stopped_tool:
@@ -2822,13 +3005,14 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             requested_stream = bool(request_body.get("stream", False))
             requested_account_id = route_account_id or self.headers.get("chatgpt-account-id")
             candidate_account_ids, session_key = self._account_candidates(requested_account_id, request_body)
+            requested_effort = extract_reasoning_effort(request_body)
             normalized_body = normalize_request_body(request_body)
             requested_model = (
                 normalized_body.get("model")
                 if isinstance(normalized_body.get("model"), str)
                 else None
             )
-            requested_effort = extract_reasoning_effort(normalized_body)
+            actual_effort = extract_reasoning_effort(normalized_body)
             self._forward_responses_body(
                 candidate_account_ids=candidate_account_ids,
                 session_key=session_key,
@@ -2840,6 +3024,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 is_stream=requested_stream,
                 requested_model=requested_model,
                 requested_effort=requested_effort,
+                actual_effort=actual_effort,
                 output_format="responses",
             )
         except httpx.HTTPStatusError as exc:
@@ -2870,6 +3055,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             requested_account_id = route_account_id or self.headers.get("chatgpt-account-id")
             candidate_account_ids, session_key = self._account_candidates(requested_account_id, request_body)
             responses_body = anthropic_messages_to_responses(request_body)
+            requested_effort = extract_reasoning_effort(responses_body)
             normalized_body = normalize_request_body(responses_body)
             is_stream = bool(request_body.get("stream", False))
             requested_model = (
@@ -2877,7 +3063,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 if isinstance(normalized_body.get("model"), str)
                 else None
             )
-            requested_effort = extract_reasoning_effort(normalized_body)
+            actual_effort = extract_reasoning_effort(normalized_body)
             self._forward_responses_body(
                 candidate_account_ids=candidate_account_ids,
                 session_key=session_key,
@@ -2889,6 +3075,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 is_stream=is_stream,
                 requested_model=requested_model,
                 requested_effort=requested_effort,
+                actual_effort=actual_effort,
                 output_format="messages",
             )
         except httpx.HTTPStatusError as exc:
@@ -2919,6 +3106,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             requested_account_id = route_account_id or self.headers.get("chatgpt-account-id")
             candidate_account_ids, session_key = self._account_candidates(requested_account_id, request_body)
             responses_body = chat_completions_to_responses(request_body)
+            requested_effort = extract_reasoning_effort(responses_body)
             normalized_body = normalize_request_body(responses_body)
             is_stream = bool(request_body.get("stream", False))
             requested_model = (
@@ -2926,7 +3114,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 if isinstance(normalized_body.get("model"), str)
                 else None
             )
-            requested_effort = extract_reasoning_effort(normalized_body)
+            actual_effort = extract_reasoning_effort(normalized_body)
             self._forward_responses_body(
                 candidate_account_ids=candidate_account_ids,
                 session_key=session_key,
@@ -2938,6 +3126,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 is_stream=is_stream,
                 requested_model=requested_model,
                 requested_effort=requested_effort,
+                actual_effort=actual_effort,
                 output_format="chat",
             )
         except httpx.HTTPStatusError as exc:
@@ -2965,6 +3154,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         requested_model: str | None,
         requested_effort: str | None,
         output_format: str,
+        actual_effort: str | None = None,
     ) -> None:
         upstream_url = f"{UPSTREAM_BASE_URL}/responses"
         max_attempts = stream_max_retries() + 1 if is_stream else 1
@@ -3080,6 +3270,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             request_id=request_id,
                             started_at=started_at,
                             requested_effort=requested_effort,
+                            actual_effort=actual_effort,
                             requested_model=requested_model,
                             upstream_request_id=upstream_request_id,
                             metrics=metrics,
@@ -3093,6 +3284,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                                     _prepend_chunk(first_response_chunk, response_chunks),
                                     message_id=f"msg_{request_id}",
                                     model=requested_model or "gpt-5.5",
+                                    metrics=metrics,
                                 )
                             elif output_format == "chat":
                                 first_response_chunk = next(response_chunks)
@@ -3208,6 +3400,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         request_id: str | None = None,
         started_at: float | None = None,
         requested_effort: str | None = None,
+        actual_effort: str | None = None,
         requested_model: str | None = None,
         upstream_request_id: str | None = None,
         metrics: BridgeStreamMetrics | None = None,
@@ -3272,17 +3465,24 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 "client_disconnected": bool(metrics.client_disconnected),
                 "downstream_writes": metrics.downstream_writes,
                 "duration_s": round(elapsed, 3),
-                "effort": requested_effort or "unknown",
+                "actual_effort": actual_effort or requested_effort or "unknown",
+                "effort": actual_effort or requested_effort or "unknown",
                 "first_visible_after_ms": metrics.first_visible_after_ms,
                 "guard_mode": stream_tool_call_guard_mode(),
                 "guard_seconds": int(guard_secs) if guard_secs else 0,
                 "last_event_name": metrics.last_event_name,
                 "model": requested_model or "unknown",
                 "reasoning_events": metrics.reasoning_events,
+                "requested_effort": requested_effort or "unknown",
                 "request_id": stream_request_id,
                 "started_at": int(time.time() - elapsed),
                 "status": status,
                 "terminal_event_seen": bool(metrics.terminal_event_seen),
+                "tool_arg_buffer_chars": metrics.tool_arg_buffer_chars,
+                "tool_arg_coalesced_calls": metrics.tool_arg_coalesced_calls,
+                "tool_arg_delta_events": metrics.tool_arg_delta_events,
+                "tool_arg_ping_events": metrics.tool_arg_ping_events,
+                "tool_args_mode": metrics.tool_args_mode or anthropic_tool_args_mode(),
                 "tool_events": metrics.tool_events,
                 "upstream_events": metrics.upstream_events,
                 "visible_text_events": metrics.visible_text_events,
@@ -3339,7 +3539,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     if idle_for >= STREAM_IDLE_LOG_SECS and now - state.last_idle_logged_at >= STREAM_IDLE_LOG_SECS:
                         state.last_idle_logged_at = now
                         print(
-                            f"{log_timestamp()} [bridge-stream-idle] request_id={stream_request_id} account_id={account_id} model={requested_model or 'unknown'} effort={requested_effort or 'unknown'} phase={idle_phase} idle_s={idle_for:.1f} limit_s={idle_fail_secs:.1f} active_reasoning={str(state.active).lower()} upstream_events={metrics.upstream_events} heartbeats={state.emitted_count}",
+                            f"{log_timestamp()} [bridge-stream-idle] request_id={stream_request_id} account_id={account_id} model={requested_model or 'unknown'} requested_effort={requested_effort or 'unknown'} actual_effort={actual_effort or requested_effort or 'unknown'} phase={idle_phase} idle_s={idle_for:.1f} limit_s={idle_fail_secs:.1f} active_reasoning={str(state.active).lower()} upstream_events={metrics.upstream_events} heartbeats={state.emitted_count}",
                             file=sys.stderr,
                         )
                     heartbeat = self._build_reasoning_placeholder_sse(
@@ -3443,6 +3643,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         account_id=account_id,
                         requested_model=requested_model,
                         requested_effort=requested_effort,
+                        actual_effort=actual_effort,
                         request_id=stream_request_id,
                         started_at=stream_started_at,
                         upstream_request_id=upstream_request_id,
@@ -3503,6 +3704,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 account_id=account_id,
                 requested_model=requested_model,
                 requested_effort=requested_effort,
+                actual_effort=actual_effort,
                 request_id=stream_request_id,
                 started_at=stream_started_at,
                 upstream_request_id=upstream_request_id,
@@ -3683,6 +3885,12 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 metrics.reasoning_events += 1
             if "tool" in event_key or "function_call" in event_key:
                 metrics.tool_events += 1
+            if event_key == "response.function_call_arguments.delta" and isinstance(payload, dict):
+                metrics.tool_args_mode = metrics.tool_args_mode or anthropic_tool_args_mode()
+                metrics.tool_arg_delta_events += 1
+                delta = payload.get("delta")
+                if isinstance(delta, str):
+                    metrics.tool_arg_buffer_chars += len(delta)
             if event_key in {
                 "response.completed",
                 "response.failed",

@@ -1177,6 +1177,34 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn("[bridge-long-stream-warning]", stderr.getvalue())
         self.assertIn('"visible_text_events": 1', stderr.getvalue())
 
+    def test_function_call_argument_guard_defaults_to_passthrough(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(local_codex_bridge.stream_tool_call_guard_mode(), "off")
+            self.assertEqual(local_codex_bridge.stream_tool_call_guard_seconds(), 0.0)
+
+    def test_function_call_argument_metrics_count_lengths_without_content(self) -> None:
+        metrics = local_codex_bridge.BridgeStreamMetrics()
+        chunks = list(
+            self.make_handler()._emit_sse_block_with_reasoning_placeholder(
+                [
+                    "event: response.function_call_arguments.delta",
+                    'data: {"type":"response.function_call_arguments.delta","delta":"{\\"secret\\":\\"value\\"}"}',
+                ],
+                "acct-1",
+                state=local_codex_bridge.ReasoningPlaceholderState(),
+                request_id="bridge-test",
+                started_at=local_codex_bridge.time.monotonic(),
+                requested_model="gpt-5.5",
+                metrics=metrics,
+            )
+        )
+
+        body = b"".join(chunks).decode("utf-8")
+        self.assertIn("response.function_call_arguments.delta", body)
+        self.assertEqual(metrics.tool_arg_delta_events, 1)
+        self.assertEqual(metrics.tool_arg_buffer_chars, len('{"secret":"value"}'))
+        self.assertEqual(metrics.tool_args_mode, "coalesce")
+
     def test_function_call_argument_runaway_fails_before_client_idle_timeout(self) -> None:
         response = FakeSseResponse(
             [
@@ -2144,22 +2172,108 @@ class LocalCodexBridgeCase(unittest.TestCase):
             ),
         ]
 
-        body = b"".join(
-            local_codex_bridge.iter_anthropic_messages_sse(
-                iter(chunks),
-                message_id="msg_1",
-                model="gpt-5.5",
-            )
-        ).decode("utf-8")
+        with mock.patch.dict(os.environ, {"CODEX_BRIDGE_ANTHROPIC_TOOL_ARGS_MODE": "coalesce"}):
+            body = b"".join(
+                local_codex_bridge.iter_anthropic_messages_sse(
+                    iter(chunks),
+                    message_id="msg_1",
+                    model="gpt-5.5",
+                )
+            ).decode("utf-8")
 
         self.assertIn('"type":"tool_use"', body)
         self.assertIn('"id":"call_1"', body)
         self.assertIn('"name":"Read"', body)
         self.assertIn('"type":"input_json_delta"', body)
-        self.assertIn('"partial_json":"{\\"file_path\\":"', body)
-        self.assertIn('"partial_json":"\\"/tmp/a\\"}"', body)
+        self.assertEqual(body.count('"type":"input_json_delta"'), 1)
+        self.assertIn('"partial_json":"{\\"file_path\\":\\"/tmp/a\\"}"', body)
+        self.assertIn('event: ping', body)
+        self.assertLess(body.index('"type":"tool_use"'), body.index('event: ping'))
+        self.assertLess(body.index('event: ping'), body.index('"type":"input_json_delta"'))
         self.assertIn('"stop_reason":"tool_use"', body)
         self.assertNotIn("response.function_call_arguments.delta", body)
+
+    def test_anthropic_stream_coalesces_long_tool_argument_stream(self) -> None:
+        deltas = [f'"k{i}":{i},' for i in range(1200)]
+        final_arguments = "{" + "".join(deltas) + '"done":true}'
+        chunks = [
+            (
+                b"event: response.output_item.added\n"
+                b'data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Write","arguments":""},"output_index":0}\n\n'
+            )
+        ]
+        chunks.extend(
+            (
+                "event: response.function_call_arguments.delta\n"
+                f"data: {json.dumps({'type': 'response.function_call_arguments.delta', 'item_id': 'fc_1', 'output_index': 0, 'delta': delta})}\n\n"
+            ).encode("utf-8")
+            for delta in deltas
+        )
+        chunks.extend(
+            [
+                (
+                    "event: response.function_call_arguments.done\n"
+                    f"data: {json.dumps({'type': 'response.function_call_arguments.done', 'item_id': 'fc_1', 'output_index': 0, 'arguments': final_arguments})}\n\n"
+                ).encode("utf-8"),
+                b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}\n\n',
+            ]
+        )
+
+        metrics = local_codex_bridge.BridgeStreamMetrics()
+        with mock.patch.dict(os.environ, {"CODEX_BRIDGE_ANTHROPIC_TOOL_ARGS_MODE": "coalesce"}):
+            body = b"".join(
+                local_codex_bridge.iter_anthropic_messages_sse(
+                    iter(chunks),
+                    message_id="msg_1",
+                    model="gpt-5.5",
+                    metrics=metrics,
+                )
+            ).decode("utf-8")
+
+        self.assertEqual(body.count('"type":"input_json_delta"'), 1)
+        self.assertLess(body.count("event: ping"), 1200)
+        self.assertIn('"type":"tool_use"', body)
+        self.assertIn('"stop_reason":"tool_use"', body)
+        self.assertNotIn("response.function_call_arguments.delta", body)
+        self.assertEqual(metrics.tool_arg_coalesced_calls, 1)
+        self.assertGreaterEqual(metrics.tool_arg_ping_events, 1)
+
+    def test_anthropic_stream_can_stream_function_call_argument_deltas(self) -> None:
+        chunks = [
+            (
+                b"event: response.output_item.added\n"
+                b'data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":""},"output_index":0}\n\n'
+            ),
+            (
+                b"event: response.function_call_arguments.delta\n"
+                b'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\\\"file_path\\\":"}\n\n'
+            ),
+            (
+                b"event: response.function_call_arguments.delta\n"
+                b'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"\\\"/tmp/a\\\"}"}\n\n'
+            ),
+            (
+                b"event: response.function_call_arguments.done\n"
+                b'data: {"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":0,"arguments":"{\\\"file_path\\\":\\\"/tmp/a\\\"}"}\n\n'
+            ),
+            (
+                b"event: response.completed\n"
+                b'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"output_tokens":3}}}\n\n'
+            ),
+        ]
+
+        with mock.patch.dict(os.environ, {"CODEX_BRIDGE_ANTHROPIC_TOOL_ARGS_MODE": "stream"}):
+            body = b"".join(
+                local_codex_bridge.iter_anthropic_messages_sse(
+                    iter(chunks),
+                    message_id="msg_1",
+                    model="gpt-5.5",
+                )
+            ).decode("utf-8")
+
+        self.assertIn('"partial_json":"{\\"file_path\\":"', body)
+        self.assertIn('"partial_json":"\\"/tmp/a\\"}"', body)
+        self.assertNotIn('event: ping', body)
 
     def test_anthropic_stream_converts_completed_function_call_without_deltas(self) -> None:
         chunks = [
@@ -2185,6 +2299,40 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn('"name":"Write"', body)
         self.assertIn('"partial_json":"{\\"path\\":\\"/tmp/a\\"}"', body)
         self.assertIn('"stop_reason":"tool_use"', body)
+
+    def test_anthropic_stream_completed_flushes_pending_tool_arguments(self) -> None:
+        chunks = [
+            (
+                b"event: response.output_item.added\n"
+                b'data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Edit","arguments":""},"output_index":0}\n\n'
+            ),
+            (
+                b"event: response.function_call_arguments.delta\n"
+                b'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\\\"old\\\":"}\n\n'
+            ),
+            (
+                b"event: response.function_call_arguments.delta\n"
+                b'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"\\\"a\\\"}"}\n\n'
+            ),
+            (
+                b"event: response.completed\n"
+                b'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"output_tokens":3}}}\n\n'
+            ),
+        ]
+
+        with mock.patch.dict(os.environ, {"CODEX_BRIDGE_ANTHROPIC_TOOL_ARGS_MODE": "coalesce"}):
+            body = b"".join(
+                local_codex_bridge.iter_anthropic_messages_sse(
+                    iter(chunks),
+                    message_id="msg_1",
+                    model="gpt-5.5",
+                )
+            ).decode("utf-8")
+
+        self.assertEqual(body.count('"type":"input_json_delta"'), 1)
+        self.assertIn('"partial_json":"{\\"old\\":\\"a\\"}"', body)
+        self.assertIn("event: content_block_stop", body)
+        self.assertIn("event: message_stop", body)
 
     def test_bridge_listen_host_rejects_non_loopback_by_default(self) -> None:
         self.assertEqual(local_codex_bridge.resolve_listen_host("127.0.0.1"), "127.0.0.1")
@@ -2348,9 +2496,16 @@ class LocalCodexBridgeCase(unittest.TestCase):
                             "status": "tool_arguments_streaming",
                             "model": "gpt-5.5",
                             "duration_s": 42.5,
+                            "requested_effort": "medium",
+                            "actual_effort": "xhigh",
                             "last_event_name": "response.function_call_arguments.delta",
                             "guard_mode": "auto",
                             "guard_seconds": 240,
+                            "tool_args_mode": "coalesce",
+                            "tool_arg_delta_events": 10,
+                            "tool_arg_buffer_chars": 2048,
+                            "tool_arg_ping_events": 3,
+                            "tool_arg_coalesced_calls": 1,
                             "tool_events": 123,
                             "visible_text_events": 1,
                         },
@@ -2364,6 +2519,13 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(payload["active_stream"]["request_id"], "bridge-active")
         self.assertEqual(payload["active_stream"]["status"], "tool_arguments_streaming")
         self.assertEqual(payload["active_stream"]["guard_seconds"], 240)
+        self.assertEqual(payload["active_stream"]["requested_effort"], "medium")
+        self.assertEqual(payload["active_stream"]["actual_effort"], "xhigh")
+        self.assertEqual(payload["active_stream"]["tool_args_mode"], "coalesce")
+        self.assertEqual(payload["active_stream"]["tool_arg_delta_events"], 10)
+        self.assertEqual(payload["active_stream"]["tool_arg_buffer_chars"], 2048)
+        self.assertEqual(payload["active_stream"]["tool_arg_ping_events"], 3)
+        self.assertEqual(payload["active_stream"]["tool_arg_coalesced_calls"], 1)
 
     def test_bridge_state_reads_usage_metrics_without_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

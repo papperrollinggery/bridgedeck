@@ -58,7 +58,7 @@ DEFAULT_ZPROFILE_PATH = Path.home() / ".zprofile"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.20"
+APP_VERSION = "0.2.21"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -1183,6 +1183,7 @@ def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dic
             "client_disconnected": bool(active.get("client_disconnected")),
             "downstream_writes": safe_int(active.get("downstream_writes"), 0),
             "duration_s": safe_float(active.get("duration_s"), 0.0),
+            "actual_effort": str(active.get("actual_effort") or ""),
             "effort": str(active.get("effort") or ""),
             "first_visible_after_ms": active.get("first_visible_after_ms"),
             "guard_mode": str(active.get("guard_mode") or ""),
@@ -1190,10 +1191,16 @@ def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dic
             "last_event_name": str(active.get("last_event_name") or ""),
             "model": str(active.get("model") or ""),
             "reasoning_events": safe_int(active.get("reasoning_events"), 0),
+            "requested_effort": str(active.get("requested_effort") or ""),
             "request_id": str(active.get("request_id") or ""),
             "started_at": safe_int(active.get("started_at"), 0),
             "status": str(active.get("status") or ""),
             "terminal_event_seen": bool(active.get("terminal_event_seen")),
+            "tool_arg_buffer_chars": safe_int(active.get("tool_arg_buffer_chars"), 0),
+            "tool_arg_coalesced_calls": safe_int(active.get("tool_arg_coalesced_calls"), 0),
+            "tool_arg_delta_events": safe_int(active.get("tool_arg_delta_events"), 0),
+            "tool_arg_ping_events": safe_int(active.get("tool_arg_ping_events"), 0),
+            "tool_args_mode": str(active.get("tool_args_mode") or ""),
             "tool_events": safe_int(active.get("tool_events"), 0),
             "upstream_events": safe_int(active.get("upstream_events"), 0),
             "visible_text_events": safe_int(active.get("visible_text_events"), 0),
@@ -1281,6 +1288,13 @@ def parse_bridge_stream_log(path: Path, *, max_events: int = 80) -> list[dict[st
                 "client_disconnected": bool(body.get("client_disconnected")),
                 "terminal_event_seen": bool(body.get("terminal_event_seen")),
                 "idle_timeout_seen": bool(body.get("idle_timeout_seen")),
+                "actual_effort": str(body.get("actual_effort") or body.get("effort") or ""),
+                "requested_effort": str(body.get("requested_effort") or ""),
+                "tool_arg_buffer_chars": safe_int(body.get("tool_arg_buffer_chars"), 0),
+                "tool_arg_coalesced_calls": safe_int(body.get("tool_arg_coalesced_calls"), 0),
+                "tool_arg_delta_events": safe_int(body.get("tool_arg_delta_events"), 0),
+                "tool_arg_ping_events": safe_int(body.get("tool_arg_ping_events"), 0),
+                "tool_args_mode": str(body.get("tool_args_mode") or ""),
                 "upstream_events": safe_int(body.get("upstream_events"), 0),
                 "downstream_writes": safe_int(body.get("downstream_writes"), 0),
                 "visible_text_events": safe_int(body.get("visible_text_events"), 0),
@@ -7354,7 +7368,7 @@ INDEX_HTML = """<!doctype html>
           : '';
         const active = item.active_stream || {};
         const activeLine = active.request_id
-          ? `<br><span class="warnText">active stream: ${esc(active.status || 'streaming')} · ${esc(active.model || '-')} · ${esc(active.duration_s || 0)}s · guard ${esc(active.guard_mode || 'auto')}/${esc(active.guard_seconds || 0)}s</span>`
+          ? `<br><span class="warnText">active stream: ${esc(active.status || 'streaming')} · ${esc(active.model || '-')} · ${esc(active.duration_s || 0)}s · effort ${esc(active.requested_effort || '-')}/${esc(active.actual_effort || active.effort || '-')} · guard ${esc(active.guard_mode || 'off')}/${esc(active.guard_seconds || 0)}s · args ${esc(active.tool_args_mode || '-')} ${esc(active.tool_arg_delta_events || 0)}片/${esc(active.tool_arg_buffer_chars || 0)}字 · ping ${esc(active.tool_arg_ping_events || 0)}</span>`
           : '';
         const streamDiag = item.stream_diagnostics && item.stream_diagnostics.message
           ? `<br><span class="muted">stream diagnosis: ${esc(item.stream_diagnostics.message)}</span>`
@@ -7389,14 +7403,14 @@ INDEX_HTML = """<!doctype html>
       const state = active.request_id ? 'warn' : (diag.status === 'ok' ? 'ok' : (diag.status === 'unknown' ? '' : 'bad'));
       box.className = `recommend ${state}`;
       const activeLine = active.request_id
-        ? `当前: ${active.status || 'streaming'} · ${active.model || '-'} · ${active.duration_s || 0}s · ${active.last_event_name || '-'} · tool ${active.tool_events || 0} · 可见文本 ${active.visible_text_events || 0} · guard ${active.guard_mode || 'auto'}/${active.guard_seconds || 0}s`
+        ? `当前: ${active.status || 'streaming'} · ${active.model || '-'} · ${active.duration_s || 0}s · ${active.last_event_name || '-'} · 思考 ${active.requested_effort || '-'}/${active.actual_effort || active.effort || '-'} · tool ${active.tool_events || 0} · 参数 ${active.tool_args_mode || '-'} ${active.tool_arg_delta_events || 0}片/${active.tool_arg_buffer_chars || 0}字 · ping ${active.tool_arg_ping_events || 0} · 可见文本 ${active.visible_text_events || 0} · guard ${active.guard_mode || 'off'}/${active.guard_seconds || 0}s`
         : '当前: 无活跃 Local Bridge 流';
       const latestLine = latest.kind
         ? `最近: ${latest.timestamp || '-'} · ${latest.kind} · ${latest.model || '-'} · ${latest.duration_s ? `${latest.duration_s}s` : `${latest.duration_ms || 0}ms`}`
         : '最近: -';
       const detail = latest.kind === 'client_disconnect'
-        ? `上游事件 ${latest.upstream_events || 0}，下游写入 ${latest.downstream_writes || 0}，终止事件 ${latest.terminal_event_seen ? '已看到' : '未看到'}。`
-        : `可见文本 ${latest.visible_text_events || 0}，reasoning ${latest.reasoning_events || 0}，tool ${latest.tool_events || 0}，terminal ${latest.terminal_events || 0}。`;
+        ? `上游事件 ${latest.upstream_events || 0}，下游写入 ${latest.downstream_writes || 0}，终止事件 ${latest.terminal_event_seen ? '已看到' : '未看到'}，思考 ${latest.requested_effort || '-'}/${latest.actual_effort || '-'}，工具参数 ${latest.tool_args_mode || '-'} ${latest.tool_arg_delta_events || 0}片/${latest.tool_arg_buffer_chars || 0}字。`
+        : `可见文本 ${latest.visible_text_events || 0}，reasoning ${latest.reasoning_events || 0}，tool ${latest.tool_events || 0}，terminal ${latest.terminal_events || 0}，思考 ${latest.requested_effort || '-'}/${latest.actual_effort || '-'}，工具参数 ${latest.tool_args_mode || '-'} ${latest.tool_arg_delta_events || 0}片。`;
       box.innerHTML = `<b>${esc(active.request_id ? '检测到活跃流。若长时间停在 tool_arguments_streaming，通常是上游持续生成工具参数，不是断网。' : (diag.message || '流式诊断未知'))}</b><br>${esc(activeLine)}<br>${esc(latestLine)}<br>${esc(detail)}<br><span class="muted">client_disconnect ${counts.client_disconnect || 0} · idle_timeout ${counts.bridge_idle_timeout || 0} · long_stream ${counts.long_stream || 0} · stream_end ${counts.stream_end || 0}</span>`;
     }
     function renderHookRiskDiagnostics(data) {

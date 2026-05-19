@@ -171,5 +171,9 @@ if command -v swiftc >/dev/null 2>&1; then
 fi
 chmod +x "$MACOS/launcher"
 
+if command -v codesign >/dev/null 2>&1; then
+  codesign --force --deep --sign - "$APP_DIR" >/dev/null
+fi
+
 /usr/bin/hdiutil create -volname "$APP_NAME" -srcfolder "$APP_DIR" -ov -format UDZO "$DMG"
 echo "$DMG"
