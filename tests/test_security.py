@@ -197,6 +197,20 @@ class FakeManager:
                     "cost_usd": 0.0,
                 }
             ],
+            "stream_diagnostics": {
+                "status": "ok",
+                "message": "最近流式请求正常结束。",
+                "latest": {},
+                "counts": {},
+                "events": [],
+                "log_paths": [],
+            },
+            "claude_hook_risks": {
+                "status": "ok",
+                "message": "Claude hooks 未发现明显长等待风险。",
+                "events": {},
+                "risks": [],
+            },
             "account_matrix": [],
             "current_provider_from_settings": "",
             "claude_attribution_header": {
@@ -441,6 +455,17 @@ class FakeManager:
                         "duration_ms": 100,
                         "error_type": "RemoteProtocolError",
                         "error": "incomplete chunked read",
+                    },
+                    "stream_diagnostics": {
+                        "status": "warning",
+                        "message": "最近一次是客户端断开：Bridge 仍在接收上游流，不是 Bridge idle timeout。",
+                        "latest": {
+                            "kind": "client_disconnect",
+                            "account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                            "log_path": "/Users/person/.cc-switch/bridgedeck-local-bridge.log",
+                        },
+                        "events": [],
+                        "log_paths": ["/Users/person/.cc-switch/bridgedeck-local-bridge.log"],
                     },
                 },
                 "cc_switch_proxy": {"name": "CC Switch Proxy", "running": True, "port": 15721},
@@ -1087,6 +1112,9 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn("[bridge-stream-end]", logs)
         self.assertIn('"terminal_event_seen": true', logs)
         self.assertIn('"upstream_events": 2', logs)
+        self.assertIn('"visible_text_events": 1', logs)
+        self.assertIn('"terminal_events": 1', logs)
+        self.assertIn('"last_event_name": "response.completed"', logs)
 
     def test_stream_final_summary_records_client_disconnect(self) -> None:
         metrics = local_codex_bridge.BridgeStreamMetrics()
@@ -1112,6 +1140,34 @@ class LocalCodexBridgeCase(unittest.TestCase):
 
         self.assertIn("[bridge-stream-end]", stderr.getvalue())
         self.assertIn('"client_disconnected": true', stderr.getvalue())
+
+    def test_long_stream_warning_logs_without_changing_stream(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.output_text.delta",
+                'data: {"type":"response.output_text.delta","delta":"hello"}',
+                "",
+            ]
+        )
+
+        with (
+            mock.patch.object(local_codex_bridge, "STREAM_LONG_WARNING_SECS", 0.001),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    response,
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic() - 1,
+                    requested_model="gpt-5.5",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        self.assertIn("hello", body)
+        self.assertIn("[bridge-long-stream-warning]", stderr.getvalue())
+        self.assertIn('"visible_text_events": 1', stderr.getvalue())
 
     def test_stream_write_failure_records_client_disconnect(self) -> None:
         with (
@@ -2169,6 +2225,64 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(payload["usage_events"][0]["bridge_port"], 8876)
         self.assertTrue(payload["usage_events"][0]["desktop_route"])
 
+    def test_bridge_stream_log_diagnostics_classifies_client_disconnect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "local-codex-bridge.log"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        '2026-05-19T15:43:59 [bridge-stream-error] {"account_id":"acct-1","duration_ms":304682,"error":"downstream client disconnected before terminal event: write_failed","error_type":"BridgeClientDisconnect","model":"gpt-5.5","request_id":"bridge-test"}',
+                        '2026-05-19T15:43:59 [bridge-stream-end] {"account_id":"acct-1","client_disconnected":true,"downstream_writes":9189,"duration_s":304.731,"first_visible_after_ms":null,"idle_timeout_seen":false,"last_event_name":"response.reasoning.delta","model":"gpt-5.5","reasoning_events":9189,"request_id":"bridge-test","terminal_event_seen":false,"terminal_events":0,"tool_events":0,"upstream_events":9190,"visible_text_events":0}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(bridgedeck, "DEFAULT_LOCAL_BRIDGE_LOG_PATHS", ()):
+                payload = bridgedeck.bridge_stream_diagnostics([log_path])
+
+        self.assertEqual(payload["status"], "warning")
+        self.assertEqual(payload["latest"]["kind"], "client_disconnect")
+        self.assertEqual(payload["counts"]["client_disconnect"], 1)
+        self.assertIn("不是 Bridge idle timeout", payload["message"])
+
+    def test_claude_hook_risk_status_flags_long_hooks_without_command_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Path(tmp) / "settings.json"
+            settings.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "/Users/person/private/secret-hook.sh --token abc",
+                                            "timeout": 300,
+                                        }
+                                    ]
+                                }
+                            ],
+                            "PermissionRequest": [
+                                {"hooks": [{"type": "command", "command": "curl http://127.0.0.1:23333/permission", "timeout": 600}]}
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = bridgedeck.claude_hook_risk_status(settings)
+
+        self.assertEqual(payload["status"], "warning")
+        self.assertEqual(payload["risk_count"], 2)
+        encoded = json.dumps(payload)
+        self.assertNotIn("secret-hook.sh --token abc", encoded)
+        self.assertNotIn("/Users/person/private", encoded)
+        self.assertIn("timeout=300s", encoded)
+
 
 class ServerCase(unittest.TestCase):
     def start_server(self, *, allow_sensitive: bool = True, allow_remote_access: bool = False):
@@ -2287,8 +2401,11 @@ class ServerCase(unittest.TestCase):
         self.assertIn("ANTHROPIC_BASE_URL", html)
         self.assertNotIn("ANTHROPIC_MODEL=gpt-5.5", html)
         self.assertIn("ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark", html)
+        self.assertIn("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME=Haiku 4.5", html)
         self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex", html)
+        self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME=Sonnet 4.6", html)
         self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5", html)
+        self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME=Opus 4.7", html)
         self.assertIn("CLAUDE_CODE_ATTRIBUTION_HEADER=0", html)
         self.assertIn("repair-claude-attribution-header", html)
         self.assertIn("Claude 自动路由", html)
@@ -3453,8 +3570,11 @@ class LauncherCase(unittest.TestCase):
         self.assertEqual(applied["updated"][0]["id"], "desktop-1")
         routes = after_meta["claudeDesktopModelRoutes"]
         self.assertEqual(routes["claude-haiku-4-5"]["model"], "gpt-5.3-codex-spark")
+        self.assertEqual(routes["claude-haiku-4-5"]["labelOverride"], "Haiku 4.5")
         self.assertEqual(routes["claude-sonnet-4-6"]["model"], "gpt-5.3-codex")
+        self.assertEqual(routes["claude-sonnet-4-6"]["labelOverride"], "Sonnet 4.6")
         self.assertEqual(routes["claude-opus-4-7"]["model"], "gpt-5.5")
+        self.assertEqual(routes["claude-opus-4-7"]["labelOverride"], "Opus 4.7")
         self.assertFalse(routes["claude-opus-4-7"]["supports1m"])
 
     def test_create_cli_launcher_does_not_refresh_or_write_tokens(self) -> None:
@@ -3624,8 +3744,11 @@ class LauncherCase(unittest.TestCase):
             self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "local-bridge")
             self.assertNotIn("ANTHROPIC_MODEL", env)
             self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gpt-5.3-codex-spark")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"], "Haiku 4.5")
             self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-5.3-codex")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"], "Sonnet 4.6")
             self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gpt-5.5")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "Opus 4.7")
             self.assertEqual(env["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0")
             self.assertEqual(meta["apiFormat"], "openai_responses")
             self.assertEqual(meta["codexOauthTransport"], "local_bridge")
@@ -3636,6 +3759,26 @@ class LauncherCase(unittest.TestCase):
             self.assertIn('planName: "five_hour"', meta["usage_script"]["code"])
             self.assertIn('planName: "weekly_limit"', meta["usage_script"]["code"])
             self.assertNotIn("providerType", meta)
+
+    def test_local_bridge_provider_payload_masks_gpt_model_menu_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+
+            settings, _ = manager._build_provider_payload(
+                "acct-1",
+                settings_config={
+                    "env": {
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "gpt-5.3-codex-spark",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "Team Sonnet",
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "gpt-5.5",
+                    }
+                },
+            )
+
+            env = settings["env"]
+            self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"], "Haiku 4.5")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"], "Team Sonnet")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "Opus 4.7")
 
     def test_provider_payload_applies_adjustable_compact_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

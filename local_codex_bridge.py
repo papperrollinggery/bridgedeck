@@ -55,6 +55,7 @@ REASONING_PLACEHOLDER_MODE_ENV = "CODEX_BRIDGE_REASONING_PLACEHOLDER_MODE"
 STREAM_IDLE_LOG_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_LOG_SECS", "20"))
 STREAM_IDLE_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_FAIL_SECS", "300"))
 STREAM_IDLE_PARTIAL_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_PARTIAL_FAIL_SECS", "900"))
+STREAM_LONG_WARNING_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_LONG_WARNING_SECS", "240"))
 STRIP_CLAUDE_ATTRIBUTION_HEADER_ENV = "CODEX_BRIDGE_STRIP_CLAUDE_CODE_ATTRIBUTION_HEADER"
 CLAUDE_ATTRIBUTION_HEADER_RE = re.compile(
     r"^\s*x-anthropic-billing-header\s*:[^\r\n]*(?:\r?\n){0,2}",
@@ -121,6 +122,13 @@ class BridgeStreamMetrics:
     client_disconnected: bool = False
     terminal_event_seen: bool = False
     idle_timeout_seen: bool = False
+    visible_text_events: int = 0
+    reasoning_events: int = 0
+    tool_events: int = 0
+    terminal_events: int = 0
+    first_visible_after_ms: int | None = None
+    last_event_name: str = ""
+    long_stream_warning_logged: bool = False
 
 
 @dataclass(frozen=True)
@@ -1073,15 +1081,53 @@ def log_bridge_stream_summary(
         "effort": requested_effort or "unknown",
         "heartbeats": state.emitted_count,
         "idle_timeout_seen": metrics.idle_timeout_seen,
+        "first_visible_after_ms": metrics.first_visible_after_ms,
+        "last_event_name": metrics.last_event_name,
         "model": requested_model or "unknown",
+        "reasoning_events": metrics.reasoning_events,
         "request_id": request_id,
         "terminal_event_seen": metrics.terminal_event_seen,
+        "terminal_events": metrics.terminal_events,
+        "tool_events": metrics.tool_events,
         "upstream_events": metrics.upstream_events,
+        "visible_text_events": metrics.visible_text_events,
     }
     if upstream_request_id:
         payload["upstream_request_id"] = upstream_request_id
     print(
         f"{log_timestamp()} [bridge-stream-end] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}",
+        file=sys.stderr,
+    )
+
+
+def log_bridge_long_stream_warning(
+    *,
+    account_id: str,
+    requested_model: str | None,
+    requested_effort: str | None,
+    request_id: str,
+    started_at: float,
+    upstream_request_id: str | None,
+    metrics: BridgeStreamMetrics,
+) -> None:
+    payload = {
+        "account_id": account_id,
+        "duration_s": round(time.monotonic() - started_at, 3),
+        "effort": requested_effort or "unknown",
+        "first_visible_after_ms": metrics.first_visible_after_ms,
+        "last_event_name": metrics.last_event_name,
+        "model": requested_model or "unknown",
+        "reasoning_events": metrics.reasoning_events,
+        "request_id": request_id,
+        "terminal_event_seen": metrics.terminal_event_seen,
+        "tool_events": metrics.tool_events,
+        "upstream_events": metrics.upstream_events,
+        "visible_text_events": metrics.visible_text_events,
+    }
+    if upstream_request_id:
+        payload["upstream_request_id"] = upstream_request_id
+    print(
+        f"{log_timestamp()} [bridge-long-stream-warning] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}",
         file=sys.stderr,
     )
 
@@ -3142,6 +3188,22 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     upstream_request_id=upstream_request_id,
                     metrics=metrics,
                 ))
+                if (
+                    STREAM_LONG_WARNING_SECS > 0
+                    and not metrics.long_stream_warning_logged
+                    and not metrics.terminal_event_seen
+                    and time.monotonic() - stream_started_at >= STREAM_LONG_WARNING_SECS
+                ):
+                    metrics.long_stream_warning_logged = True
+                    log_bridge_long_stream_warning(
+                        account_id=account_id,
+                        requested_model=requested_model,
+                        requested_effort=requested_effort,
+                        request_id=stream_request_id,
+                        started_at=stream_started_at,
+                        upstream_request_id=upstream_request_id,
+                        metrics=metrics,
+                    )
                 if not committed and sse_block_commits_stream(event_name, payload):
                     committed = True
                 if committed:
@@ -3322,7 +3384,21 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         event_name, payload, data_lines = self._parse_sse_block(block_lines)
         if metrics is not None:
             metrics.upstream_events += 1
-            if event_name in {
+            event_key = event_name or ""
+            if isinstance(payload, dict) and not event_key:
+                payload_type = payload.get("type")
+                if isinstance(payload_type, str):
+                    event_key = payload_type
+            metrics.last_event_name = event_key or "unknown"
+            if event_key in {"response.output_text.delta", "response.output_text.done"}:
+                metrics.visible_text_events += 1
+                if metrics.first_visible_after_ms is None:
+                    metrics.first_visible_after_ms = int((time.monotonic() - started_at) * 1000)
+            if self._block_has_reasoning_signal(event_name, payload):
+                metrics.reasoning_events += 1
+            if "tool" in event_key or "function_call" in event_key:
+                metrics.tool_events += 1
+            if event_key in {
                 "response.completed",
                 "response.failed",
                 "response.cancelled",
@@ -3330,6 +3406,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 "error",
             }:
                 metrics.terminal_event_seen = True
+                metrics.terminal_events += 1
         self._update_reasoning_placeholder_state(state, event_name, payload)
         terminal_error = terminal_stream_error_from_payload(event_name, payload)
         if terminal_error is not None and not state.logged_terminal_error:

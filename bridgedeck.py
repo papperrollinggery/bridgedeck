@@ -45,6 +45,10 @@ DEFAULT_LOCAL_BRIDGE_STATE_PATH = Path(
         str(Path.home() / ".cc-switch" / "bridgedeck-local-bridge-state.json"),
     )
 )
+DEFAULT_LOCAL_BRIDGE_LOG_PATHS = (
+    Path.home() / ".cc-switch" / "bridgedeck-local-bridge.log",
+    Path.home() / "Library" / "Logs" / "local-codex-bridge.log",
+)
 DEFAULT_OMC_CODEX_SHIM_PATHS = (
     DEFAULT_CLI_LAUNCHER_DIR / "bin" / "codex",
     Path.home() / ".codebuddy" / "bin" / "codex",
@@ -87,6 +91,11 @@ MODEL_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
 )
+MODEL_DISPLAY_ENV_KEYS = (
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+)
 SAFE_COMMON_CONFIG_KEYS = (
     "hooks",
     "permissions",
@@ -106,6 +115,7 @@ PROVIDER_SCOPED_ENV_KEYS = {
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_AUTH_TOKEN",
     *MODEL_ENV_KEYS,
+    *MODEL_DISPLAY_ENV_KEYS,
     COMPACT_WINDOW_ENV,
     COMPACT_THRESHOLD_ENV,
     MAX_CONTEXT_TOKENS_ENV,
@@ -129,18 +139,24 @@ CLAUDE_DESKTOP_ROUTE_SPECS = (
         "alias": "claude-haiku-4-5",
         "slot": "haiku",
         "env": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "display_env": "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+        "display_name": "Haiku 4.5",
         "default_model": "gpt-5.3-codex-spark",
     },
     {
         "alias": "claude-sonnet-4-6",
         "slot": "sonnet",
         "env": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "display_env": "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+        "display_name": "Sonnet 4.6",
         "default_model": "gpt-5.3-codex",
     },
     {
         "alias": "claude-opus-4-7",
         "slot": "opus",
         "env": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "display_env": "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+        "display_name": "Opus 4.7",
         "default_model": "gpt-5.5",
     },
 )
@@ -318,6 +334,17 @@ def normalize_provider_model_env(env: dict[str, Any]) -> None:
             env[key] = normalize_openai_model_id(env[key])
 
 
+def apply_bridge_safe_model_display_names(env: dict[str, Any]) -> None:
+    for spec in CLAUDE_DESKTOP_ROUTE_SPECS:
+        display_env = spec.get("display_env")
+        if not isinstance(display_env, str):
+            continue
+        current = env.get(display_env)
+        current_text = current.strip() if isinstance(current, str) else ""
+        if not current_text or re.match(r"(?i)^gpt-", current_text):
+            env[display_env] = spec["display_name"]
+
+
 def bridge_model_option(model_id: str | None) -> dict[str, Any] | None:
     normalized = normalize_openai_model_id(model_id)
     for item in BRIDGE_MODEL_OPTIONS:
@@ -402,9 +429,12 @@ def claude_desktop_routes_from_env(env: dict[str, Any]) -> dict[str, dict[str, A
     routes: dict[str, dict[str, Any]] = {}
     for spec in CLAUDE_DESKTOP_ROUTE_SPECS:
         model = normalize_openai_model_id(env.get(spec["env"]) or spec["default_model"])
+        display_name = env.get(spec["display_env"])
+        if not isinstance(display_name, str) or not display_name.strip() or re.match(r"(?i)^gpt-", display_name.strip()):
+            display_name = spec["display_name"]
         routes[spec["alias"]] = {
             "model": model,
-            "labelOverride": model,
+            "labelOverride": display_name,
             "supports1m": bridge_model_supports_1m(model),
         }
     return routes
@@ -1159,6 +1189,265 @@ def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dic
             "upstream_request_id": str(error.get("upstream_request_id") or ""),
     }
     return state
+
+
+def read_tail_text(path: Path, *, max_bytes: int = 512 * 1024) -> str:
+    if not path.exists() or path.is_symlink() or not path.is_file():
+        return ""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(-max_bytes, os.SEEK_END)
+                handle.readline()
+            return handle.read(max_bytes).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _bridge_stream_log_paths(extra: list[Path] | None = None) -> list[Path]:
+    paths: list[Path] = []
+    for path in [*(extra or []), *DEFAULT_LOCAL_BRIDGE_LOG_PATHS]:
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def parse_bridge_stream_log(path: Path, *, max_events: int = 80) -> list[dict[str, Any]]:
+    text = read_tail_text(path)
+    if not text:
+        return []
+    events: list[dict[str, Any]] = []
+    pattern = re.compile(r"^(?P<ts>\S+)\s+\[(?P<tag>bridge-(?:stream-error|stream-end|long-stream-warning))\]\s+(?P<body>\{.*\})$")
+    for line in text.splitlines():
+        match = pattern.match(line.strip())
+        if not match:
+            continue
+        try:
+            body = json.loads(match.group("body"))
+        except Exception:
+            continue
+        if not isinstance(body, dict):
+            continue
+        tag = match.group("tag")
+        error_type = str(body.get("error_type") or "")
+        kind = "stream_end"
+        if bool(body.get("client_disconnected")):
+            kind = "client_disconnect"
+        elif bool(body.get("idle_timeout_seen")):
+            kind = "bridge_idle_timeout"
+        elif tag == "bridge-long-stream-warning":
+            kind = "long_stream"
+        elif error_type == "BridgeClientDisconnect":
+            kind = "client_disconnect"
+        elif error_type == "BridgeStreamIdleTimeout":
+            kind = "bridge_idle_timeout"
+        elif tag == "bridge-stream-error":
+            kind = "upstream_stream_error"
+        events.append(
+            {
+                "timestamp": match.group("ts"),
+                "tag": tag,
+                "kind": kind,
+                "account_id": str(body.get("account_id") or ""),
+                "model": str(body.get("model") or ""),
+                "request_id": str(body.get("request_id") or ""),
+                "duration_ms": safe_int(body.get("duration_ms"), 0),
+                "duration_s": safe_float(body.get("duration_s"), 0.0),
+                "error_type": error_type,
+                "error": truncate_log_text(str(body.get("error") or ""), limit=160),
+                "client_disconnected": bool(body.get("client_disconnected")),
+                "terminal_event_seen": bool(body.get("terminal_event_seen")),
+                "idle_timeout_seen": bool(body.get("idle_timeout_seen")),
+                "upstream_events": safe_int(body.get("upstream_events"), 0),
+                "downstream_writes": safe_int(body.get("downstream_writes"), 0),
+                "visible_text_events": safe_int(body.get("visible_text_events"), 0),
+                "reasoning_events": safe_int(body.get("reasoning_events"), 0),
+                "tool_events": safe_int(body.get("tool_events"), 0),
+                "terminal_events": safe_int(body.get("terminal_events"), 0),
+                "first_visible_after_ms": body.get("first_visible_after_ms"),
+                "last_event_name": str(body.get("last_event_name") or ""),
+                "log_path": str(path),
+            }
+        )
+    return events[-max_events:]
+
+
+def bridge_stream_diagnostics(log_paths: list[Path] | None = None) -> dict[str, Any]:
+    paths = _bridge_stream_log_paths(log_paths)
+    events: list[dict[str, Any]] = []
+    for path in paths:
+        events.extend(parse_bridge_stream_log(path))
+    events.sort(key=lambda item: str(item.get("timestamp") or ""))
+    events = events[-80:]
+    latest = events[-1] if events else {}
+    def count_kind(kind: str) -> int:
+        keys = {
+            str(item.get("request_id") or item.get("timestamp") or idx)
+            for idx, item in enumerate(events)
+            if item.get("kind") == kind
+        }
+        return len(keys)
+
+    counts = {
+        "client_disconnect": count_kind("client_disconnect"),
+        "bridge_idle_timeout": count_kind("bridge_idle_timeout"),
+        "upstream_stream_error": count_kind("upstream_stream_error"),
+        "long_stream": count_kind("long_stream"),
+        "stream_end": count_kind("stream_end"),
+    }
+    if not events:
+        status = "unknown"
+        message = "还没有采集到 Local Bridge 流式日志。"
+    elif latest.get("kind") == "client_disconnect":
+        status = "warning"
+        message = "最近一次是客户端断开：Bridge 仍在接收上游流，不是 Bridge idle timeout。"
+    elif latest.get("kind") == "bridge_idle_timeout":
+        status = "warning"
+        message = "最近一次是 Bridge idle timeout：上游在超时窗口内没有继续产出。"
+    elif latest.get("kind") == "long_stream":
+        status = "warning"
+        message = "检测到长时间未结束的流：需要观察是否只有 reasoning/tool 事件、没有可见文本。"
+    elif latest.get("kind") == "upstream_stream_error":
+        status = "warning"
+        message = "最近一次是上游流式错误。"
+    else:
+        status = "ok"
+        message = "最近流式请求正常结束。"
+    return {
+        "ok": True,
+        "status": status,
+        "message": message,
+        "latest": latest,
+        "counts": counts,
+        "events": events[-20:],
+        "log_paths": [str(path) for path in paths if path.exists()],
+    }
+
+
+def _hook_command_label(command: Any) -> str:
+    text = str(command or "").strip()
+    if not text:
+        return "unknown"
+    lowered = text.lower()
+    if "clawd" in lowered:
+        return "Clawd on Desk hook"
+    if "http://" in lowered or "https://" in lowered:
+        return "HTTP hook"
+    token = text.split()[0]
+    name = Path(token).name
+    return name or "command"
+
+
+def _hook_timeout(entry: dict[str, Any]) -> int | None:
+    for key in ("timeout", "timeoutSeconds", "timeout_seconds"):
+        if key in entry:
+            return safe_int(entry.get(key), 0)
+    return None
+
+
+def _hook_is_async(entry: dict[str, Any]) -> bool:
+    return any(bool(entry.get(key)) for key in ("async", "run_in_background", "runInBackground", "background"))
+
+
+def _iter_hook_entries(event: str, value: Any):
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_hook_entries(event, item)
+        return
+    if not isinstance(value, dict):
+        return
+    if "command" in value or value.get("type") == "command":
+        yield event, value
+    for key in ("hooks", "commands"):
+        child = value.get(key)
+        if isinstance(child, (list, dict)):
+            yield from _iter_hook_entries(event, child)
+
+
+def claude_hook_risk_status(path: Path = DEFAULT_CLAUDE_SETTINGS_PATH) -> dict[str, Any]:
+    if path.is_symlink():
+        return {
+            "ok": False,
+            "status": "unknown",
+            "message": "Claude settings 是符号链接，未读取 hooks。",
+            "settings_path": str(path),
+            "events": {},
+            "risks": [],
+        }
+    if not path.exists():
+        return {
+            "ok": True,
+            "status": "unknown",
+            "message": "未发现 Claude settings.json。",
+            "settings_path": str(path),
+            "events": {},
+            "risks": [],
+        }
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "unknown",
+            "message": f"Claude settings.json 不可读: {type(exc).__name__}",
+            "settings_path": str(path),
+            "events": {},
+            "risks": [],
+        }
+    hooks = payload.get("hooks") if isinstance(payload, dict) else None
+    if not isinstance(hooks, dict):
+        return {
+            "ok": True,
+            "status": "ok",
+            "message": "未配置 Claude hooks。",
+            "settings_path": str(path),
+            "events": {},
+            "risks": [],
+        }
+    event_counts: dict[str, int] = {}
+    risks: list[dict[str, Any]] = []
+    watched_events = {"PreToolUse", "PostToolUse", "Stop", "PermissionRequest"}
+    for event, value in hooks.items():
+        event_name = str(event)
+        for _, entry in _iter_hook_entries(event_name, value):
+            event_counts[event_name] = event_counts.get(event_name, 0) + 1
+            timeout = _hook_timeout(entry)
+            is_async = _hook_is_async(entry)
+            command_label = _hook_command_label(entry.get("command"))
+            reason = ""
+            severity = "info"
+            if timeout is not None and timeout >= 120:
+                reason = f"timeout={timeout}s，可能造成会话看起来停住"
+                severity = "warning"
+            elif event_name == "PermissionRequest" and timeout is not None and timeout >= 60:
+                reason = f"PermissionRequest timeout={timeout}s，授权等待过长"
+                severity = "warning"
+            elif event_name in watched_events and timeout is None and not is_async:
+                reason = "同步 hook 未声明 timeout，卡住时不易定位"
+                severity = "warning"
+            if reason:
+                risks.append(
+                    {
+                        "event": event_name,
+                        "command_label": command_label,
+                        "timeout": timeout,
+                        "async": is_async,
+                        "severity": severity,
+                        "reason": reason,
+                    }
+                )
+    status = "warning" if any(item.get("severity") == "warning" for item in risks) else "ok"
+    message = "Claude hooks 存在长 timeout/同步等待风险。" if status == "warning" else "Claude hooks 未发现明显长等待风险。"
+    return {
+        "ok": True,
+        "status": status,
+        "message": message,
+        "settings_path": str(path),
+        "events": event_counts,
+        "risks": risks[:12],
+        "risk_count": len(risks),
+    }
 
 
 def mask_url_credentials(value: str) -> str:
@@ -2534,6 +2823,15 @@ class BridgeManager:
         for flag in codex_desktop.get("risk_flags", []):
             if flag in {"desktop_static_model", "desktop_static_reasoning_effort", "desktop_static_service_tier"}:
                 risk_flags.append(str(flag))
+        stream_diag = snapshot.get("stream_diagnostics") if isinstance(snapshot.get("stream_diagnostics"), dict) else {}
+        latest_stream = stream_diag.get("latest") if isinstance(stream_diag.get("latest"), dict) else {}
+        if latest_stream.get("kind") == "client_disconnect":
+            risk_flags.append("bridge_client_disconnect")
+        elif latest_stream.get("kind") == "bridge_idle_timeout":
+            risk_flags.append("bridge_idle_timeout")
+        hook_risks = snapshot.get("claude_hook_risks") if isinstance(snapshot.get("claude_hook_risks"), dict) else {}
+        if hook_risks.get("status") == "warning":
+            risk_flags.append("claude_hook_stall_risk")
         status = "ok" if not risk_flags else str(risk_flags[0])
         return {
             "ok": True,
@@ -2543,6 +2841,8 @@ class BridgeManager:
             "codex_desktop": snapshot.get("codex_desktop", {}),
             "ccswitch_315": ccswitch_315,
             "claude_desktop_providers": snapshot.get("claude_desktop_providers", []),
+            "stream_diagnostics": stream_diag,
+            "claude_hook_risks": hook_risks,
         }
 
     def services(self, *, server_port: int = DEFAULT_PORT) -> dict[str, Any]:
@@ -2550,6 +2850,7 @@ class BridgeManager:
         bridge_script = find_local_bridge_script(bridge_processes)
         upstream_proxy = detect_upstream_proxy(bridge_processes)
         bridge_state = read_local_bridge_state()
+        stream_diagnostics = self.stream_diagnostics()
         active_connections = port_active_connections(LOCAL_BRIDGE_PORT)
         return {
             "ok": True,
@@ -2572,6 +2873,7 @@ class BridgeManager:
                     "upstream_proxy": mask_url_credentials(upstream_proxy),
                     "log_path": str(self.paths.db.parent / "bridgedeck-local-bridge.log"),
                     "last_stream_error": bridge_state.get("last_stream_error") or {},
+                    "stream_diagnostics": stream_diagnostics,
                 },
                 "cc_switch_proxy": {
                     "name": "CC Switch Proxy",
@@ -2581,6 +2883,9 @@ class BridgeManager:
                 },
             },
         }
+
+    def stream_diagnostics(self) -> dict[str, Any]:
+        return bridge_stream_diagnostics([self.paths.db.parent / "bridgedeck-local-bridge.log"])
 
     def codex_native_proxy_status(self) -> dict[str, Any]:
         env_path = DEFAULT_CODEX_HOME / ".env"
@@ -3420,6 +3725,7 @@ class BridgeManager:
         env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "gpt-5.3-codex-spark")
         env.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", "gpt-5.3-codex")
         env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "gpt-5.5")
+        apply_bridge_safe_model_display_names(env)
         ensure_claude_attribution_default(env)
         normalize_provider_model_env(env)
         if compact_config is not None:
@@ -3717,6 +4023,8 @@ class BridgeManager:
         except Exception as exc:  # noqa: BLE001
             plugin_status = {"ok": False, "error": str(exc)}
         local_bridge_state = read_local_bridge_state()
+        stream_diagnostics = self.stream_diagnostics()
+        hook_risks = claude_hook_risk_status()
         data: dict[str, Any] = {
             "version": APP_VERSION,
             "paths": {
@@ -3744,6 +4052,8 @@ class BridgeManager:
             "omc_codex_shim": self._omc_codex_shim_status(),
             "usage_metrics": local_bridge_state.get("usage_metrics", {}),
             "usage_events": local_bridge_state.get("usage_events", []),
+            "stream_diagnostics": stream_diagnostics,
+            "claude_hook_risks": hook_risks,
             "account_matrix": [],
             "current_provider_from_settings": self._current_provider_from_settings(),
             "auto_switch": self._load_auto_switch_config(),
@@ -5282,7 +5592,22 @@ def redact_path_value(value: Any) -> Any:
         return "~"
     if value.startswith(f"{home}/"):
         return f"~/{value[len(home) + 1:]}"
+    value = re.sub(r"^/Users/[^/]+(?=/|$)", "~", value)
     return value
+
+
+def _redact_stream_diagnostics(stream_diagnostics: dict[str, Any]) -> None:
+    stream_diagnostics["log_paths"] = [
+        redact_path_value(item) for item in stream_diagnostics.get("log_paths", []) if isinstance(item, str)
+    ]
+    latest = stream_diagnostics.get("latest")
+    if isinstance(latest, dict):
+        latest["account_id"] = mask_id_value(latest.get("account_id"))
+        latest["log_path"] = redact_path_value(latest.get("log_path"))
+    for item in stream_diagnostics.get("events", []):
+        if isinstance(item, dict):
+            item["account_id"] = mask_id_value(item.get("account_id"))
+            item["log_path"] = redact_path_value(item.get("log_path"))
 
 
 def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
@@ -5382,12 +5707,21 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             stream_error = service.get("last_stream_error")
             if isinstance(stream_error, dict):
                 stream_error["account_id"] = mask_id_value(stream_error.get("account_id"))
+            stream_diagnostics = service.get("stream_diagnostics")
+            if isinstance(stream_diagnostics, dict):
+                _redact_stream_diagnostics(stream_diagnostics)
     usage_metrics = redacted.get("usage_metrics")
     if isinstance(usage_metrics, dict):
         usage_metrics["last_account_id"] = mask_id_value(usage_metrics.get("last_account_id"))
     for event in redacted.get("usage_events", []):
         if isinstance(event, dict):
             event["account_id"] = mask_id_value(event.get("account_id"))
+    stream_diagnostics = redacted.get("stream_diagnostics")
+    if isinstance(stream_diagnostics, dict):
+        _redact_stream_diagnostics(stream_diagnostics)
+    hook_risks = redacted.get("claude_hook_risks")
+    if isinstance(hook_risks, dict):
+        hook_risks["settings_path"] = redact_path_value(hook_risks.get("settings_path"))
     codex_auth = redacted.get("codex_auth")
     if isinstance(codex_auth, dict):
         codex_auth.pop("path", None)
@@ -6279,6 +6613,12 @@ INDEX_HTML = """<!doctype html>
                 </table>
               </div>
             </div>
+            <div class="card guideSection" data-guide="diagnostics">
+              <h2>Claude Code 停顿诊断</h2>
+              <div class="sectionHint">只读分析 Local Bridge 流式日志和 Claude hooks；不会修改 settings.json 或 Codex config。</div>
+              <div id="streamDiagnostics" class="recommend">流式诊断加载中...</div>
+              <div id="hookRiskDiagnostics" class="recommend mt10">Hook 诊断加载中...</div>
+            </div>
             <div class="card guideSection" data-guide="log">
               <h2>执行日志</h2>
               <textarea id="log" readonly></textarea>
@@ -6315,9 +6655,9 @@ INDEX_HTML = """<!doctype html>
     const LOCAL_API_KEY_PLACEHOLDER = 'sk-bridgedeck-local-placeholder';
     const LOCAL_ANTHROPIC_AUTH_TOKEN = 'local-bridge';
     const CLAUDE_DESKTOP_ROUTES = [
-      ['claude-haiku-4-5', 'gpt-5.3-codex-spark'],
-      ['claude-sonnet-4-6', 'gpt-5.3-codex'],
-      ['claude-opus-4-7', 'gpt-5.5']
+      ['claude-haiku-4-5', 'Haiku 4.5'],
+      ['claude-sonnet-4-6', 'Sonnet 4.6'],
+      ['claude-opus-4-7', 'Opus 4.7']
     ];
     const GUIDES = {
       oauth: {
@@ -6982,9 +7322,12 @@ INDEX_HTML = """<!doctype html>
         const streamError = err.error_type
           ? `<br><span class="warnText">stream error: ${esc(err.error_type)}${err.model ? ' / ' + esc(err.model) : ''}</span>`
           : '';
+        const streamDiag = item.stream_diagnostics && item.stream_diagnostics.message
+          ? `<br><span class="muted">stream diagnosis: ${esc(item.stream_diagnostics.message)}</span>`
+          : '';
         return `<div class="serviceItem">
           <div class="serviceName">${esc(item.name || '')}</div>
-          <div class="serviceMeta"><span class="${cls}">${running ? '运行中' : '未运行'}</span> · ${esc(item.port || '')}${script}${proxy}${streamError}</div>
+          <div class="serviceMeta"><span class="${cls}">${running ? '运行中' : '未运行'}</span> · ${esc(item.port || '')}${script}${proxy}${streamError}${streamDiag}</div>
         </div>`;
       }).join('');
       const message = document.getElementById('serviceMessage');
@@ -7001,6 +7344,34 @@ INDEX_HTML = """<!doctype html>
         return parts.join(' · ');
       });
       box.innerHTML = `<b>${esc(payload.message || '代理诊断完成')}</b>${lines.length ? `<br>${lines.map((line) => esc(line)).join('<br>')}` : ''}`;
+    }
+    function renderStreamDiagnostics(data) {
+      const box = document.getElementById('streamDiagnostics');
+      if (!box) return;
+      const diag = data.stream_diagnostics || {};
+      const latest = diag.latest || {};
+      const counts = diag.counts || {};
+      const state = diag.status === 'ok' ? 'ok' : (diag.status === 'unknown' ? '' : 'bad');
+      box.className = `recommend ${state}`;
+      const latestLine = latest.kind
+        ? `最近: ${latest.timestamp || '-'} · ${latest.kind} · ${latest.model || '-'} · ${latest.duration_s ? `${latest.duration_s}s` : `${latest.duration_ms || 0}ms`}`
+        : '最近: -';
+      const detail = latest.kind === 'client_disconnect'
+        ? `上游事件 ${latest.upstream_events || 0}，下游写入 ${latest.downstream_writes || 0}，终止事件 ${latest.terminal_event_seen ? '已看到' : '未看到'}。`
+        : `可见文本 ${latest.visible_text_events || 0}，reasoning ${latest.reasoning_events || 0}，tool ${latest.tool_events || 0}，terminal ${latest.terminal_events || 0}。`;
+      box.innerHTML = `<b>${esc(diag.message || '流式诊断未知')}</b><br>${esc(latestLine)}<br>${esc(detail)}<br><span class="muted">client_disconnect ${counts.client_disconnect || 0} · idle_timeout ${counts.bridge_idle_timeout || 0} · long_stream ${counts.long_stream || 0} · stream_end ${counts.stream_end || 0}</span>`;
+    }
+    function renderHookRiskDiagnostics(data) {
+      const box = document.getElementById('hookRiskDiagnostics');
+      if (!box) return;
+      const diag = data.claude_hook_risks || {};
+      const risks = Array.isArray(diag.risks) ? diag.risks : [];
+      const state = diag.status === 'ok' ? 'ok' : (diag.status === 'unknown' ? '' : 'bad');
+      box.className = `recommend ${state}`;
+      const eventCounts = diag.events || {};
+      const countLine = Object.keys(eventCounts).sort().map((key) => `${key}:${eventCounts[key]}`).join(' · ');
+      const riskLines = risks.slice(0, 5).map((item) => `${item.event || '-'} · ${item.command_label || '-'} · ${item.reason || '-'}`);
+      box.innerHTML = `<b>${esc(diag.message || 'Hook 诊断未知')}</b>${countLine ? `<br><span class="muted">${esc(countLine)}</span>` : ''}${riskLines.length ? `<br>${riskLines.map((line) => `- ${esc(line)}`).join('<br>')}` : ''}`;
     }
     async function refreshServices() {
       const payload = await api('/api/services');
@@ -7429,7 +7800,7 @@ INDEX_HTML = """<!doctype html>
       return item && item.account_id ? `${LOCAL_BRIDGE_BASE_URL}/accounts/${encodeURIComponent(item.account_id)}` : '';
     }
     function claudeDesktopRoutesText() {
-      return CLAUDE_DESKTOP_ROUTES.map(([route, target]) => `${route} -> ${target}`).join('\\n');
+      return CLAUDE_DESKTOP_ROUTES.map(([route, label]) => `${route} (${label})`).join('\\n');
     }
     function apiAccessEnv(item) {
       const baseUrl = apiAccessBaseUrl(item);
@@ -7437,7 +7808,7 @@ INDEX_HTML = """<!doctype html>
     }
     function anthropicAccessEnv(item) {
       const baseUrl = anthropicAccessBaseUrl(item);
-      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark\nANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex\nANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5\nCLAUDE_CODE_ATTRIBUTION_HEADER=0\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` : '';
+      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark\nANTHROPIC_DEFAULT_HAIKU_MODEL_NAME=Haiku 4.5\nANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex\nANTHROPIC_DEFAULT_SONNET_MODEL_NAME=Sonnet 4.6\nANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5\nANTHROPIC_DEFAULT_OPUS_MODEL_NAME=Opus 4.7\nCLAUDE_CODE_ATTRIBUTION_HEADER=0\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` : '';
     }
     function anthropicForcedModelEnv(item) {
       const base = anthropicAccessEnv(item);
@@ -8081,6 +8452,8 @@ INDEX_HTML = """<!doctype html>
       renderClaudeDesktopProviders(data);
       renderCliHomes(data);
       renderDiagnosis(data);
+      renderStreamDiagnostics(data);
+      renderHookRiskDiagnostics(data);
       renderActualCurrentAccounts(data);
       renderPluginSync(data);
       renderAttributionHeader(data);
