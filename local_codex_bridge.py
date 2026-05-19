@@ -56,7 +56,9 @@ STREAM_IDLE_LOG_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_LOG_SECS",
 STREAM_IDLE_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_FAIL_SECS", "300"))
 STREAM_IDLE_PARTIAL_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_PARTIAL_FAIL_SECS", "900"))
 STREAM_LONG_WARNING_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_LONG_WARNING_SECS", "240"))
+STREAM_TOOL_CALL_GUARD_MODE_ENV = "CODEX_BRIDGE_STREAM_TOOL_CALL_GUARD"
 STREAM_TOOL_CALL_WALL_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_TOOL_CALL_WALL_FAIL_SECS", "240"))
+STREAM_STATE_UPDATE_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_STATE_UPDATE_SECS", "5"))
 STRIP_CLAUDE_ATTRIBUTION_HEADER_ENV = "CODEX_BRIDGE_STRIP_CLAUDE_CODE_ATTRIBUTION_HEADER"
 CLAUDE_ATTRIBUTION_HEADER_RE = re.compile(
     r"^\s*x-anthropic-billing-header\s*:[^\r\n]*(?:\r?\n){0,2}",
@@ -1067,6 +1069,34 @@ def response_failed_sse(
     ).encode("utf-8")
 
 
+def stream_tool_call_guard_mode() -> str:
+    raw = os.environ.get(STREAM_TOOL_CALL_GUARD_MODE_ENV, "auto").strip().lower()
+    aliases = {
+        "": "auto",
+        "1": "auto",
+        "true": "auto",
+        "yes": "auto",
+        "on": "auto",
+        "0": "off",
+        "false": "off",
+        "no": "off",
+        "never": "off",
+        "passthrough": "off",
+        "disabled": "off",
+        "disable": "off",
+    }
+    raw = aliases.get(raw, raw)
+    if raw not in {"auto", "protective", "off"}:
+        return "auto"
+    return raw
+
+
+def stream_tool_call_guard_seconds() -> float:
+    if stream_tool_call_guard_mode() == "off":
+        return 0.0
+    return max(0.0, STREAM_TOOL_CALL_WALL_FAIL_SECS)
+
+
 def log_bridge_stream_summary(
     *,
     account_id: str,
@@ -1186,6 +1216,15 @@ def _write_bridge_state(state: dict[str, Any]) -> None:
 def record_bridge_stream_error(payload: dict[str, Any]) -> None:
     state = _read_bridge_state()
     state["last_stream_error"] = payload
+    _write_bridge_state(state)
+
+
+def record_bridge_active_stream(payload: dict[str, Any] | None) -> None:
+    state = _read_bridge_state()
+    if payload is None:
+        state.pop("active_stream", None)
+    else:
+        state["active_stream"] = payload
     _write_bridge_state(state)
 
 
@@ -3059,6 +3098,40 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         committed = False
         pending_chunks: list[bytes] = []
         usage_recorded = False
+        last_state_recorded_at = 0.0
+
+        def active_stream_payload(status: str) -> dict[str, Any]:
+            guard_secs = stream_tool_call_guard_seconds()
+            elapsed = time.monotonic() - stream_started_at
+            return {
+                "account_id": account_id,
+                "client_disconnected": bool(metrics.client_disconnected),
+                "downstream_writes": metrics.downstream_writes,
+                "duration_s": round(elapsed, 3),
+                "effort": requested_effort or "unknown",
+                "first_visible_after_ms": metrics.first_visible_after_ms,
+                "guard_mode": stream_tool_call_guard_mode(),
+                "guard_seconds": int(guard_secs) if guard_secs else 0,
+                "last_event_name": metrics.last_event_name,
+                "model": requested_model or "unknown",
+                "reasoning_events": metrics.reasoning_events,
+                "request_id": stream_request_id,
+                "started_at": int(time.time() - elapsed),
+                "status": status,
+                "terminal_event_seen": bool(metrics.terminal_event_seen),
+                "tool_events": metrics.tool_events,
+                "upstream_events": metrics.upstream_events,
+                "visible_text_events": metrics.visible_text_events,
+            }
+
+        def maybe_record_active_stream(status: str, *, force: bool = False) -> None:
+            nonlocal last_state_recorded_at
+            now = time.monotonic()
+            if force or STREAM_STATE_UPDATE_SECS <= 0 or now - last_state_recorded_at >= STREAM_STATE_UPDATE_SECS:
+                last_state_recorded_at = now
+                record_bridge_active_stream(active_stream_payload(status))
+
+        maybe_record_active_stream("open", force=True)
 
         try:
             while True:
@@ -3193,6 +3266,8 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     upstream_request_id=upstream_request_id,
                     metrics=metrics,
                 ))
+                status = "tool_arguments_streaming" if "function_call_arguments.delta" in (metrics.last_event_name or "") else "streaming"
+                maybe_record_active_stream(status)
                 if (
                     STREAM_LONG_WARNING_SECS > 0
                     and not metrics.long_stream_warning_logged
@@ -3210,16 +3285,18 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         metrics=metrics,
                     )
                 if (
-                    STREAM_TOOL_CALL_WALL_FAIL_SECS > 0
+                    stream_tool_call_guard_seconds() > 0
                     and not metrics.terminal_event_seen
                     and "function_call_arguments.delta" in (metrics.last_event_name or "")
-                    and time.monotonic() - stream_started_at >= STREAM_TOOL_CALL_WALL_FAIL_SECS
+                    and time.monotonic() - stream_started_at >= stream_tool_call_guard_seconds()
                 ):
+                    guard_secs = stream_tool_call_guard_seconds()
                     exc = BridgeToolCallRunaway(
                         "bridge tool call argument stream exceeded "
-                        f"{STREAM_TOOL_CALL_WALL_FAIL_SECS:.0f}s before a terminal event; "
+                        f"{guard_secs:.0f}s before a terminal event; "
                         "closing early so the client can retry instead of hitting its own stream idle timeout"
                     )
+                    maybe_record_active_stream("guard_triggered", force=True)
                     log_bridge_stream_error(
                         account_id=account_id,
                         requested_model=requested_model,
@@ -3257,6 +3334,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 else:
                     pending_chunks.extend(chunks)
         finally:
+            record_bridge_active_stream(None)
             log_bridge_stream_summary(
                 account_id=account_id,
                 requested_model=requested_model,

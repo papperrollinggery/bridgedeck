@@ -632,6 +632,14 @@ class NoopAuthStore:
 
 
 class LocalCodexBridgeCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._bridge_state_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._bridge_state_tmp.cleanup)
+        state_path = Path(self._bridge_state_tmp.name) / "bridge-state.json"
+        patcher = mock.patch.object(local_codex_bridge, "BRIDGE_STATE_PATH", state_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def make_handler(self) -> local_codex_bridge.CodexBridgeHandler:
         return object.__new__(local_codex_bridge.CodexBridgeHandler)
 
@@ -1179,10 +1187,13 @@ class LocalCodexBridgeCase(unittest.TestCase):
         )
 
         with (
+            mock.patch.dict(os.environ, {"CODEX_BRIDGE_STREAM_TOOL_CALL_GUARD": "auto"}),
             mock.patch.object(local_codex_bridge, "STREAM_TOOL_CALL_WALL_FAIL_SECS", 0.001),
             mock.patch.object(local_codex_bridge, "record_bridge_stream_error") as record,
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
         ):
+            self.assertEqual(local_codex_bridge.stream_tool_call_guard_mode(), "auto")
+            self.assertLess(local_codex_bridge.stream_tool_call_guard_seconds(), 300)
             chunks = list(
                 self.make_handler()._iter_stream_with_reasoning_placeholder(
                     response,
@@ -1201,6 +1212,40 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn('"terminal_event_seen": true', stderr.getvalue())
         record.assert_called_once()
         self.assertEqual(record.call_args.args[0]["error_type"], "BridgeToolCallRunaway")
+        self.assertNotIn("active_stream", local_codex_bridge._read_bridge_state())
+
+    def test_function_call_argument_guard_can_be_disabled_for_passthrough(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.function_call_arguments.delta",
+                'data: {"type":"response.function_call_arguments.delta","delta":"{\\"path\\":"}',
+                "",
+                "event: response.completed",
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}',
+                "",
+            ]
+        )
+
+        with (
+            mock.patch.dict(os.environ, {"CODEX_BRIDGE_STREAM_TOOL_CALL_GUARD": "passthrough"}),
+            mock.patch.object(local_codex_bridge, "STREAM_TOOL_CALL_WALL_FAIL_SECS", 0.001),
+            mock.patch.object(local_codex_bridge, "record_bridge_stream_error") as record,
+        ):
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    response,
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic() - 1,
+                    requested_model="gpt-5.5",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        self.assertIn("event: response.function_call_arguments.delta", body)
+        self.assertIn("event: response.completed", body)
+        self.assertNotIn("bridge_tool_call_runaway", body)
+        record.assert_not_called()
 
     def test_text_long_stream_does_not_trigger_tool_call_runaway(self) -> None:
         response = FakeSseResponse(
@@ -2223,6 +2268,36 @@ class LocalCodexBridgeCase(unittest.TestCase):
 
         self.assertEqual(payload["last_stream_error"]["error_type"], "RemoteProtocolError")
         self.assertEqual(payload["last_stream_error"]["request_id"], "bridge-test")
+
+    def test_bridge_state_reads_active_stream_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": 123,
+                        "active_stream": {
+                            "account_id": "acct-1",
+                            "request_id": "bridge-active",
+                            "status": "tool_arguments_streaming",
+                            "model": "gpt-5.5",
+                            "duration_s": 42.5,
+                            "last_event_name": "response.function_call_arguments.delta",
+                            "guard_mode": "auto",
+                            "guard_seconds": 240,
+                            "tool_events": 123,
+                            "visible_text_events": 1,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = bridgedeck.read_local_bridge_state(state_path)
+
+        self.assertEqual(payload["active_stream"]["request_id"], "bridge-active")
+        self.assertEqual(payload["active_stream"]["status"], "tool_arguments_streaming")
+        self.assertEqual(payload["active_stream"]["guard_seconds"], 240)
 
     def test_bridge_state_reads_usage_metrics_without_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

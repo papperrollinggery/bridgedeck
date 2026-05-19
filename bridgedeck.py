@@ -1176,6 +1176,28 @@ def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dic
             for item in events[-200:]
             if isinstance(item, dict)
         ]
+    active = payload.get("active_stream")
+    if isinstance(active, dict):
+        state["active_stream"] = {
+            "account_id": str(active.get("account_id") or ""),
+            "client_disconnected": bool(active.get("client_disconnected")),
+            "downstream_writes": safe_int(active.get("downstream_writes"), 0),
+            "duration_s": safe_float(active.get("duration_s"), 0.0),
+            "effort": str(active.get("effort") or ""),
+            "first_visible_after_ms": active.get("first_visible_after_ms"),
+            "guard_mode": str(active.get("guard_mode") or ""),
+            "guard_seconds": safe_int(active.get("guard_seconds"), 0),
+            "last_event_name": str(active.get("last_event_name") or ""),
+            "model": str(active.get("model") or ""),
+            "reasoning_events": safe_int(active.get("reasoning_events"), 0),
+            "request_id": str(active.get("request_id") or ""),
+            "started_at": safe_int(active.get("started_at"), 0),
+            "status": str(active.get("status") or ""),
+            "terminal_event_seen": bool(active.get("terminal_event_seen")),
+            "tool_events": safe_int(active.get("tool_events"), 0),
+            "upstream_events": safe_int(active.get("upstream_events"), 0),
+            "visible_text_events": safe_int(active.get("visible_text_events"), 0),
+        }
     error = payload.get("last_stream_error")
     if not isinstance(error, dict):
         return state
@@ -2872,6 +2894,7 @@ class BridgeManager:
                     "restart_protected": bool(active_connections),
                     "upstream_proxy": mask_url_credentials(upstream_proxy),
                     "log_path": str(self.paths.db.parent / "bridgedeck-local-bridge.log"),
+                    "active_stream": bridge_state.get("active_stream") or {},
                     "last_stream_error": bridge_state.get("last_stream_error") or {},
                     "stream_diagnostics": stream_diagnostics,
                 },
@@ -4052,6 +4075,7 @@ class BridgeManager:
             "omc_codex_shim": self._omc_codex_shim_status(),
             "usage_metrics": local_bridge_state.get("usage_metrics", {}),
             "usage_events": local_bridge_state.get("usage_events", []),
+            "active_stream": local_bridge_state.get("active_stream", {}),
             "stream_diagnostics": stream_diagnostics,
             "claude_hook_risks": hook_risks,
             "account_matrix": [],
@@ -5707,6 +5731,9 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             stream_error = service.get("last_stream_error")
             if isinstance(stream_error, dict):
                 stream_error["account_id"] = mask_id_value(stream_error.get("account_id"))
+            active_stream = service.get("active_stream")
+            if isinstance(active_stream, dict):
+                active_stream["account_id"] = mask_id_value(active_stream.get("account_id"))
             stream_diagnostics = service.get("stream_diagnostics")
             if isinstance(stream_diagnostics, dict):
                 _redact_stream_diagnostics(stream_diagnostics)
@@ -5719,6 +5746,9 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     stream_diagnostics = redacted.get("stream_diagnostics")
     if isinstance(stream_diagnostics, dict):
         _redact_stream_diagnostics(stream_diagnostics)
+    active_stream = redacted.get("active_stream")
+    if isinstance(active_stream, dict):
+        active_stream["account_id"] = mask_id_value(active_stream.get("account_id"))
     hook_risks = redacted.get("claude_hook_risks")
     if isinstance(hook_risks, dict):
         hook_risks["settings_path"] = redact_path_value(hook_risks.get("settings_path"))
@@ -7322,12 +7352,16 @@ INDEX_HTML = """<!doctype html>
         const streamError = err.error_type
           ? `<br><span class="warnText">stream error: ${esc(err.error_type)}${err.model ? ' / ' + esc(err.model) : ''}</span>`
           : '';
+        const active = item.active_stream || {};
+        const activeLine = active.request_id
+          ? `<br><span class="warnText">active stream: ${esc(active.status || 'streaming')} · ${esc(active.model || '-')} · ${esc(active.duration_s || 0)}s · guard ${esc(active.guard_mode || 'auto')}/${esc(active.guard_seconds || 0)}s</span>`
+          : '';
         const streamDiag = item.stream_diagnostics && item.stream_diagnostics.message
           ? `<br><span class="muted">stream diagnosis: ${esc(item.stream_diagnostics.message)}</span>`
           : '';
         return `<div class="serviceItem">
           <div class="serviceName">${esc(item.name || '')}</div>
-          <div class="serviceMeta"><span class="${cls}">${running ? '运行中' : '未运行'}</span> · ${esc(item.port || '')}${script}${proxy}${streamError}${streamDiag}</div>
+          <div class="serviceMeta"><span class="${cls}">${running ? '运行中' : '未运行'}</span> · ${esc(item.port || '')}${script}${proxy}${streamError}${activeLine}${streamDiag}</div>
         </div>`;
       }).join('');
       const message = document.getElementById('serviceMessage');
@@ -7349,17 +7383,21 @@ INDEX_HTML = """<!doctype html>
       const box = document.getElementById('streamDiagnostics');
       if (!box) return;
       const diag = data.stream_diagnostics || {};
+      const active = data.active_stream || {};
       const latest = diag.latest || {};
       const counts = diag.counts || {};
-      const state = diag.status === 'ok' ? 'ok' : (diag.status === 'unknown' ? '' : 'bad');
+      const state = active.request_id ? 'warn' : (diag.status === 'ok' ? 'ok' : (diag.status === 'unknown' ? '' : 'bad'));
       box.className = `recommend ${state}`;
+      const activeLine = active.request_id
+        ? `当前: ${active.status || 'streaming'} · ${active.model || '-'} · ${active.duration_s || 0}s · ${active.last_event_name || '-'} · tool ${active.tool_events || 0} · 可见文本 ${active.visible_text_events || 0} · guard ${active.guard_mode || 'auto'}/${active.guard_seconds || 0}s`
+        : '当前: 无活跃 Local Bridge 流';
       const latestLine = latest.kind
         ? `最近: ${latest.timestamp || '-'} · ${latest.kind} · ${latest.model || '-'} · ${latest.duration_s ? `${latest.duration_s}s` : `${latest.duration_ms || 0}ms`}`
         : '最近: -';
       const detail = latest.kind === 'client_disconnect'
         ? `上游事件 ${latest.upstream_events || 0}，下游写入 ${latest.downstream_writes || 0}，终止事件 ${latest.terminal_event_seen ? '已看到' : '未看到'}。`
         : `可见文本 ${latest.visible_text_events || 0}，reasoning ${latest.reasoning_events || 0}，tool ${latest.tool_events || 0}，terminal ${latest.terminal_events || 0}。`;
-      box.innerHTML = `<b>${esc(diag.message || '流式诊断未知')}</b><br>${esc(latestLine)}<br>${esc(detail)}<br><span class="muted">client_disconnect ${counts.client_disconnect || 0} · idle_timeout ${counts.bridge_idle_timeout || 0} · long_stream ${counts.long_stream || 0} · stream_end ${counts.stream_end || 0}</span>`;
+      box.innerHTML = `<b>${esc(active.request_id ? '检测到活跃流。若长时间停在 tool_arguments_streaming，通常是上游持续生成工具参数，不是断网。' : (diag.message || '流式诊断未知'))}</b><br>${esc(activeLine)}<br>${esc(latestLine)}<br>${esc(detail)}<br><span class="muted">client_disconnect ${counts.client_disconnect || 0} · idle_timeout ${counts.bridge_idle_timeout || 0} · long_stream ${counts.long_stream || 0} · stream_end ${counts.stream_end || 0}</span>`;
     }
     function renderHookRiskDiagnostics(data) {
       const box = document.getElementById('hookRiskDiagnostics');
