@@ -54,6 +54,7 @@ REASONING_PLACEHOLDER_HEARTBEAT_SECS = 8.0
 REASONING_PLACEHOLDER_MODE_ENV = "CODEX_BRIDGE_REASONING_PLACEHOLDER_MODE"
 STREAM_IDLE_LOG_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_LOG_SECS", "20"))
 STREAM_IDLE_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_FAIL_SECS", "300"))
+STREAM_IDLE_PARTIAL_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_PARTIAL_FAIL_SECS", "900"))
 STRIP_CLAUDE_ATTRIBUTION_HEADER_ENV = "CODEX_BRIDGE_STRIP_CLAUDE_CODE_ATTRIBUTION_HEADER"
 CLAUDE_ATTRIBUTION_HEADER_RE = re.compile(
     r"^\s*x-anthropic-billing-header\s*:[^\r\n]*(?:\r?\n){0,2}",
@@ -2958,6 +2959,11 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         metrics: BridgeStreamMetrics | None = None,
         usage_context: dict[str, Any] | None = None,
     ):
+        def idle_limit_seconds() -> tuple[float, str]:
+            if state.active or state.saw_text_delta or committed or metrics.upstream_events > 0:
+                return STREAM_IDLE_PARTIAL_FAIL_SECS, "partial"
+            return STREAM_IDLE_FAIL_SECS, "bootstrap"
+
         block_queue: queue.Queue[list[str] | BaseException | object] = queue.Queue(maxsize=16)
         done_marker = object()
         stream_request_id = request_id or bridge_request_id()
@@ -3007,22 +3013,24 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             while True:
                 timeout = self._reasoning_placeholder_timeout(state)
                 poll_timeout = timeout if timeout is not None else STREAM_IDLE_LOG_SECS
-                if STREAM_IDLE_FAIL_SECS > 0:
+                idle_fail_secs, idle_phase = idle_limit_seconds()
+                if idle_fail_secs > 0:
                     now = time.monotonic()
                     idle_for = now - (state.last_upstream_at or stream_started_at)
-                    idle_fail_remaining = max(STREAM_IDLE_FAIL_SECS - idle_for, 0.001)
+                    idle_fail_remaining = max(idle_fail_secs - idle_for, 0.001)
                     poll_timeout = min(poll_timeout, idle_fail_remaining)
                 try:
                     queued = block_queue.get(timeout=poll_timeout)
                 except queue.Empty:
                     now = time.monotonic()
                     idle_for = now - (state.last_upstream_at or stream_started_at)
-                    if STREAM_IDLE_FAIL_SECS > 0 and idle_for >= STREAM_IDLE_FAIL_SECS:
+                    idle_fail_secs, idle_phase = idle_limit_seconds()
+                    if idle_fail_secs > 0 and idle_for >= idle_fail_secs:
                         metrics.idle_timeout_seen = True
                         state.completed = True
                         state.active = False
                         exc = BridgeStreamIdleTimeout(
-                            f"bridge stream idle timeout request_id={stream_request_id} idle_s={idle_for:.1f} model={requested_model or 'unknown'}"
+                            f"bridge stream idle timeout request_id={stream_request_id} phase={idle_phase} idle_s={idle_for:.1f} limit_s={idle_fail_secs:.1f} model={requested_model or 'unknown'}"
                         )
                         log_bridge_stream_error(
                             account_id=account_id,
@@ -3043,7 +3051,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     if idle_for >= STREAM_IDLE_LOG_SECS and now - state.last_idle_logged_at >= STREAM_IDLE_LOG_SECS:
                         state.last_idle_logged_at = now
                         print(
-                            f"{log_timestamp()} [bridge-stream-idle] request_id={stream_request_id} account_id={account_id} model={requested_model or 'unknown'} effort={requested_effort or 'unknown'} idle_s={idle_for:.1f} active_reasoning={str(state.active).lower()} heartbeats={state.emitted_count}",
+                            f"{log_timestamp()} [bridge-stream-idle] request_id={stream_request_id} account_id={account_id} model={requested_model or 'unknown'} effort={requested_effort or 'unknown'} phase={idle_phase} idle_s={idle_for:.1f} limit_s={idle_fail_secs:.1f} active_reasoning={str(state.active).lower()} upstream_events={metrics.upstream_events} heartbeats={state.emitted_count}",
                             file=sys.stderr,
                         )
                     heartbeat = self._build_reasoning_placeholder_sse(
@@ -3059,6 +3067,10 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             while pending_chunks:
                                 yield pending_chunks.pop(0)
                         yield heartbeat
+                    elif state.saw_text_delta or committed or metrics.upstream_events > 0:
+                        yield (
+                            f": bridge upstream idle phase={idle_phase} idle_s={idle_for:.1f}\n\n"
+                        ).encode("utf-8")
                     continue
 
                 if queued is done_marker:

@@ -556,6 +556,29 @@ class SilentReasoningResponse:
         yield ""
 
 
+class SlowBootstrapResponse:
+    headers = {"x-request-id": "upstream-test"}
+
+    def iter_lines(self):
+        time.sleep(0.05)
+        yield "event: response.completed"
+        yield 'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}'
+        yield ""
+
+
+class SlowAfterTextResponse:
+    headers = {"x-request-id": "upstream-test"}
+
+    def iter_lines(self):
+        yield "event: response.output_text.delta"
+        yield 'data: {"type":"response.output_text.delta","delta":"partial"}'
+        yield ""
+        time.sleep(0.05)
+        yield "event: response.completed"
+        yield 'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}'
+        yield ""
+
+
 class BrokenWriter:
     def write(self, payload: bytes) -> int:
         raise BrokenPipeError("client closed")
@@ -906,10 +929,41 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn("done", body)
         self.assertIn("[bridge-stream-idle]", stderr.getvalue())
 
-    def test_stream_idle_timeout_emits_failed_sse_without_fake_output_text(self) -> None:
+    def test_stream_idle_timeout_emits_failed_sse_before_first_upstream_event(self) -> None:
         with (
             mock.patch.object(local_codex_bridge, "STREAM_IDLE_LOG_SECS", 0.005),
             mock.patch.object(local_codex_bridge, "STREAM_IDLE_FAIL_SECS", 0.02),
+            mock.patch.object(local_codex_bridge, "STREAM_IDLE_PARTIAL_FAIL_SECS", 0.2),
+            mock.patch.object(local_codex_bridge, "REASONING_PLACEHOLDER_HEARTBEAT_SECS", 0.005),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    SlowBootstrapResponse(),
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic(),
+                    requested_model="gpt-5.4",
+                    requested_effort="high",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        logs = stderr.getvalue()
+        self.assertIn("event: response.failed", body)
+        self.assertIn("bridge_stream_idle_timeout", body)
+        self.assertIn("phase=bootstrap", body)
+        self.assertIn("bridge-test", body)
+        self.assertNotIn("event: response.output_text.delta", body)
+        self.assertIn("[bridge-stream-idle]", logs)
+        self.assertIn("[bridge-stream-end]", logs)
+        self.assertIn('"idle_timeout_seen": true', logs)
+
+    def test_stream_idle_timeout_uses_longer_limit_after_reasoning_started(self) -> None:
+        with (
+            mock.patch.object(local_codex_bridge, "STREAM_IDLE_LOG_SECS", 0.005),
+            mock.patch.object(local_codex_bridge, "STREAM_IDLE_FAIL_SECS", 0.02),
+            mock.patch.object(local_codex_bridge, "STREAM_IDLE_PARTIAL_FAIL_SECS", 0.2),
             mock.patch.object(local_codex_bridge, "REASONING_PLACEHOLDER_HEARTBEAT_SECS", 0.005),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
         ):
@@ -926,13 +980,37 @@ class LocalCodexBridgeCase(unittest.TestCase):
 
         body = b"".join(chunks).decode("utf-8")
         logs = stderr.getvalue()
-        self.assertIn("event: response.failed", body)
-        self.assertIn("bridge_stream_idle_timeout", body)
-        self.assertIn("bridge-test", body)
-        self.assertNotIn("event: response.output_text.delta", body)
+        self.assertIn("event: response.completed", body)
+        self.assertNotIn("bridge_stream_idle_timeout", body)
         self.assertIn("[bridge-stream-idle]", logs)
-        self.assertIn("[bridge-stream-end]", logs)
-        self.assertIn('"idle_timeout_seen": true', logs)
+        self.assertIn("phase=partial", logs)
+        self.assertIn('"idle_timeout_seen": false', logs)
+
+    def test_stream_idle_timeout_keeps_partial_text_stream_alive(self) -> None:
+        with (
+            mock.patch.object(local_codex_bridge, "STREAM_IDLE_LOG_SECS", 0.005),
+            mock.patch.object(local_codex_bridge, "STREAM_IDLE_FAIL_SECS", 0.02),
+            mock.patch.object(local_codex_bridge, "STREAM_IDLE_PARTIAL_FAIL_SECS", 0.2),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    SlowAfterTextResponse(),
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic(),
+                    requested_model="gpt-5.4",
+                    requested_effort="high",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        logs = stderr.getvalue()
+        self.assertIn("partial", body)
+        self.assertIn("event: response.completed", body)
+        self.assertIn(": bridge upstream idle phase=partial", body)
+        self.assertNotIn("bridge_stream_idle_timeout", body)
+        self.assertIn('"idle_timeout_seen": false', logs)
 
     def test_pre_output_overloaded_terminal_raises_retryable_without_failed_sse(self) -> None:
         response = FakeSseResponse(
