@@ -56,6 +56,7 @@ STREAM_IDLE_LOG_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_LOG_SECS",
 STREAM_IDLE_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_FAIL_SECS", "300"))
 STREAM_IDLE_PARTIAL_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_PARTIAL_FAIL_SECS", "900"))
 STREAM_LONG_WARNING_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_LONG_WARNING_SECS", "240"))
+STREAM_TOOL_CALL_WALL_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_TOOL_CALL_WALL_FAIL_SECS", "240"))
 STRIP_CLAUDE_ATTRIBUTION_HEADER_ENV = "CODEX_BRIDGE_STRIP_CLAUDE_CODE_ATTRIBUTION_HEADER"
 CLAUDE_ATTRIBUTION_HEADER_RE = re.compile(
     r"^\s*x-anthropic-billing-header\s*:[^\r\n]*(?:\r?\n){0,2}",
@@ -149,6 +150,10 @@ class BridgeStreamIdleTimeout(Exception):
 
 
 class BridgeClientDisconnect(Exception):
+    pass
+
+
+class BridgeToolCallRunaway(Exception):
     pass
 
 
@@ -3204,6 +3209,44 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         upstream_request_id=upstream_request_id,
                         metrics=metrics,
                     )
+                if (
+                    STREAM_TOOL_CALL_WALL_FAIL_SECS > 0
+                    and not metrics.terminal_event_seen
+                    and "function_call_arguments.delta" in (metrics.last_event_name or "")
+                    and time.monotonic() - stream_started_at >= STREAM_TOOL_CALL_WALL_FAIL_SECS
+                ):
+                    exc = BridgeToolCallRunaway(
+                        "bridge tool call argument stream exceeded "
+                        f"{STREAM_TOOL_CALL_WALL_FAIL_SECS:.0f}s before a terminal event; "
+                        "closing early so the client can retry instead of hitting its own stream idle timeout"
+                    )
+                    log_bridge_stream_error(
+                        account_id=account_id,
+                        requested_model=requested_model,
+                        request_id=stream_request_id,
+                        started_at=stream_started_at,
+                        exc=exc,
+                        upstream_request_id=upstream_request_id,
+                    )
+                    state.completed = True
+                    state.active = False
+                    metrics.terminal_event_seen = True
+                    metrics.terminal_events += 1
+                    if not committed and sse_block_commits_stream(event_name, payload):
+                        committed = True
+                    if committed:
+                        while pending_chunks:
+                            yield pending_chunks.pop(0)
+                        for chunk in chunks:
+                            yield chunk
+                    yield response_failed_sse(
+                        request_id=stream_request_id,
+                        requested_model=requested_model,
+                        exc=exc,
+                        error_code="bridge_tool_call_runaway",
+                        error_type="bridge_tool_call_runaway",
+                    )
+                    break
                 if not committed and sse_block_commits_stream(event_name, payload):
                     committed = True
                 if committed:

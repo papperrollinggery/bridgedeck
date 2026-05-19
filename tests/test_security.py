@@ -1169,6 +1169,71 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn("[bridge-long-stream-warning]", stderr.getvalue())
         self.assertIn('"visible_text_events": 1', stderr.getvalue())
 
+    def test_function_call_argument_runaway_fails_before_client_idle_timeout(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.function_call_arguments.delta",
+                'data: {"type":"response.function_call_arguments.delta","delta":"{\\"path\\":"}',
+                "",
+            ]
+        )
+
+        with (
+            mock.patch.object(local_codex_bridge, "STREAM_TOOL_CALL_WALL_FAIL_SECS", 0.001),
+            mock.patch.object(local_codex_bridge, "record_bridge_stream_error") as record,
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    response,
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic() - 1,
+                    requested_model="gpt-5.5",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        self.assertIn("event: response.function_call_arguments.delta", body)
+        self.assertIn("event: response.failed", body)
+        self.assertIn("bridge_tool_call_runaway", body)
+        self.assertIn("[bridge-stream-error]", stderr.getvalue())
+        self.assertIn('"terminal_event_seen": true', stderr.getvalue())
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args[0]["error_type"], "BridgeToolCallRunaway")
+
+    def test_text_long_stream_does_not_trigger_tool_call_runaway(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.output_text.delta",
+                'data: {"type":"response.output_text.delta","delta":"hello"}',
+                "",
+                "event: response.completed",
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}',
+                "",
+            ]
+        )
+
+        with (
+            mock.patch.object(local_codex_bridge, "STREAM_TOOL_CALL_WALL_FAIL_SECS", 0.001),
+            mock.patch.object(local_codex_bridge, "record_bridge_stream_error") as record,
+        ):
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    response,
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic() - 1,
+                    requested_model="gpt-5.5",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        self.assertIn("hello", body)
+        self.assertIn("event: response.completed", body)
+        self.assertNotIn("bridge_tool_call_runaway", body)
+        record.assert_not_called()
+
     def test_stream_write_failure_records_client_disconnect(self) -> None:
         with (
             mock.patch.object(local_codex_bridge, "record_bridge_stream_error") as record,
