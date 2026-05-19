@@ -49,6 +49,7 @@ ALLOW_REMOTE_ENV = "CODEX_BRIDGE_ALLOW_REMOTE"
 BIND_FAILURE_SLEEP_SECS_ENV = "CODEX_BRIDGE_BIND_FAILURE_SLEEP_SECS"
 STREAM_MAX_RETRIES_ENV = "CODEX_BRIDGE_STREAM_MAX_RETRIES"
 SESSION_AFFINITY_ENV = "CODEX_BRIDGE_SESSION_AFFINITY"
+PROMPT_CACHE_KEY_MODE_ENV = "CODEX_BRIDGE_PROMPT_CACHE_KEY"
 REASONING_PLACEHOLDER_HEARTBEAT_SECS = 8.0
 REASONING_PLACEHOLDER_MODE_ENV = "CODEX_BRIDGE_REASONING_PLACEHOLDER_MODE"
 STREAM_IDLE_LOG_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_LOG_SECS", "20"))
@@ -444,6 +445,60 @@ def log_claude_attribution_strip(
         f"{log_timestamp()} [claude-attribution-strip] {json.dumps(payload, ensure_ascii=False, sort_keys=True)}",
         file=sys.stderr,
     )
+
+
+def prompt_cache_key_mode() -> str:
+    mode = str(os.environ.get(PROMPT_CACHE_KEY_MODE_ENV) or "auto").strip().lower()
+    return mode if mode in {"auto", "never"} else "auto"
+
+
+def prompt_cache_key_from_session(session_key: str | None) -> str:
+    if not session_key or prompt_cache_key_mode() == "never":
+        return ""
+    return "bd:" + hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:32]
+
+
+def _stable_json_string(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _canonicalize_json_string(value: str) -> str:
+    text = value.strip()
+    if not text or text[0] not in "[{":
+        return value
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return value
+    if isinstance(parsed, (dict, list)):
+        return _stable_json_string(parsed)
+    return value
+
+
+def canonicalize_for_cache(value: Any, *, key_hint: str = "") -> Any:
+    if isinstance(value, dict):
+        return {str(key): canonicalize_for_cache(value[key], key_hint=str(key)) for key in sorted(value.keys(), key=str)}
+    if isinstance(value, list):
+        return [canonicalize_for_cache(item, key_hint=key_hint) for item in value]
+    if isinstance(value, str) and key_hint in {"arguments", "output"}:
+        return _canonicalize_json_string(value)
+    return value
+
+
+def prepare_upstream_responses_body(
+    body: dict[str, Any],
+    *,
+    session_key: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    prepared = canonicalize_for_cache(body)
+    cache_key = prompt_cache_key_from_session(session_key)
+    if cache_key:
+        prepared["prompt_cache_key"] = cache_key
+    return prepared, {
+        "session_id": _prompt_sha12(session_key or ""),
+        "prompt_cache_key_present": bool(cache_key),
+        "cache_key_source": "session_identity" if cache_key else ("disabled" if prompt_cache_key_mode() == "never" else "none"),
+    }
 
 
 def stream_max_retries() -> int:
@@ -1134,6 +1189,9 @@ def record_bridge_usage(
     client_port: int | None = None,
     client_label: str = "",
     desktop_route: bool = False,
+    session_id: str = "",
+    prompt_cache_key_present: bool = False,
+    cache_key_source: str = "",
 ) -> None:
     counts = _extract_usage_counts(usage)
     if not counts or not any(counts.values()):
@@ -1162,6 +1220,9 @@ def record_bridge_usage(
     metrics["last_status_code"] = _usage_int(status_code)
     metrics["last_bridge_port"] = _usage_int(bridge_port)
     metrics["last_client_label"] = client_label or ""
+    metrics["last_session_id"] = session_id or ""
+    metrics["last_prompt_cache_key_present"] = bool(prompt_cache_key_present)
+    metrics["last_cache_key_source"] = cache_key_source or ""
     metrics["last_updated_at"] = int(time.time())
     state["usage_metrics"] = metrics
     event = {
@@ -1179,6 +1240,9 @@ def record_bridge_usage(
         "client_port": _usage_int(client_port),
         "client_label": client_label or "",
         "desktop_route": bool(desktop_route),
+        "session_id": session_id or "",
+        "prompt_cache_key_present": bool(prompt_cache_key_present),
+        "cache_key_source": cache_key_source or "",
         "duration_ms": _usage_int(duration_ms),
         "input_tokens": counts["input_tokens"],
         "output_tokens": counts["output_tokens"],
@@ -2316,6 +2380,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         route_path: str,
         original_body: dict[str, Any],
         actual_model: str | None,
+        session_key: str | None = None,
     ) -> dict[str, Any]:
         requested_model = original_body.get("model") if isinstance(original_body.get("model"), str) else actual_model
         requested_model_id = normalize_bridge_model_id(requested_model)
@@ -2341,6 +2406,9 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             "client_port": int(client_port or 0),
             "client_label": client_label,
             "desktop_route": desktop_route,
+            "session_id": session_key or "",
+            "prompt_cache_key_present": False,
+            "cache_key_source": "none",
         }
 
     def do_GET(self) -> None:
@@ -2651,7 +2719,13 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             route_path=route_path,
             original_body=original_body,
             actual_model=requested_model,
+            session_key=session_key,
         )
+        upstream_body, cache_context = prepare_upstream_responses_body(
+            normalized_body,
+            session_key=session_key,
+        )
+        usage_context.update(cache_context)
 
         for account_index, candidate_account_id in enumerate(candidate_account_ids):
             account_id, access_token = self.server.auth_store.get_access_token(candidate_account_id)
@@ -2663,7 +2737,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         "POST",
                         upstream_url,
                         headers=upstream_headers,
-                        json=normalized_body,
+                        json=upstream_body,
                     ) as response:
                         error_body = response.read() if not response.is_success else None
                         log_upstream_result(
@@ -2730,6 +2804,9 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                                 client_port=usage_context.get("client_port"),
                                 client_label=str(usage_context.get("client_label") or ""),
                                 desktop_route=bool(usage_context.get("desktop_route")),
+                                session_id=str(usage_context.get("session_id") or ""),
+                                prompt_cache_key_present=bool(usage_context.get("prompt_cache_key_present")),
+                                cache_key_source=str(usage_context.get("cache_key_source") or ""),
                             )
                             if output_format == "messages":
                                 response_body = responses_json_to_anthropic_message(response_body, requested_model)
@@ -3031,6 +3108,9 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             client_port=(usage_context or {}).get("client_port"),
                             client_label=str((usage_context or {}).get("client_label") or ""),
                             desktop_route=bool((usage_context or {}).get("desktop_route")),
+                            session_id=str((usage_context or {}).get("session_id") or ""),
+                            prompt_cache_key_present=bool((usage_context or {}).get("prompt_cache_key_present")),
+                            cache_key_source=str((usage_context or {}).get("cache_key_source") or ""),
                         )
                         usage_recorded = True
                 terminal_error = terminal_stream_error_from_payload(event_name, payload)
