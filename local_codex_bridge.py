@@ -760,6 +760,24 @@ def mask_proxy_url(proxy_url: str | None) -> str:
     return proxy_url
 
 
+def looks_like_proxy_tls_failure(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    ssl_markers = ("ssl", "tls", "handshake", "certificate", "wrong version number")
+    eof_markers = ("unexpected_eof", "eof occurred", "connection reset", "remote end closed", "protocol violation")
+    return any(marker in text for marker in ssl_markers) and any(marker in text for marker in eof_markers)
+
+
+def upstream_exception_detail(exc: BaseException) -> str:
+    detail = f"{type(exc).__name__}: {exc}"
+    proxy_url = os.environ.get(UPSTREAM_PROXY_ENV, "").strip()
+    if proxy_url and looks_like_proxy_tls_failure(exc):
+        detail += (
+            f"; diagnosis=local_proxy_tls_failure proxy={mask_proxy_url(proxy_url)} "
+            "action=run_bridgedeck_network_diagnosis"
+        )
+    return detail
+
+
 def get_upstream_proxy_url() -> str | None:
     value = os.environ.get(UPSTREAM_PROXY_ENV, "").strip()
     if not value:
@@ -1573,7 +1591,7 @@ class AuthStore:
             )
             raise
         except Exception as exc:
-            log_upstream_result("oauth_token", None, False, detail=f"{type(exc).__name__}: {exc}")
+            log_upstream_result("oauth_token", None, False, detail=upstream_exception_detail(exc))
             raise
 
 
@@ -2906,10 +2924,9 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 )
                 self._write_json_error(exc.response.status_code, exc.response.text)
             except Exception as exc:  # noqa: BLE001
-                log_upstream_result(
-                    "quota", route_account_id, False, detail=f"{type(exc).__name__}: {exc}"
-                )
-                self._write_json_error(500, f"{type(exc).__name__}: {exc}")
+                detail = upstream_exception_detail(exc)
+                log_upstream_result("quota", route_account_id, False, detail=detail)
+                self._write_json_error(500, detail)
             return
         self.send_error(404, "Not Found")
 
@@ -3034,9 +3051,9 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 "responses",
                 route_account_id or "default",
                 False,
-                detail=f"request_id={request_id} {type(exc).__name__}: {exc}",
+                detail=f"request_id={request_id} {upstream_exception_detail(exc)}",
             )
-            self._write_json_error(500, f"{type(exc).__name__}: {exc}")
+            self._write_json_error(500, upstream_exception_detail(exc))
 
     def _handle_messages(self, route_account_id: str | None, route_path: str) -> None:
         request_id = bridge_request_id()
@@ -3085,9 +3102,9 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 "messages",
                 route_account_id or "default",
                 False,
-                detail=f"request_id={request_id} {type(exc).__name__}: {exc}",
+                detail=f"request_id={request_id} {upstream_exception_detail(exc)}",
             )
-            self._write_json_error(500, f"{type(exc).__name__}: {exc}")
+            self._write_json_error(500, upstream_exception_detail(exc))
 
     def _handle_chat_completions(self, route_account_id: str | None, route_path: str) -> None:
         request_id = bridge_request_id()
@@ -3136,9 +3153,9 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 "chat.completions",
                 route_account_id or "default",
                 False,
-                detail=f"request_id={request_id} {type(exc).__name__}: {exc}",
+                detail=f"request_id={request_id} {upstream_exception_detail(exc)}",
             )
-            self._write_json_error(500, f"{type(exc).__name__}: {exc}")
+            self._write_json_error(500, upstream_exception_detail(exc))
 
     def _forward_responses_body(
         self,

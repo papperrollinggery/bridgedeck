@@ -64,6 +64,20 @@ LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
 LOCAL_BRIDGE_PORT = 8876
 COMMON_UPSTREAM_PROXY_PORTS = (1087, 7890, 6152, 8080)
+LEGACY_PROXY_PROCESS_HINTS = (
+    ("v2rayu", "V2rayU (v2ray)"),
+    ("v2ray-core", "v2ray-core"),
+    ("v2ray", "v2ray-core"),
+)
+KNOWN_PROXY_PROCESS_HINTS = (
+    *LEGACY_PROXY_PROCESS_HINTS,
+    ("shadowrocket", "Shadowrocket"),
+    ("clash", "Clash"),
+    ("mihomo", "Mihomo"),
+    ("sing-box", "sing-box"),
+    ("surge", "Surge"),
+    ("xray", "Xray"),
+)
 COMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 COMPACT_THRESHOLD_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 MAX_CONTEXT_TOKENS_ENV = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
@@ -1084,6 +1098,29 @@ def probe_remote_url(
         }
 
 
+def openai_probe_is_healthy(probe: dict[str, Any] | None) -> bool:
+    return bool(probe and safe_int(probe.get("status_code"), 0) == 401)
+
+
+def probe_error_text(probe: dict[str, Any] | None) -> str:
+    if not isinstance(probe, dict):
+        return ""
+    return " ".join(
+        str(probe.get(key) or "")
+        for key in ("error", "body_excerpt", "content_type")
+        if probe.get(key)
+    )
+
+
+def looks_like_tls_proxy_failure(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    ssl_markers = ("ssl", "tls", "handshake", "certificate", "wrong version number")
+    eof_markers = ("unexpected_eof", "eof occurred", "connection reset", "remote end closed", "protocol violation")
+    return any(marker in lowered for marker in ssl_markers) and any(marker in lowered for marker in eof_markers)
+
+
 def safe_int(value: Any, default: int = 0) -> int:
     if isinstance(value, bool):
         return default
@@ -1523,6 +1560,41 @@ def process_command(pid: int) -> str:
     if not proc or proc.returncode != 0:
         return ""
     return proc.stdout.strip()
+
+
+def proxy_process_label(command: str) -> str:
+    text = str(command or "").strip()
+    lowered = text.lower()
+    for needle, label in KNOWN_PROXY_PROCESS_HINTS:
+        if needle in lowered:
+            return label
+    if not text:
+        return "unknown"
+    parts = text.split()
+    first = Path(parts[0]).name if parts else ""
+    if first in {"python", "python3", "node", "bash", "zsh", "sh"} and len(parts) > 1:
+        return Path(parts[1]).name or first
+    return first or "unknown"
+
+
+def proxy_process_is_legacy_conflict(command: str) -> bool:
+    lowered = str(command or "").lower()
+    return any(needle in lowered for needle, _label in LEGACY_PROXY_PROCESS_HINTS)
+
+
+def proxy_port_processes(port: int) -> list[dict[str, Any]]:
+    processes: list[dict[str, Any]] = []
+    for item in port_processes(port):
+        command = str(item.get("command") or "")
+        processes.append(
+            {
+                "pid": safe_int(item.get("pid"), 0),
+                "label": proxy_process_label(command),
+                "command": command,
+                "legacy_conflict": proxy_process_is_legacy_conflict(command),
+            }
+        )
+    return processes
 
 
 def process_environment_text(pid: int) -> str:
@@ -3035,6 +3107,13 @@ class BridgeManager:
         proxy_url, proxy_source = detect_codex_proxy_url()
         proxy_host, proxy_port = parse_proxy_target(proxy_url)
         proxy_running = bool(proxy_host and proxy_port and tcp_open(proxy_host, proxy_port))
+        proxy_processes = proxy_port_processes(proxy_port) if proxy_port else []
+        proxy_owner_detail = "未检测到端口占用进程"
+        if proxy_processes:
+            proxy_owner_detail = " / ".join(
+                f"{item.get('label') or 'unknown'}(pid {item.get('pid') or '-'})"
+                for item in proxy_processes
+            )
         native_proxy_status = self.codex_native_proxy_status()
 
         checks: list[dict[str, Any]] = [
@@ -3052,6 +3131,12 @@ class BridgeManager:
                 "detail": f"{proxy_host}:{proxy_port}" if proxy_running else (f"{proxy_host}:{proxy_port} 不可达" if proxy_host and proxy_port else "未解析到代理地址"),
             },
             {
+                "id": "proxy_owner",
+                "label": "代理端口占用者",
+                "status": "warning" if any(item.get("legacy_conflict") for item in proxy_processes) else ("ok" if proxy_processes else "unknown"),
+                "detail": proxy_owner_detail,
+            },
+            {
                 "id": "codex_native_proxy_env",
                 "label": "Codex 原生代理 env",
                 "status": native_proxy_status["status"],
@@ -3061,6 +3146,7 @@ class BridgeManager:
         ]
 
         openai_probe: dict[str, Any] | None = None
+        direct_openai_probe: dict[str, Any] | None = None
         if proxy_url and proxy_running:
             openai_probe = probe_remote_url(
                 PROXY_DIAG_OPENAI_URL,
@@ -3071,9 +3157,25 @@ class BridgeManager:
                 {
                     "id": "openai_api",
                     "label": "api.openai.com 基础探测",
-                    "status": "ok" if openai_probe.get("status_code") == 401 else ("forbidden" if openai_probe.get("status_code") == 403 else "failed"),
+                    "status": "ok" if openai_probe_is_healthy(openai_probe) else ("forbidden" if openai_probe.get("status_code") == 403 else "failed"),
                     "detail": openai_probe.get("error") or f"HTTP {openai_probe.get('status_code')}",
                     "body_excerpt": openai_probe.get("body_excerpt", ""),
+                }
+            )
+        if not openai_probe_is_healthy(openai_probe):
+            direct_openai_probe = probe_remote_url(
+                PROXY_DIAG_OPENAI_URL,
+                proxy_url="",
+                headers={"Accept": "application/json"},
+                timeout=10.0,
+            )
+            checks.append(
+                {
+                    "id": "openai_direct",
+                    "label": "绕过本地 HTTP 代理探测",
+                    "status": "ok" if openai_probe_is_healthy(direct_openai_probe) else ("forbidden" if direct_openai_probe.get("status_code") == 403 else "failed"),
+                    "detail": direct_openai_probe.get("error") or f"HTTP {direct_openai_probe.get('status_code')}",
+                    "body_excerpt": direct_openai_probe.get("body_excerpt", ""),
                 }
             )
 
@@ -3149,6 +3251,27 @@ class BridgeManager:
             status = "proxy_down"
             message = "本地代理端口不可达"
             recommendations = ["先启动本地代理，再重测"]
+        elif openai_probe and not openai_probe_is_healthy(openai_probe) and openai_probe_is_healthy(direct_openai_probe):
+            status = "proxy_unhealthy"
+            error_text = probe_error_text(openai_probe)
+            message = "本地网络可达，但配置的本地代理无法连接 OpenAI"
+            if looks_like_tls_proxy_failure(error_text):
+                status = "proxy_tls_failure"
+                message = "检测到本地代理 TLS/SSL 握手失败"
+            recommendations = [
+                "检查当前代理端口是否被遗留代理软件抢占",
+                "重启正在使用的代理工具后再重测",
+                "若已开启系统级 TUN/VPN，可临时清除显式 HTTP 代理后验证直连链路",
+            ]
+            legacy_labels = sorted(
+                {
+                    str(item.get("label") or "")
+                    for item in proxy_processes
+                    if item.get("legacy_conflict") and item.get("label")
+                }
+            )
+            if legacy_labels:
+                recommendations.insert(0, f"当前端口占用者包含 {' / '.join(legacy_labels)}，优先关闭该遗留后台进程")
         elif any(check.get("status") == "forbidden" for check in checks):
             status = "upstream_forbidden"
             message = "代理链路对 OpenAI/Codex 请求返回 403"
@@ -3190,7 +3313,9 @@ class BridgeManager:
                 "host": proxy_host,
                 "port": proxy_port,
                 "running": proxy_running,
+                "processes": proxy_processes,
             },
+            "direct_openai_probe": direct_openai_probe or {},
             "codex_auth": {
                 "present": bool(auth_state.get("present")),
                 "authenticated": bool(auth_state.get("authenticated")),
@@ -5771,8 +5896,12 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         codex_auth.pop("path", None)
         codex_auth["email_masked"] = mask_email_value(codex_auth.get("email_masked"))
     proxy = redacted.get("proxy")
-    if isinstance(proxy, dict) and proxy.get("url"):
-        proxy["url"] = "<redacted>"
+    if isinstance(proxy, dict):
+        if proxy.get("url"):
+            proxy["url"] = "<redacted>"
+        for process in proxy.get("processes", []):
+            if isinstance(process, dict):
+                process.pop("command", None)
     native_proxy = redacted.get("codex_native_proxy")
     if isinstance(native_proxy, dict):
         native_proxy["env_path"] = redact_path_value(native_proxy.get("env_path"))
@@ -5784,6 +5913,9 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             native_proxy["repair_proxy_url"] = "<redacted>"
         if native_proxy.get("repair_proxy_url_masked"):
             native_proxy["repair_proxy_url_masked"] = "<redacted>"
+        for process in native_proxy.get("proxy_processes", []):
+            if isinstance(process, dict):
+                process.pop("command", None)
     return redacted
 
 
@@ -6582,7 +6714,7 @@ INDEX_HTML = """<!doctype html>
               <div id="serviceStatus" class="serviceGrid">服务状态加载中...</div>
               <div class="row">
                 <button class="miniBtn" data-action="refresh-services">刷新服务</button>
-                <button class="miniBtn" data-action="proxy-diagnosis">诊断代理链路</button>
+                <button class="miniBtn" data-action="proxy-diagnosis">一键网络检测</button>
                 <button class="miniBtn" data-action="codex-native-proxy-status">诊断 Codex 原生代理</button>
                 <button class="miniBtn" data-action="repair-codex-native-proxy">修复 Codex 原生代理</button>
                 <button class="miniBtn" data-action="repair-quota-query">一键修复额度查询</button>
@@ -7391,7 +7523,10 @@ INDEX_HTML = """<!doctype html>
         if (item.body_excerpt) parts.push(item.body_excerpt);
         return parts.join(' · ');
       });
-      box.innerHTML = `<b>${esc(payload.message || '代理诊断完成')}</b>${lines.length ? `<br>${lines.map((line) => esc(line)).join('<br>')}` : ''}`;
+      const owners = payload.proxy && Array.isArray(payload.proxy.processes) ? payload.proxy.processes : [];
+      const ownerLines = owners.map((item) => `端口占用: ${item.label || 'unknown'}${item.pid ? ` pid ${item.pid}` : ''}${item.legacy_conflict ? ' · 可能是遗留代理' : ''}`);
+      const recs = Array.isArray(payload.recommendations) ? payload.recommendations.slice(0, 4) : [];
+      box.innerHTML = `<b>${esc(payload.message || '代理诊断完成')}</b>${lines.length ? `<br>${lines.map((line) => esc(line)).join('<br>')}` : ''}${ownerLines.length ? `<br>${ownerLines.map((line) => esc(line)).join('<br>')}` : ''}${recs.length ? `<br>${recs.map((line) => `- ${esc(line)}`).join('<br>')}` : ''}`;
     }
     function renderStreamDiagnostics(data) {
       const box = document.getElementById('streamDiagnostics');

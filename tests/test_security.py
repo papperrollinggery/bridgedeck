@@ -296,7 +296,16 @@ class FakeManager:
                 "host": "127.0.0.1",
                 "port": 1087,
                 "running": True,
+                "processes": [
+                    {
+                        "pid": 123,
+                        "label": "Shadowrocket",
+                        "command": "/Applications/Shadowrocket.app/Contents/MacOS/Shadowrocket",
+                        "legacy_conflict": False,
+                    }
+                ],
             },
+            "direct_openai_probe": {},
             "codex_auth": {
                 "present": True,
                 "authenticated": True,
@@ -673,6 +682,20 @@ class LocalCodexBridgeCase(unittest.TestCase):
             request.add_header(key, value)
         with urllib.request.urlopen(request, timeout=5) as response:
             return response.status, response.read().decode("utf-8"), dict(response.headers.items())
+
+    def test_upstream_exception_detail_marks_proxy_tls_failure(self) -> None:
+        exc = RuntimeError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+
+        with mock.patch.dict(
+            local_codex_bridge.os.environ,
+            {local_codex_bridge.UPSTREAM_PROXY_ENV: "http://user:pass@127.0.0.1:1087"},
+            clear=False,
+        ):
+            detail = local_codex_bridge.upstream_exception_detail(exc)
+
+        self.assertIn("diagnosis=local_proxy_tls_failure", detail)
+        self.assertIn("proxy=http://127.0.0.1:1087", detail)
+        self.assertNotIn("user:pass", detail)
 
     def test_stream_passthrough_preserves_delta_and_completed(self) -> None:
         response = FakeSseResponse(
@@ -2954,6 +2977,12 @@ class ServerCase(unittest.TestCase):
             "http://127.0.0.1:1087",
         )
 
+    def test_proxy_process_label_detects_v2rayu_owner(self) -> None:
+        command = "/Applications/V2rayU.app/Contents/Resources/v2ray -config config.json"
+
+        self.assertEqual(bridgedeck.proxy_process_label(command), "V2rayU (v2ray)")
+        self.assertTrue(bridgedeck.proxy_process_is_legacy_conflict(command))
+
     def test_port_active_connections_parses_lsof_field_output(self) -> None:
         proc = types.SimpleNamespace(
             returncode=0,
@@ -3128,6 +3157,51 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(payload["status"], "healthy")
         self.assertEqual(payload["proxy"]["port"], 1087)
         self.assertEqual(payload["codex_native_proxy"]["status"], "ok")
+
+    def test_proxy_diagnosis_classifies_tls_failure_with_direct_bypass_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = bridgedeck.BridgeManager(
+                bridgedeck.ManagerPaths(
+                    db=Path(tmp) / "cc-switch.db",
+                    settings=Path(tmp) / "settings.json",
+                    auth_store=Path(tmp) / "auth.json",
+                )
+            )
+
+            def fake_probe(_url: str, *, proxy_url: str, **_kwargs: Any) -> dict[str, Any]:
+                if proxy_url:
+                    return {
+                        "ok": False,
+                        "reached": False,
+                        "status_code": 0,
+                        "error": "SSLError: [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol",
+                    }
+                return {"ok": False, "reached": True, "status_code": 401, "body_excerpt": '{"error":"missing"}'}
+
+            with (
+                mock.patch.object(bridgedeck, "detect_codex_proxy_url", return_value=("http://127.0.0.1:1087", "env:HTTPS_PROXY")),
+                mock.patch.object(bridgedeck, "tcp_open", return_value=True),
+                mock.patch.object(
+                    bridgedeck,
+                    "port_processes",
+                    return_value=[
+                        {
+                            "pid": 123,
+                            "command": "/Applications/V2rayU.app/Contents/Resources/v2ray -config config.json",
+                        }
+                    ],
+                ),
+                mock.patch.object(manager, "codex_native_proxy_status", return_value={"status": "ok", "message": "ok", "missing_keys": []}),
+                mock.patch.object(bridgedeck, "read_codex_auth_state", return_value={"present": False, "authenticated": False}),
+                mock.patch.object(bridgedeck, "probe_remote_url", side_effect=fake_probe),
+            ):
+                payload = manager.proxy_diagnosis()
+
+        self.assertEqual(payload["status"], "proxy_tls_failure")
+        self.assertEqual(payload["proxy"]["processes"][0]["label"], "V2rayU (v2ray)")
+        self.assertTrue(payload["proxy"]["processes"][0]["legacy_conflict"])
+        self.assertEqual(payload["direct_openai_probe"]["status_code"], 401)
+        self.assertTrue(any("V2rayU" in item for item in payload["recommendations"]))
 
     def test_codex_native_proxy_endpoints_return_status_and_repair(self) -> None:
         server, _ = self.start_server()
@@ -3353,6 +3427,8 @@ class ServerCase(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(payload["proxy"]["url"], "<redacted>")
+        self.assertNotIn("command", payload["proxy"]["processes"][0])
+        self.assertNotIn("/Applications/Shadowrocket", json.dumps(payload))
 
     def test_detect_codex_proxy_url_prefers_codex_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
