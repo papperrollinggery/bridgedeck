@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.22
+
+- Added Codex Desktop Doctor diagnostics for deprecated hooks config, stale Desktop app-server state, native proxy setup, version split, and recent Desktop reconnect/deprecation log signals.
+- Added install-scan support across CLI, UI, macOS launcher first-run flow, and package preflight so packaged apps are checked before use.
+- Added redacted public health endpoints for local monitoring without exposing full paths, commands, tokens, or account identifiers.
+- Added Local Codex Bridge incomplete-answer guard: suspicious half-sentence `response.completed` streams now fail instead of being treated as successful Claude/Anthropic turns.
+- Added stream end diagnostics for answer ending class, visible text length, terminal response status, output tokens, and privacy-preserving tail hashes.
+
 ## 0.2.21
 
 - Fixed Claude Code stream idle regressions by disabling the tool-call runaway guard by default.

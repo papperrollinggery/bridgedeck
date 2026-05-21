@@ -49,6 +49,7 @@ BridgeDeck binds to `127.0.0.1` by default.
 
 When the app icon is opened, BridgeDeck shows a native choice dialog:
 
+- First launch: BridgeDeck suggests an install scan before opening the UI. The scan runs Python compile checks, package-script syntax checks, and `/Applications/BridgeDeck.app` freshness checks.
 - `Open UI`: start or open the `8899` control panel.
 - `Start Bridge Only`: start only the `8876` Local Codex Bridge.
 - `Stop UI, Keep Bridge`: stop the `8899` UI while leaving `8876` running.
@@ -70,6 +71,12 @@ Manual UI URL:
 
 ```text
 http://127.0.0.1:8899
+```
+
+Run the same install scan manually:
+
+```bash
+python3 bridgedeck.py --install-scan
 ```
 
 Start, stop, or inspect only the Local Codex Bridge:
@@ -277,6 +284,8 @@ chmod +x package-bridgedeck-dmg.command
 ./package-bridgedeck-dmg.command
 shasum -a 256 dist/BridgeDeck.dmg
 ```
+
+The package script always runs `py_compile` and shell syntax checks before building. Set `BRIDGEDECK_PACKAGE_TESTS=1` to include the full unit test suite in the package preflight.
 
 Project layout:
 

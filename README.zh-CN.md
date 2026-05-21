@@ -49,6 +49,7 @@ BridgeDeck 默认只监听 `127.0.0.1`。
 
 点击 App 图标后，BridgeDeck 会显示原生选择框：
 
+- 首次启动：BridgeDeck 会建议先运行安装扫描，检查 Python 编译、打包脚本语法和 `/Applications/BridgeDeck.app` 是否为当前版本。
 - `打开 UI`：启动或打开 `8899` 控制台。
 - `只启动 Bridge`：只启动 `8876` Local Codex Bridge。
 - `关闭 UI 保留 Bridge`：关闭 `8899` UI，但保留 `8876` 继续运行。
@@ -70,6 +71,12 @@ python3 bridgedeck.py --host 127.0.0.1 --port 8899
 
 ```text
 http://127.0.0.1:8899
+```
+
+手动运行同一套安装扫描：
+
+```bash
+python3 bridgedeck.py --install-scan
 ```
 
 只操作 Local Codex Bridge：
@@ -277,6 +284,8 @@ chmod +x package-bridgedeck-dmg.command
 ./package-bridgedeck-dmg.command
 shasum -a 256 dist/BridgeDeck.dmg
 ```
+
+打包脚本会先强制执行 `py_compile` 和 shell 语法检查。需要把完整单元测试也放进打包前置检查时，使用 `BRIDGEDECK_PACKAGE_TESTS=1`。
 
 项目结构：
 

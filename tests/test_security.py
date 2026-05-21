@@ -211,7 +211,32 @@ class FakeManager:
                 "events": {},
                 "risks": [],
             },
-            "account_matrix": [],
+            "account_matrix": [
+                {
+                    "account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "email": "person@example.com",
+                    "label": "person@example.com",
+                    "account_status": "ok",
+                    "quota_status": "unknown",
+                    "claude_current": True,
+                    "claude_providers": ["Provider"],
+                    "cli_launchers": [],
+                    "codex_cli_homes": [
+                        {
+                            "path": f"{home}/.codex",
+                            "run_command": "codex",
+                            "token_account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                            "access_account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                            "email": "person@example.com",
+                            "risk_flags": [],
+                        }
+                    ],
+                    "codex_desktop": "cc_switch",
+                    "desktop_detected": True,
+                    "risk_flags": [],
+                    "advice": "正常",
+                }
+            ],
             "current_provider_from_settings": "",
             "claude_attribution_header": {
                 "status": "disabled",
@@ -344,6 +369,42 @@ class FakeManager:
             "status": self.codex_native_proxy_status(),
             "restart_required": True,
         }
+
+    def codex_desktop_doctor(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "status": "upstream_hooks_warning_likely",
+            "action": "report_upstream",
+            "message": "活跃 config 已是 hooks=true，但日志仍出现 codex_hooks deprecated warning",
+            "recommendations": ["不要继续重复改 config"],
+            "checks": [
+                {"id": "config_hooks", "label": "Codex hooks config", "status": "ok", "detail": "hooks enabled"}
+            ],
+            "config": {
+                "config_path": f"{Path.home()}/.codex/config.toml",
+                "backup_legacy_refs": [f"{Path.home()}/.codex/config.toml.backup"],
+            },
+            "codex_native_proxy": self.codex_native_proxy_status(),
+            "process": {
+                "app_server_running": True,
+                "restart_required": False,
+                "processes": [{"pid": 123, "command": "/Applications/Codex.app/Contents/Resources/codex app-server"}],
+            },
+            "versions": {"global_cli_path": "/opt/homebrew/bin/codex", "bundled_cli_path": "/Applications/Codex.app/Contents/Resources/codex"},
+            "logs": {
+                "log_root": f"{Path.home()}/Library/Logs/com.openai.codex",
+                "paths": [f"{Path.home()}/Library/Logs/com.openai.codex/test.log"],
+                "counts": {"codex_hooks_deprecation": 1},
+            },
+            "codex_desktop": {
+                "config_path": f"{Path.home()}/.codex/config.toml",
+                "base_url": "http://127.0.0.1:8876/accounts/01234567-89ab-cdef-0123-456789abcdef/v1",
+                "account_id": "01234567-89ab-cdef-0123-456789abcdef",
+            },
+        }
+
+    def normalize_codex_hooks_config(self) -> dict[str, Any]:
+        return {"ok": True, "changed": True, "message": "已清理 [features].codex_hooks", "restart_required": True}
 
     def sync_claude_enabled_plugins(self) -> dict[str, Any]:
         return {
@@ -496,6 +557,7 @@ class FakeSseResponse:
         self.lines = lines
         self.exc = exc
         self.headers = {"x-request-id": "upstream-test"}
+        self.status_code = 200
 
     def iter_lines(self):
         for line in self.lines:
@@ -1144,8 +1206,67 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn('"terminal_event_seen": true', logs)
         self.assertIn('"upstream_events": 2', logs)
         self.assertIn('"visible_text_events": 1', logs)
+        self.assertIn('"visible_text_chars": 5', logs)
+        self.assertIn('"answer_incomplete_risk": false', logs)
         self.assertIn('"terminal_events": 1', logs)
         self.assertIn('"last_event_name": "response.completed"', logs)
+
+    def test_stream_summary_marks_open_colon_without_logging_text(self) -> None:
+        response = FakeSseResponse(
+            [
+                "event: response.output_text.delta",
+                'data: {"type":"response.output_text.delta","delta":"可继续做三件事："}',
+                "",
+                "event: response.completed",
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"output_tokens":8,"total_tokens":18}}}',
+                "",
+            ]
+        )
+
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            chunks = list(
+                self.make_handler()._iter_stream_with_reasoning_placeholder(
+                    response,
+                    "acct-1",
+                    request_id="bridge-test",
+                    started_at=local_codex_bridge.time.monotonic(),
+                    requested_model="gpt-5.5",
+                )
+            )
+
+        body = b"".join(chunks).decode("utf-8")
+        logs = stderr.getvalue()
+        self.assertIn("可继续做三件事：", body)
+        self.assertIn("event: response.failed", body)
+        self.assertIn("bridge_incomplete_answer", body)
+        self.assertNotIn("event: response.completed", body)
+        self.assertIn('"answer_end_class": "open_colon"', logs)
+        self.assertIn('"answer_incomplete_risk": true', logs)
+        self.assertIn("[bridge-stream-error]", logs)
+        self.assertIn('"completed_output_tokens": 8', logs)
+        self.assertIn('"completed_response_status": "completed"', logs)
+        self.assertIn('"visible_text_tail_sha12"', logs)
+        self.assertNotIn("可继续做三件事", logs)
+
+    def test_anthropic_stream_incomplete_answer_guard_emits_error_after_closing_text(self) -> None:
+        raw = (
+            b'event: response.output_text.delta\n'
+            b'data: {"type":"response.output_text.delta","delta":"Next:"}\n\n'
+            b'event: response.failed\n'
+            b'data: {"type":"response.failed","response":{"status":"failed","error":{"code":"bridge_incomplete_answer","message":"incomplete","type":"bridge_incomplete_answer"}}}\n\n'
+        )
+
+        body = b"".join(
+            local_codex_bridge.iter_anthropic_messages_sse(
+                [raw],
+                message_id="msg_test",
+                model="gpt-5.5",
+            )
+        ).decode("utf-8")
+
+        self.assertIn("event: content_block_stop", body)
+        self.assertIn("event: error", body)
+        self.assertIn("bridge_incomplete_answer", body)
 
     def test_stream_final_summary_records_client_disconnect(self) -> None:
         metrics = local_codex_bridge.BridgeStreamMetrics()
@@ -2638,6 +2759,23 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(payload["counts"]["client_disconnect"], 1)
         self.assertIn("不是 Bridge idle timeout", payload["message"])
 
+    def test_bridge_stream_log_diagnostics_flags_incomplete_answer_risk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "local-codex-bridge.log"
+            log_path.write_text(
+                '2026-05-21T20:31:00 [bridge-stream-end] {"account_id":"acct-1","answer_end_class":"open_colon","answer_incomplete_risk":true,"client_disconnected":false,"completed_response_status":"completed","downstream_writes":20,"duration_s":3.2,"idle_timeout_seen":false,"last_event_name":"response.completed","model":"gpt-5.5","request_id":"bridge-test","terminal_event_seen":true,"terminal_events":1,"upstream_events":20,"visible_text_chars":8,"visible_text_events":1,"visible_text_tail_sha12":"abc123"}\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(bridgedeck, "DEFAULT_LOCAL_BRIDGE_LOG_PATHS", ()):
+                payload = bridgedeck.bridge_stream_diagnostics([log_path])
+
+        self.assertEqual(payload["status"], "warning")
+        self.assertEqual(payload["latest"]["kind"], "answer_incomplete_risk")
+        self.assertEqual(payload["latest"]["answer_end_class"], "open_colon")
+        self.assertEqual(payload["counts"]["answer_incomplete_risk"], 1)
+        self.assertIn("答案结尾像半句", payload["message"])
+
     def test_claude_hook_risk_status_flags_long_hooks_without_command_leak(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Path(tmp) / "settings.json"
@@ -2719,6 +2857,176 @@ class ServerCase(unittest.TestCase):
             with exc:
                 payload = json.loads(exc.read().decode("utf-8"))
                 return exc.code, payload
+
+
+class CodexDesktopDoctorCase(ServerCase):
+    def make_manager(self, root: Path) -> bridgedeck.BridgeManager:
+        return bridgedeck.BridgeManager(
+            bridgedeck.ManagerPaths(
+                db=root / ".cc-switch" / "cc-switch.db",
+                settings=root / ".cc-switch" / "settings.json",
+                auth_store=root / ".cc-switch" / "codex_oauth_auth.json",
+            )
+        )
+
+    def ok_native_proxy(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "status": "ok",
+            "message": "Codex 原生代理变量已齐全",
+            "missing_keys": [],
+            "mismatched_keys": [],
+        }
+
+    def process_state(self, *, restart_required: bool = False) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "app_running": True,
+            "app_server_running": True,
+            "restart_required": restart_required,
+            "restart_required_for_config": restart_required,
+            "restart_required_for_env": False,
+            "processes": [],
+        }
+
+    def log_state(
+        self,
+        *,
+        deprecation: int = 0,
+        unknown: int = 0,
+        slow_config: int = 0,
+        slow_skills: int = 0,
+    ) -> dict[str, Any]:
+        counts = {
+            "codex_hooks_deprecation": deprecation,
+            "unknown_conversation": unknown,
+            "reconnect": 0,
+            "slow_config_read": slow_config,
+            "slow_skills_list": slow_skills,
+        }
+        signals = [key for key, value in counts.items() if value]
+        return {
+            "ok": True,
+            "status": "warning" if signals else "ok",
+            "counts": counts,
+            "signals": signals,
+            "paths": [],
+            "last_seen": {},
+        }
+
+    def test_doctor_classifies_active_legacy_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text("[features]\ncodex_hooks = true\n", encoding="utf-8")
+            manager = self.make_manager(root)
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(manager, "codex_native_proxy_status", return_value=self.ok_native_proxy()),
+                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state()),
+                mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
+                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state()),
+            ):
+                result = manager.codex_desktop_doctor()
+
+        self.assertEqual(result["status"], "active_config_legacy_key")
+        self.assertEqual(result["action"], "normalize_config")
+
+    def test_doctor_prefers_stale_process_before_upstream_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text("[features]\nhooks = true\n", encoding="utf-8")
+            manager = self.make_manager(root)
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(manager, "codex_native_proxy_status", return_value=self.ok_native_proxy()),
+                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state(restart_required=True)),
+                mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
+                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state(deprecation=2)),
+            ):
+                result = manager.codex_desktop_doctor()
+
+        self.assertEqual(result["status"], "desktop_state_stale")
+        self.assertEqual(result["action"], "hard_restart_codex")
+
+    def test_doctor_classifies_clean_config_deprecation_as_upstream_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text("[features]\nhooks = true\n", encoding="utf-8")
+            manager = self.make_manager(root)
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(manager, "codex_native_proxy_status", return_value=self.ok_native_proxy()),
+                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state()),
+                mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
+                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state(deprecation=2)),
+            ):
+                result = manager.codex_desktop_doctor()
+
+        self.assertEqual(result["status"], "upstream_hooks_warning_likely")
+        self.assertEqual(result["action"], "report_upstream")
+
+    def test_normalize_codex_hooks_config_removes_alias_and_keeps_hooks_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text('model = "gpt-5.5"\n[features]\ncodex_hooks = true\n', encoding="utf-8")
+            manager = self.make_manager(root)
+
+            with mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home):
+                result = manager.normalize_codex_hooks_config()
+
+            body = config.read_text(encoding="utf-8")
+
+        self.assertTrue(result["changed"])
+        self.assertIn("hooks = true", body)
+        self.assertNotIn("codex_hooks", body)
+        self.assertIn('model = "gpt-5.5"', body)
+
+    def test_install_scan_checks_compile_and_package_script(self) -> None:
+        scan = bridgedeck.bridge_install_scan(ROOT, include_tests=False)
+
+        checks = {item["id"]: item for item in scan["checks"]}
+        self.assertTrue(scan["ok"])
+        self.assertEqual(checks["resources"]["status"], "ok")
+        self.assertEqual(checks["py_compile"]["status"], "ok")
+        self.assertEqual(checks["package_shell_syntax"]["status"], "ok")
+        self.assertEqual(checks["unit_tests"]["status"], "skipped")
+
+    def test_write_install_state_records_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "install-state.json"
+            scan = {"status": "ok", "ok": True, "checked_at": "2026-05-21T00:00:00Z", "root": str(ROOT)}
+
+            bridgedeck.write_install_state(scan, target)
+
+            payload = json.loads(target.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["status"], "ok")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["version"], bridgedeck.APP_VERSION)
+
+    def test_launcher_and_packager_have_first_install_scan_hooks(self) -> None:
+        launcher = (ROOT / "BridgeDeckLauncher.swift").read_text(encoding="utf-8")
+        packager = (ROOT / "package-bridgedeck-dmg.command").read_text(encoding="utf-8")
+
+        self.assertIn("install-state.json", launcher)
+        self.assertIn("--install-scan", launcher)
+        self.assertIn("首次打开 BridgeDeck", launcher)
+        self.assertIn("run_preflight", packager)
+        self.assertIn("python3 -m py_compile", packager)
+        self.assertIn("BRIDGEDECK_PACKAGE_TESTS", packager)
+        self.assertIn("--install-scan --write-install-state", packager)
 
     def test_data_requires_valid_csrf_token(self) -> None:
         server, _ = self.start_server()
@@ -2839,9 +3147,18 @@ class ServerCase(unittest.TestCase):
         self.assertIn('data-action="sync-claude-plugins"', html)
         self.assertIn('data-action="preview-bridge-dedupe"', html)
         self.assertIn('data-action="apply-bridge-dedupe"', html)
+        self.assertIn('data-action="install-scan"', html)
+        self.assertIn('id="installScan"', html)
+        self.assertIn("runInstallScan", html)
+        self.assertIn("/api/install-scan", html)
         self.assertIn('data-action="proxy-diagnosis"', html)
+        self.assertIn('data-action="codex-desktop-doctor"', html)
         self.assertIn('data-action="codex-native-proxy-status"', html)
         self.assertIn('data-action="repair-codex-native-proxy"', html)
+        self.assertIn('data-action="normalize-codex-hooks-config"', html)
+        self.assertIn('id="codexDesktopDoctor"', html)
+        self.assertIn("refreshCodexDesktopDoctor", html)
+        self.assertIn("/api/codex-desktop-doctor", html)
         self.assertIn('id="proxyDiagnosis"', html)
         self.assertIn("不改模型、provider 或 config.toml", html)
         self.assertIn('id="anthropicAccessToken"', html)
@@ -3228,6 +3545,69 @@ class ServerCase(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("WS_PROXY", payload["env_keys"])
 
+    def test_codex_desktop_doctor_endpoint_returns_status(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/codex-desktop-doctor",
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "upstream_hooks_warning_likely")
+        self.assertEqual(payload["action"], "report_upstream")
+
+    def test_public_health_is_loopback_only_and_redacted_without_csrf(self) -> None:
+        server, _ = self.start_server(allow_sensitive=False)
+
+        status, payload = self.request(server, "/api/public-health")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        doctor = payload["codex_desktop_doctor"]
+        self.assertEqual(doctor["codex_native_proxy"]["proxy_url"], "<redacted>")
+        self.assertNotIn("command", doctor["process"]["processes"][0])
+        self.assertTrue(str(doctor["config"]["config_path"]).startswith("~"))
+
+        status, payload = self.request(server, "/api/public-health", headers={"Host": "example.com"})
+        self.assertEqual(status, 403)
+        self.assertIn(payload["error"], {"Invalid Host header", "Loopback host required"})
+
+    def test_install_scan_endpoint_requires_csrf_and_returns_checks(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(server, "/api/install-scan")
+
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "Invalid CSRF token")
+
+        status, payload = self.request(
+            server,
+            "/api/install-scan",
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertIn("py_compile", {item["id"] for item in payload["checks"]})
+
+    def test_normalize_codex_hooks_config_endpoint(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/normalize-codex-hooks-config",
+            method="POST",
+            body={},
+            headers={"X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["restart_required"])
+
     def test_dedupe_bridge_providers_endpoint_defaults_to_preview(self) -> None:
         server, _ = self.start_server()
 
@@ -3266,6 +3646,11 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(payload["usage_events"][0]["input_tokens"], 1200)
         self.assertEqual(payload["usage_events"][0]["requested_model"], "claude-opus-4-7")
         self.assertEqual(payload["usage_events"][0]["actual_model"], "gpt-5.5")
+        nested_home = payload["account_matrix"][0]["codex_cli_homes"][0]
+        self.assertEqual(nested_home["path"], "~/.codex")
+        self.assertEqual(nested_home["token_account_id"], "01234567...cdef")
+        self.assertEqual(nested_home["access_account_id"], "01234567...cdef")
+        self.assertEqual(nested_home["email"], "pe***n@example.com")
 
     def test_cross_site_fetch_metadata_is_rejected(self) -> None:
         server, manager = self.start_server()

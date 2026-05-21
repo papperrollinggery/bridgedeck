@@ -58,6 +58,7 @@ STREAM_IDLE_PARTIAL_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_P
 STREAM_LONG_WARNING_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_LONG_WARNING_SECS", "240"))
 STREAM_TOOL_CALL_GUARD_MODE_ENV = "CODEX_BRIDGE_STREAM_TOOL_CALL_GUARD"
 STREAM_TOOL_CALL_WALL_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_TOOL_CALL_WALL_FAIL_SECS", "240"))
+INCOMPLETE_ANSWER_GUARD_ENV = "CODEX_BRIDGE_INCOMPLETE_ANSWER_GUARD"
 ANTHROPIC_TOOL_ARGS_MODE_ENV = "CODEX_BRIDGE_ANTHROPIC_TOOL_ARGS_MODE"
 ANTHROPIC_TOOL_ARG_PING_SECS = float(os.environ.get("CODEX_BRIDGE_ANTHROPIC_TOOL_ARG_PING_SECS", "5"))
 STREAM_STATE_UPDATE_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_STATE_UPDATE_SECS", "5"))
@@ -139,6 +140,12 @@ class BridgeStreamMetrics:
     tool_arg_buffer_chars: int = 0
     tool_arg_ping_events: int = 0
     tool_arg_coalesced_calls: int = 0
+    visible_text_chars: int = 0
+    last_visible_text_tail: str = ""
+    completed_response_status: str = ""
+    completed_incomplete_reason: str = ""
+    completed_output_tokens: int | None = None
+    completed_total_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +158,10 @@ class BridgeModel:
 
 
 class TerminalStreamError(Exception):
+    pass
+
+
+class BridgeIncompleteAnswer(TerminalStreamError):
     pass
 
 
@@ -1122,6 +1133,28 @@ def stream_tool_call_guard_seconds() -> float:
     return max(0.0, STREAM_TOOL_CALL_WALL_FAIL_SECS)
 
 
+def incomplete_answer_guard_mode() -> str:
+    raw = os.environ.get(INCOMPLETE_ANSWER_GUARD_ENV, "fail").strip().lower()
+    aliases = {
+        "": "fail",
+        "0": "off",
+        "false": "off",
+        "no": "off",
+        "never": "off",
+        "disabled": "off",
+        "disable": "off",
+        "1": "fail",
+        "true": "fail",
+        "yes": "fail",
+        "on": "fail",
+        "error": "fail",
+    }
+    raw = aliases.get(raw, raw)
+    if raw not in {"off", "warn", "fail"}:
+        return "fail"
+    return raw
+
+
 def anthropic_tool_args_mode() -> str:
     raw = os.environ.get(ANTHROPIC_TOOL_ARGS_MODE_ENV, "coalesce").strip().lower()
     aliases = {
@@ -1150,6 +1183,100 @@ def anthropic_tool_arg_ping_seconds() -> float:
     return max(0.0, ANTHROPIC_TOOL_ARG_PING_SECS)
 
 
+def _append_visible_text_metrics(metrics: BridgeStreamMetrics, text: str) -> None:
+    if not text:
+        return
+    metrics.visible_text_chars += len(text)
+    metrics.last_visible_text_tail = (metrics.last_visible_text_tail + text)[-160:]
+
+
+def _visible_text_from_payload(event_key: str, payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    if event_key == "response.output_text.delta":
+        value = payload.get("delta")
+        return value if isinstance(value, str) else ""
+    if event_key == "response.output_text.done":
+        value = payload.get("text")
+        return value if isinstance(value, str) else ""
+    return ""
+
+
+def _response_from_terminal_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    response = payload.get("response")
+    if isinstance(response, dict):
+        return response
+    return payload
+
+
+def _update_terminal_response_metrics(metrics: BridgeStreamMetrics, payload: Any) -> None:
+    response = _response_from_terminal_payload(payload)
+    if not response:
+        return
+    status = response.get("status")
+    if isinstance(status, str):
+        metrics.completed_response_status = status
+    incomplete = response.get("incomplete_details")
+    if isinstance(incomplete, dict):
+        reason = incomplete.get("reason")
+        if isinstance(reason, str):
+            metrics.completed_incomplete_reason = reason
+    usage = response.get("usage")
+    if isinstance(usage, dict):
+        output_tokens = usage.get("output_tokens")
+        total_tokens = usage.get("total_tokens")
+        if isinstance(output_tokens, int):
+            metrics.completed_output_tokens = output_tokens
+        if isinstance(total_tokens, int):
+            metrics.completed_total_tokens = total_tokens
+
+
+def _answer_end_class(tail: str) -> str:
+    text = tail.rstrip()
+    if not text:
+        return "empty"
+    last = text[-1]
+    if last in {":", "："}:
+        return "open_colon"
+    if last in {",", "，", ";", "；", "、"}:
+        return "continuation_punctuation"
+    if last in {".", "。", "!", "！", "?", "？", "…"}:
+        return "sentence_terminal"
+    if last in {")",
+        "]",
+        "}",
+        ">",
+        "）",
+        "】",
+        "」",
+        "』",
+        "》",
+    }:
+        return "closed_delimiter"
+    return "other"
+
+
+def _answer_incomplete_risk(metrics: BridgeStreamMetrics) -> bool:
+    if metrics.completed_response_status == "incomplete" or metrics.completed_incomplete_reason:
+        return True
+    if metrics.client_disconnected or metrics.idle_timeout_seen:
+        return True
+    if metrics.visible_text_chars <= 0:
+        return False
+    return _answer_end_class(metrics.last_visible_text_tail) in {"open_colon", "continuation_punctuation"}
+
+
+def _incomplete_answer_error(metrics: BridgeStreamMetrics) -> BridgeIncompleteAnswer:
+    end_class = _answer_end_class(metrics.last_visible_text_tail)
+    detail = metrics.completed_incomplete_reason or metrics.completed_response_status or "completed"
+    return BridgeIncompleteAnswer(
+        "upstream completed with a suspiciously unfinished visible answer "
+        f"(end_class={end_class}, status={detail}, visible_text_chars={metrics.visible_text_chars})"
+    )
+
+
 def log_bridge_stream_summary(
     *,
     account_id: str,
@@ -1164,7 +1291,13 @@ def log_bridge_stream_summary(
 ) -> None:
     payload = {
         "account_id": account_id,
+        "answer_end_class": _answer_end_class(metrics.last_visible_text_tail),
+        "answer_incomplete_risk": _answer_incomplete_risk(metrics),
         "client_disconnected": metrics.client_disconnected,
+        "completed_incomplete_reason": metrics.completed_incomplete_reason,
+        "completed_output_tokens": metrics.completed_output_tokens,
+        "completed_response_status": metrics.completed_response_status,
+        "completed_total_tokens": metrics.completed_total_tokens,
         "downstream_writes": metrics.downstream_writes,
         "duration_s": round(time.monotonic() - started_at, 3),
         "actual_effort": actual_effort or requested_effort or "unknown",
@@ -1186,8 +1319,13 @@ def log_bridge_stream_summary(
         "tool_args_mode": metrics.tool_args_mode or anthropic_tool_args_mode(),
         "tool_events": metrics.tool_events,
         "upstream_events": metrics.upstream_events,
+        "visible_text_chars": metrics.visible_text_chars,
         "visible_text_events": metrics.visible_text_events,
     }
+    if metrics.last_visible_text_tail:
+        payload["visible_text_tail_sha12"] = hashlib.sha256(
+            metrics.last_visible_text_tail.encode("utf-8", "replace")
+        ).hexdigest()[:12]
     if upstream_request_id:
         payload["upstream_request_id"] = upstream_request_id
     print(
@@ -2390,6 +2528,13 @@ def iter_chat_completions_sse(chunks: Any, *, completion_id: str, model: str) ->
                 )
                 yield b"data: [DONE]\n\n"
             elif event_name in {"response.failed", "error"}:
+                closing = close_text_block()
+                if closing:
+                    yield closing
+                for item_id in list(active_tool_blocks):
+                    stopped_tool = close_tool_block(item_id)
+                    if stopped_tool:
+                        yield stopped_tool
                 error = payload.get("error")
                 response_obj = payload.get("response")
                 if not isinstance(error, dict) and isinstance(response_obj, dict):
@@ -2781,6 +2926,13 @@ def iter_anthropic_messages_sse(
                 yield _sse_event("message_stop", {"type": "message_stop"})
                 stopped = True
             elif event_name in {"response.failed", "error"}:
+                closing = close_text_block()
+                if closing:
+                    yield closing
+                for item_id in list(active_tool_blocks):
+                    stopped_tool = close_tool_block(item_id)
+                    if stopped_tool:
+                        yield stopped_tool
                 error = payload.get("error")
                 response_obj = payload.get("response")
                 if not isinstance(error, dict) and isinstance(response_obj, dict):
@@ -3502,6 +3654,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 "tool_args_mode": metrics.tool_args_mode or anthropic_tool_args_mode(),
                 "tool_events": metrics.tool_events,
                 "upstream_events": metrics.upstream_events,
+                "visible_text_chars": metrics.visible_text_chars,
                 "visible_text_events": metrics.visible_text_events,
             }
 
@@ -3647,6 +3800,29 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     upstream_request_id=upstream_request_id,
                     metrics=metrics,
                 ))
+                if (
+                    event_name == "response.completed"
+                    and incomplete_answer_guard_mode() == "fail"
+                    and _answer_incomplete_risk(metrics)
+                ):
+                    exc = _incomplete_answer_error(metrics)
+                    log_bridge_stream_error(
+                        account_id=account_id,
+                        requested_model=requested_model,
+                        request_id=stream_request_id,
+                        started_at=stream_started_at,
+                        exc=exc,
+                        upstream_request_id=upstream_request_id,
+                    )
+                    chunks = [
+                        response_failed_sse(
+                            request_id=stream_request_id,
+                            requested_model=requested_model,
+                            exc=exc,
+                            error_code="bridge_incomplete_answer",
+                            error_type="bridge_incomplete_answer",
+                        )
+                    ]
                 status = "tool_arguments_streaming" if "function_call_arguments.delta" in (metrics.last_event_name or "") else "streaming"
                 maybe_record_active_stream(status)
                 if (
@@ -3896,6 +4072,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             metrics.last_event_name = event_key or "unknown"
             if event_key in {"response.output_text.delta", "response.output_text.done"}:
                 metrics.visible_text_events += 1
+                _append_visible_text_metrics(metrics, _visible_text_from_payload(event_key, payload))
                 if metrics.first_visible_after_ms is None:
                     metrics.first_visible_after_ms = int((time.monotonic() - started_at) * 1000)
             if self._block_has_reasoning_signal(event_name, payload):
@@ -3915,6 +4092,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 "response.incomplete",
                 "error",
             }:
+                _update_terminal_response_metrics(metrics, payload)
                 metrics.terminal_event_seen = True
                 metrics.terminal_events += 1
         self._update_reasoning_placeholder_state(state, event_name, payload)

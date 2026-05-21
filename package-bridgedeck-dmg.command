@@ -25,6 +25,17 @@ raise SystemExit("APP_VERSION not found")
 PY
 )"
 
+run_preflight() {
+  echo "BridgeDeck package preflight"
+  /usr/bin/env python3 -m py_compile "$ROOT/bridgedeck.py" "$ROOT/local_codex_bridge.py"
+  /bin/zsh -n "$ROOT/package-bridgedeck-dmg.command"
+  if [[ "${BRIDGEDECK_PACKAGE_TESTS:-0}" == "1" ]]; then
+    /usr/bin/env python3 -m unittest discover -s "$ROOT/tests"
+  fi
+}
+
+run_preflight
+
 rm -rf "$APP_DIR" "$DMG"
 mkdir -p "$MACOS" "$RESOURCES"
 
@@ -73,6 +84,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESOURCE_DIR="$SCRIPT_DIR/../Resources"
 LOG_DIR="$HOME/Library/Logs"
 LOG_FILE="$LOG_DIR/bridgedeck-app.log"
+INSTALL_STATE="$HOME/Library/Application Support/BridgeDeck/install-state.json"
 APP_URL="http://127.0.0.1:8899"
 mkdir -p "$LOG_DIR"
 
@@ -134,6 +146,40 @@ start_bridge_only() {
   CODEX_BRIDGE_SCRIPT="$RESOURCE_DIR/local_codex_bridge.py" "$(python_bin)" "$RESOURCE_DIR/bridgedeck.py" --local-bridge start >> "$LOG_FILE" 2>&1 &
   /usr/bin/osascript -e 'display notification "8876 Local Bridge 已启动或已在运行" with title "BridgeDeck"' >/dev/null 2>&1 || true
 }
+
+write_install_skipped() {
+  /bin/mkdir -p "$(/usr/bin/dirname "$INSTALL_STATE")"
+  /bin/cat > "$INSTALL_STATE" <<STATE
+{"status":"skipped","ok":true,"checked_at":"$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')","root":"$RESOURCE_DIR"}
+STATE
+}
+
+first_install_scan_prompt() {
+  if [[ -f "$INSTALL_STATE" ]]; then
+    return 0
+  fi
+  choice="$(/usr/bin/osascript <<'APPLESCRIPT' 2>/dev/null || true
+button returned of (display dialog "首次打开 BridgeDeck。建议先运行安装扫描：Python 编译检查、打包脚本语法检查、/Applications 版本检查。" buttons {"取消", "直接打开 UI", "运行扫描并打开 UI"} default button "运行扫描并打开 UI" cancel button "取消" with title "BridgeDeck 安装扫描")
+APPLESCRIPT
+)"
+  log_event "first_install_choice=${choice:-<empty>}"
+  case "$choice" in
+    "运行扫描并打开 UI")
+      "$(python_bin)" "$RESOURCE_DIR/bridgedeck.py" --install-scan --write-install-state >> "$LOG_FILE" 2>&1 || {
+        /usr/bin/osascript -e 'display dialog "BridgeDeck 安装扫描失败。请查看 ~/Library/Logs/bridgedeck-app.log。" buttons {"OK"} with title "BridgeDeck"' >/dev/null 2>&1 || true
+        exit 2
+      }
+      ;;
+    "直接打开 UI"|"")
+      write_install_skipped
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+}
+
+first_install_scan_prompt
 
 if ui_running; then
   log_event "launcher_start ui_running=1"

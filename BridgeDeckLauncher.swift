@@ -13,6 +13,11 @@ let logURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library")
     .appendingPathComponent("Logs")
     .appendingPathComponent("bridgedeck-app.log")
+let installStateURL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library")
+    .appendingPathComponent("Application Support")
+    .appendingPathComponent("BridgeDeck")
+    .appendingPathComponent("install-state.json")
 
 if CommandLine.arguments.contains("--self-test") {
     print("BridgeDeckLauncher OK")
@@ -165,6 +170,49 @@ func showAlert(title: String, message: String, buttons: [String]) -> NSApplicati
 func showInfo(_ message: String) {
     _ = showAlert(title: "BridgeDeck", message: message, buttons: ["OK"])
 }
+
+func writeInstallSkipped() {
+    let payload: [String: Any] = [
+        "status": "skipped",
+        "ok": true,
+        "checked_at": ISO8601DateFormatter().string(from: Date()),
+        "root": resourceURL.path,
+    ]
+    let dir = installStateURL.deletingLastPathComponent()
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) {
+        try? data.write(to: installStateURL)
+    }
+}
+
+func firstInstallScanPrompt() {
+    if FileManager.default.fileExists(atPath: installStateURL.path) {
+        return
+    }
+    let response = showAlert(
+        title: "BridgeDeck 安装扫描",
+        message: "首次打开 BridgeDeck。建议先运行安装扫描：Python 编译检查、打包脚本语法检查、/Applications 版本检查。",
+        buttons: ["运行扫描并打开 UI", "直接打开 UI", "取消"]
+    )
+    if response == .alertFirstButtonReturn {
+        let code = runProcess(
+            pythonBin(),
+            [bridgeDeckScript, "--install-scan", "--write-install-state"],
+            wait: true,
+            logOutput: true
+        )
+        if code != 0 {
+            showInfo("BridgeDeck 安装扫描失败。请查看 ~/Library/Logs/bridgedeck-app.log。")
+            exit(2)
+        }
+    } else if response == .alertSecondButtonReturn {
+        writeInstallSkipped()
+    } else {
+        exit(0)
+    }
+}
+
+firstInstallScanPrompt()
 
 let running = uiRunning()
 log("launcher_start ui_running=\(running ? 1 : 0)")

@@ -38,6 +38,13 @@ DEFAULT_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CODEX_AUTH_PATH = DEFAULT_CODEX_HOME / "auth.json"
+CODEX_DESKTOP_LOG_ROOT = Path.home() / "Library" / "Logs" / "com.openai.codex"
+DEFAULT_INSTALL_STATE_PATH = Path(
+    os.environ.get(
+        "BRIDGEDECK_INSTALL_STATE_PATH",
+        str(Path.home() / "Library" / "Application Support" / "BridgeDeck" / "install-state.json"),
+    )
+)
 DEFAULT_CLI_LAUNCHER_DIR = Path.home() / ".cc-switch" / "codex-cli-launchers"
 DEFAULT_LOCAL_BRIDGE_STATE_PATH = Path(
     os.environ.get(
@@ -58,7 +65,7 @@ DEFAULT_ZPROFILE_PATH = Path.home() / ".zprofile"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.21"
+APP_VERSION = "0.2.22"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -221,6 +228,10 @@ CODEX_OAUTH_FLOW_TTL_SECS = 10 * 60
 
 def now_ts() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
 
 
 def load_json(path: Path, fallback: Any) -> Any:
@@ -555,6 +566,41 @@ def strip_toml_section_keys(text: str, section: str, keys: tuple[str, ...]) -> t
                 continue
         output.append(line)
     return "".join(output), sorted(set(removed))
+
+
+def toml_section_bool_keys(text: str, section: str) -> dict[str, bool]:
+    values: dict[str, bool] = {}
+    in_section = False
+    key_pattern = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(true|false)\s*(?:#.*)?$", re.IGNORECASE)
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == f"[{section}]"
+            continue
+        if not in_section:
+            continue
+        match = key_pattern.match(line)
+        if match:
+            values[match.group(1)] = match.group(2).lower() == "true"
+    return values
+
+
+def has_toml_section_key(text: str, section: str, key: str) -> bool:
+    return key in toml_section_bool_keys(text, section)
+
+
+def ensure_toml_section_bool_key(text: str, section: str, key: str, value: bool) -> str:
+    if has_toml_section_key(text, section, key):
+        return text
+    lines = text.splitlines(keepends=True)
+    header = f"[{section}]"
+    for idx, line in enumerate(lines):
+        if line.strip() == header:
+            insert_at = idx + 1
+            lines.insert(insert_at, f"{key} = {'true' if value else 'false'}\n")
+            return "".join(lines)
+    suffix = "" if text.endswith("\n") or not text else "\n"
+    return f"{text}{suffix}\n{header}\n{key} = {'true' if value else 'false'}\n"
 
 
 def strip_managed_codex_desktop_bridge(text: str) -> tuple[str, bool]:
@@ -1302,6 +1348,8 @@ def parse_bridge_stream_log(path: Path, *, max_events: int = 80) -> list[dict[st
             kind = "client_disconnect"
         elif bool(body.get("idle_timeout_seen")):
             kind = "bridge_idle_timeout"
+        elif bool(body.get("answer_incomplete_risk")):
+            kind = "answer_incomplete_risk"
         elif tag == "bridge-long-stream-warning":
             kind = "long_stream"
         elif error_type == "BridgeClientDisconnect":
@@ -1325,6 +1373,13 @@ def parse_bridge_stream_log(path: Path, *, max_events: int = 80) -> list[dict[st
                 "client_disconnected": bool(body.get("client_disconnected")),
                 "terminal_event_seen": bool(body.get("terminal_event_seen")),
                 "idle_timeout_seen": bool(body.get("idle_timeout_seen")),
+                "answer_incomplete_risk": bool(body.get("answer_incomplete_risk")),
+                "answer_end_class": str(body.get("answer_end_class") or ""),
+                "completed_response_status": str(body.get("completed_response_status") or ""),
+                "completed_incomplete_reason": str(body.get("completed_incomplete_reason") or ""),
+                "completed_output_tokens": body.get("completed_output_tokens"),
+                "completed_total_tokens": body.get("completed_total_tokens"),
+                "visible_text_tail_sha12": str(body.get("visible_text_tail_sha12") or ""),
                 "actual_effort": str(body.get("actual_effort") or body.get("effort") or ""),
                 "requested_effort": str(body.get("requested_effort") or ""),
                 "tool_arg_buffer_chars": safe_int(body.get("tool_arg_buffer_chars"), 0),
@@ -1334,6 +1389,7 @@ def parse_bridge_stream_log(path: Path, *, max_events: int = 80) -> list[dict[st
                 "tool_args_mode": str(body.get("tool_args_mode") or ""),
                 "upstream_events": safe_int(body.get("upstream_events"), 0),
                 "downstream_writes": safe_int(body.get("downstream_writes"), 0),
+                "visible_text_chars": safe_int(body.get("visible_text_chars"), 0),
                 "visible_text_events": safe_int(body.get("visible_text_events"), 0),
                 "reasoning_events": safe_int(body.get("reasoning_events"), 0),
                 "tool_events": safe_int(body.get("tool_events"), 0),
@@ -1366,6 +1422,7 @@ def bridge_stream_diagnostics(log_paths: list[Path] | None = None) -> dict[str, 
         "client_disconnect": count_kind("client_disconnect"),
         "bridge_idle_timeout": count_kind("bridge_idle_timeout"),
         "upstream_stream_error": count_kind("upstream_stream_error"),
+        "answer_incomplete_risk": count_kind("answer_incomplete_risk"),
         "long_stream": count_kind("long_stream"),
         "stream_end": count_kind("stream_end"),
     }
@@ -1384,6 +1441,9 @@ def bridge_stream_diagnostics(log_paths: list[Path] | None = None) -> dict[str, 
     elif latest.get("kind") == "upstream_stream_error":
         status = "warning"
         message = "最近一次是上游流式错误。"
+    elif latest.get("kind") == "answer_incomplete_risk":
+        status = "warning"
+        message = "最近一次正常 completed，但答案结尾像半句；需区分模型提前完成和客户端渲染中断。"
     else:
         status = "ok"
         message = "最近流式请求正常结束。"
@@ -1540,6 +1600,361 @@ def run_quiet(args: list[str], *, timeout: float = 3) -> subprocess.CompletedPro
         return subprocess.run(args, check=False, capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None
+
+
+def _file_mtime(path: Path) -> tuple[float, str]:
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return 0.0, ""
+    return mtime, dt.datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
+
+
+def _parse_ps_lstart(value: str) -> tuple[float, str]:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        return 0.0, ""
+    try:
+        parsed = dt.datetime.strptime(text, "%a %b %d %H:%M:%S %Y")
+        return parsed.timestamp(), parsed.isoformat(timespec="seconds")
+    except ValueError:
+        return 0.0, text
+
+
+def _codex_process_rows() -> list[dict[str, Any]]:
+    proc = run_quiet(["/bin/ps", "-axo", "pid,lstart,command"], timeout=3)
+    if not proc or proc.returncode != 0:
+        return []
+    rows: list[dict[str, Any]] = []
+    pattern = re.compile(r"^\s*(\d+)\s+([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.+)$")
+    for line in proc.stdout.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        command = match.group(3)
+        if "Codex.app" not in command and "/Resources/codex app-server" not in command and "/Resources/node_repl" not in command:
+            continue
+        start_epoch, started_at = _parse_ps_lstart(match.group(2))
+        label = "codex"
+        if "/Contents/MacOS/Codex" in command:
+            label = "codex_app"
+        elif "codex app-server" in command and "--listen stdio://" in command:
+            label = "stdio_app_server"
+        elif "codex app-server" in command:
+            label = "desktop_app_server"
+        elif "/Resources/node_repl" in command:
+            label = "node_repl"
+        rows.append(
+            {
+                "pid": safe_int(match.group(1), 0),
+                "label": label,
+                "started_at": started_at,
+                "start_epoch": start_epoch,
+                "command": command,
+            }
+        )
+    return rows
+
+
+def codex_desktop_process_state(
+    *,
+    config_path: Path | None = None,
+    env_path: Path | None = None,
+) -> dict[str, Any]:
+    config_path = config_path or (DEFAULT_CODEX_HOME / "config.toml")
+    env_path = env_path or (DEFAULT_CODEX_HOME / ".env")
+    rows = _codex_process_rows()
+    app_servers = [row for row in rows if row.get("label") == "desktop_app_server"]
+    primary = app_servers[0] if app_servers else {}
+    start_epoch = float(primary.get("start_epoch") or 0)
+    config_mtime, config_mtime_at = _file_mtime(config_path)
+    env_mtime, env_mtime_at = _file_mtime(env_path)
+    restart_required_for_config = bool(start_epoch and config_mtime and config_mtime > start_epoch + 1)
+    restart_required_for_env = bool(start_epoch and env_mtime and env_mtime > start_epoch + 1)
+    return {
+        "ok": True,
+        "app_running": any(row.get("label") == "codex_app" for row in rows),
+        "app_server_running": bool(primary),
+        "app_server_pid": primary.get("pid", 0),
+        "app_server_started_at": primary.get("started_at", ""),
+        "app_server_start_epoch": start_epoch,
+        "config_mtime": config_mtime_at,
+        "env_mtime": env_mtime_at,
+        "restart_required_for_config": restart_required_for_config,
+        "restart_required_for_env": restart_required_for_env,
+        "restart_required": restart_required_for_config or restart_required_for_env,
+        "processes": rows,
+    }
+
+
+def codex_cli_version_state() -> dict[str, Any]:
+    global_version = ""
+    bundled_version = ""
+    global_path = which("codex") or ""
+    if global_path:
+        proc = run_quiet([global_path, "--version"], timeout=2)
+        if proc and proc.returncode == 0:
+            global_version = proc.stdout.strip() or proc.stderr.strip()
+    bundled_path = Path("/Applications/Codex.app/Contents/Resources/codex")
+    if bundled_path.exists():
+        proc = run_quiet([str(bundled_path), "--version"], timeout=2)
+        if proc and proc.returncode == 0:
+            bundled_version = proc.stdout.strip() or proc.stderr.strip()
+    return {
+        "global_cli_path": global_path,
+        "global_cli_version": global_version,
+        "bundled_cli_path": str(bundled_path) if bundled_path.exists() else "",
+        "bundled_cli_version": bundled_version,
+        "version_split": bool(global_version and bundled_version and global_version != bundled_version),
+    }
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def bridge_install_scan(root: Path | None = None, include_tests: bool = False) -> dict[str, Any]:
+    root = (root or Path(__file__).resolve().parent).resolve()
+    python = sys.executable or "python3"
+    checks: list[dict[str, Any]] = []
+    recommendations: list[str] = []
+    ok = True
+
+    def add_check(check_id: str, label: str, status: str, detail: str = "") -> None:
+        nonlocal ok
+        checks.append({"id": check_id, "label": label, "status": status, "detail": detail})
+        if status == "failed":
+            ok = False
+
+    scripts = [root / "bridgedeck.py", root / "local_codex_bridge.py"]
+    missing = [str(path) for path in scripts if not path.exists()]
+    if missing:
+        add_check("resources", "核心脚本", "failed", "缺失: " + ", ".join(missing))
+    else:
+        add_check("resources", "核心脚本", "ok", "bridgedeck.py / local_codex_bridge.py")
+        proc = subprocess.run(
+            [python, "-m", "py_compile", *(str(path) for path in scripts)],
+            cwd=str(root),
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        add_check(
+            "py_compile",
+            "Python 编译扫描",
+            "ok" if proc.returncode == 0 else "failed",
+            (proc.stderr or proc.stdout or "通过").strip()[:500],
+        )
+
+    package_script = root / "package-bridgedeck-dmg.command"
+    if package_script.exists():
+        proc = subprocess.run(
+            ["/bin/zsh", "-n", str(package_script)],
+            cwd=str(root),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        add_check(
+            "package_shell_syntax",
+            "打包脚本语法",
+            "ok" if proc.returncode == 0 else "failed",
+            (proc.stderr or proc.stdout or "通过").strip()[:500],
+        )
+    else:
+        add_check("package_shell_syntax", "打包脚本语法", "warning", "源码运行环境未包含打包脚本")
+
+    app_resource = Path("/Applications/BridgeDeck.app/Contents/Resources/bridgedeck.py")
+    if app_resource.exists() and (root / "bridgedeck.py").exists():
+        repo_hash = sha256_file(root / "bridgedeck.py")
+        app_hash = sha256_file(app_resource)
+        if repo_hash == app_hash:
+            add_check("installed_app_current", "Applications App 版本", "ok", "与当前脚本一致")
+        else:
+            add_check("installed_app_current", "Applications App 版本", "warning", "Applications 中的 App 不是当前源码版本")
+            recommendations.append("重新打包并替换 /Applications/BridgeDeck.app，然后重启 8899 UI")
+    elif app_resource.exists():
+        add_check("installed_app_current", "Applications App 版本", "warning", "无法比较当前源码")
+    else:
+        add_check("installed_app_current", "Applications App 版本", "warning", "未安装到 /Applications")
+
+    if include_tests:
+        proc = subprocess.run(
+            [python, "-m", "unittest", "discover", "-s", "tests"],
+            cwd=str(root),
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+        add_check(
+            "unit_tests",
+            "单元测试扫描",
+            "ok" if proc.returncode == 0 else "failed",
+            (proc.stderr or proc.stdout or "通过").strip()[-500:],
+        )
+    else:
+        add_check("unit_tests", "单元测试扫描", "skipped", "打包时可用 BRIDGEDECK_PACKAGE_TESTS=1 启用")
+
+    if not recommendations and ok:
+        recommendations.append("安装扫描通过，可启动 UI")
+    status = "ok" if ok and not any(c["status"] == "warning" for c in checks) else ("failed" if not ok else "warning")
+    return {
+        "ok": ok,
+        "status": status,
+        "version": APP_VERSION,
+        "root": str(root),
+        "checked_at": now_iso(),
+        "checks": checks,
+        "recommendations": recommendations,
+    }
+
+
+def write_install_state(scan: dict[str, Any], path: Path | None = None) -> None:
+    target = path or DEFAULT_INSTALL_STATE_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": APP_VERSION,
+        "status": scan.get("status"),
+        "ok": bool(scan.get("ok")),
+        "checked_at": scan.get("checked_at") or now_iso(),
+        "root": scan.get("root", ""),
+    }
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def codex_config_feature_state(config_path: Path | None = None) -> dict[str, Any]:
+    config_path = config_path or (DEFAULT_CODEX_HOME / "config.toml")
+    mtime, mtime_at = _file_mtime(config_path)
+    data: dict[str, Any] = {
+        "ok": True,
+        "exists": config_path.exists(),
+        "config_path": str(config_path),
+        "mtime": mtime_at,
+        "mtime_epoch": mtime,
+        "canonical_hooks_present": False,
+        "canonical_hooks_enabled": True,
+        "hooks_effective_enabled": True,
+        "legacy_codex_hooks_present": False,
+        "legacy_codex_hooks_enabled": False,
+        "active_legacy_key_present": False,
+        "feature_keys": [],
+        "backup_legacy_refs": [],
+        "error": "",
+    }
+    if config_path.is_symlink():
+        data.update({"ok": False, "error": "~/.codex/config.toml 是符号链接"})
+        return data
+    if not config_path.exists():
+        return data
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        data.update({"ok": False, "error": str(exc)})
+        return data
+    features = toml_section_bool_keys(text, "features")
+    data["feature_keys"] = sorted(features.keys())
+    data["canonical_hooks_present"] = "hooks" in features
+    data["canonical_hooks_enabled"] = bool(features.get("hooks", True))
+    data["hooks_effective_enabled"] = bool(features.get("hooks", True))
+    data["legacy_codex_hooks_present"] = "codex_hooks" in features
+    data["legacy_codex_hooks_enabled"] = bool(features.get("codex_hooks", False))
+    data["active_legacy_key_present"] = "codex_hooks" in features
+    refs: list[str] = []
+    for pattern in ("*.toml*", "backups/**/*.toml", "backups/**/*.toml.*"):
+        for path in DEFAULT_CODEX_HOME.glob(pattern):
+            if path == config_path or not path.is_file():
+                continue
+            try:
+                body = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if re.search(r"(?m)^\s*codex_hooks\s*=", body):
+                refs.append(str(path))
+            if len(refs) >= 12:
+                break
+        if len(refs) >= 12:
+            break
+    data["backup_legacy_refs"] = refs
+    return data
+
+
+def codex_recent_desktop_logs(*, limit: int = 5) -> list[Path]:
+    if not CODEX_DESKTOP_LOG_ROOT.exists():
+        return []
+    paths: list[Path] = []
+    try:
+        paths = [path for path in CODEX_DESKTOP_LOG_ROOT.rglob("*.log") if path.is_file()]
+    except Exception:
+        return []
+    return sorted(paths, key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)[:limit]
+
+
+def codex_desktop_log_state(*, limit: int = 5, max_bytes_per_log: int = 1_500_000) -> dict[str, Any]:
+    paths = codex_recent_desktop_logs(limit=limit)
+    counts = {
+        "codex_hooks_deprecation": 0,
+        "unknown_conversation": 0,
+        "reconnect": 0,
+        "slow_config_read": 0,
+        "slow_skills_list": 0,
+    }
+    last_seen = {key: "" for key in counts}
+    max_config_read_ms = 0
+    max_skills_list_ms = 0
+    timestamp_pattern = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z)")
+    duration_pattern = re.compile(r"durationMs=(\d+)")
+
+    for path in paths:
+        try:
+            raw = path.read_bytes()
+            body = raw[-max_bytes_per_log:].decode("utf-8", "replace")
+        except Exception:
+            continue
+        for line in body.splitlines():
+            ts_match = timestamp_pattern.match(line)
+            ts = ts_match.group(1) if ts_match else ""
+            lower = line.lower()
+            if "codex_hooks" in line and "deprecated" in lower:
+                counts["codex_hooks_deprecation"] += 1
+                last_seen["codex_hooks_deprecation"] = ts
+            if "unknown conversation" in lower:
+                counts["unknown_conversation"] += 1
+                last_seen["unknown_conversation"] = ts
+            if "reconnecting" in lower or "reconnect" in lower:
+                counts["reconnect"] += 1
+                last_seen["reconnect"] = ts
+            duration_match = duration_pattern.search(line)
+            duration_ms = safe_int(duration_match.group(1), 0) if duration_match else 0
+            if "method=config/read" in line:
+                max_config_read_ms = max(max_config_read_ms, duration_ms)
+                if duration_ms >= 3000:
+                    counts["slow_config_read"] += 1
+                    last_seen["slow_config_read"] = ts
+            if "method=skills/list" in line:
+                max_skills_list_ms = max(max_skills_list_ms, duration_ms)
+                if duration_ms >= 3000:
+                    counts["slow_skills_list"] += 1
+                    last_seen["slow_skills_list"] = ts
+
+    signals = [key for key, value in counts.items() if value]
+    return {
+        "ok": True,
+        "status": "warning" if signals else "ok",
+        "log_root": str(CODEX_DESKTOP_LOG_ROOT),
+        "paths": [str(path) for path in paths],
+        "counts": counts,
+        "last_seen": last_seen,
+        "signals": signals,
+        "max_config_read_ms": max_config_read_ms,
+        "max_skills_list_ms": max_skills_list_ms,
+    }
 
 
 def pids_listening_on_port(port: int) -> list[int]:
@@ -2951,6 +3366,171 @@ class BridgeManager:
             "claude_desktop_providers": snapshot.get("claude_desktop_providers", []),
             "stream_diagnostics": stream_diag,
             "claude_hook_risks": hook_risks,
+        }
+
+    def codex_desktop_doctor(self) -> dict[str, Any]:
+        config = codex_config_feature_state()
+        desktop = self._codex_desktop_status()
+        native_proxy = self.codex_native_proxy_status()
+        process_state = codex_desktop_process_state(
+            config_path=DEFAULT_CODEX_HOME / "config.toml",
+            env_path=DEFAULT_CODEX_HOME / ".env",
+        )
+        versions = codex_cli_version_state()
+        logs = codex_desktop_log_state()
+
+        checks: list[dict[str, Any]] = [
+            {
+                "id": "config_hooks",
+                "label": "Codex hooks config",
+                "status": "failed" if config.get("active_legacy_key_present") else ("ok" if config.get("hooks_effective_enabled") else "disabled"),
+                "detail": (
+                    "active config still contains codex_hooks"
+                    if config.get("active_legacy_key_present")
+                    else ("hooks enabled" if config.get("hooks_effective_enabled") else "hooks disabled")
+                ),
+            },
+            {
+                "id": "native_proxy",
+                "label": "Codex native proxy env",
+                "status": native_proxy.get("status", "unknown"),
+                "detail": native_proxy.get("message", ""),
+            },
+            {
+                "id": "desktop_process",
+                "label": "Codex Desktop app-server",
+                "status": "warning" if process_state.get("restart_required") else ("ok" if process_state.get("app_server_running") else "missing"),
+                "detail": (
+                    "app-server started before config/env changed"
+                    if process_state.get("restart_required")
+                    else ("app-server running" if process_state.get("app_server_running") else "app-server not detected")
+                ),
+            },
+            {
+                "id": "desktop_logs",
+                "label": "Codex Desktop logs",
+                "status": logs.get("status", "unknown"),
+                "detail": ", ".join(logs.get("signals", [])) if logs.get("signals") else "no warning signals in recent logs",
+            },
+            {
+                "id": "desktop_route",
+                "label": "Codex Desktop route",
+                "status": "warning" if desktop.get("bridge_mode") == "bridgedeck_provider" else "ok",
+                "detail": desktop.get("managed_by", "unknown"),
+            },
+        ]
+
+        recommendations: list[str] = []
+        status = "healthy"
+        action = "no_action"
+        message = "Codex Desktop config、proxy、进程和近期日志未发现明显异常。"
+
+        native_status = str(native_proxy.get("status") or "unknown")
+        log_counts = logs.get("counts") if isinstance(logs.get("counts"), dict) else {}
+        clean_hooks_config = bool(
+            config.get("hooks_effective_enabled")
+            and not config.get("active_legacy_key_present")
+        )
+        has_deprecation_warning = bool(log_counts.get("codex_hooks_deprecation"))
+        has_unknown_conversation = bool(log_counts.get("unknown_conversation"))
+        has_slow_app_server_calls = bool(log_counts.get("slow_config_read") or log_counts.get("slow_skills_list"))
+
+        if config.get("active_legacy_key_present"):
+            status = "active_config_legacy_key"
+            action = "normalize_config"
+            message = "活跃 ~/.codex/config.toml 仍包含 deprecated codex_hooks。"
+            recommendations.append("删除 [features].codex_hooks，保留 [features].hooks = true。")
+        elif desktop.get("bridge_mode") == "bridgedeck_provider":
+            status = "bridge_mode_active"
+            action = "restore_native_mode"
+            message = "Codex Desktop 当前处于 BridgeDeck 临时 Bridge 模式。"
+            recommendations.append("如果不是刻意绕过原生路径，先恢复 Codex Desktop 原生模式。")
+        elif native_status in {"missing", "incomplete", "proxy_down", "blocked"}:
+            status = f"native_proxy_{native_status}"
+            action = "repair_env" if native_status in {"missing", "incomplete"} else "start_proxy"
+            message = str(native_proxy.get("message") or "Codex 原生代理 env 不完整。")
+            recommendations.append("只修复 ~/.codex/.env；不要改 model/provider。")
+            if native_status != "blocked":
+                recommendations.append("修复后完全退出并重启 Codex Desktop。")
+        elif process_state.get("restart_required"):
+            status = "desktop_state_stale"
+            action = "hard_restart_codex"
+            message = "Codex app-server 启动时间早于 config/env 修改时间，当前进程可能仍持有旧状态。"
+            recommendations.append("完全退出 Codex Desktop，再重新打开。")
+        elif has_deprecation_warning and clean_hooks_config:
+            status = "upstream_hooks_warning_likely"
+            action = "report_upstream"
+            message = "活跃 config 已是 hooks=true，但日志仍出现 codex_hooks deprecated warning，符合上游 false-positive 类问题。"
+            recommendations.append("不要继续重复改 config；记录版本和日志，等待/跟踪上游修复。")
+        elif has_unknown_conversation:
+            status = "desktop_event_session_unhealthy"
+            action = "hard_restart_codex"
+            message = "Codex Desktop 日志出现 unknown conversation 事件，问题在 Desktop 事件/会话层。"
+            recommendations.append("完全退出 Codex Desktop，重新打开当前会话后重测。")
+        elif has_slow_app_server_calls:
+            status = "desktop_app_server_slow"
+            action = "hard_restart_codex"
+            message = "Codex Desktop app-server 出现慢 config/read 或 skills/list。"
+            recommendations.append("先重启 Codex Desktop；若复现再收集日志。")
+
+        if versions.get("version_split"):
+            recommendations.append("注意：全局 codex CLI 与 Codex.app bundled CLI 版本不同，诊断以 Desktop bundled CLI 为准。")
+        if not recommendations:
+            recommendations.append("无需修复。")
+
+        return {
+            "ok": True,
+            "status": status,
+            "action": action,
+            "message": message,
+            "recommendations": recommendations,
+            "restart_command": "osascript -e 'quit app \"Codex\"' && open -a Codex",
+            "checks": checks,
+            "config": config,
+            "codex_native_proxy": native_proxy,
+            "process": process_state,
+            "versions": versions,
+            "logs": logs,
+            "codex_desktop": desktop,
+        }
+
+    def normalize_codex_hooks_config(self) -> dict[str, Any]:
+        config_path = DEFAULT_CODEX_HOME / "config.toml"
+        if config_path.is_symlink():
+            raise ValueError("~/.codex/config.toml 不能是符号链接")
+        if not config_path.exists():
+            return {
+                "ok": True,
+                "changed": False,
+                "message": "~/.codex/config.toml 不存在，无需清理",
+                "config_path": str(config_path),
+                "backup": None,
+            }
+        original = config_path.read_text(encoding="utf-8")
+        features = toml_section_bool_keys(original, "features")
+        updated, removed = strip_toml_section_keys(original, "features", ("codex_hooks",))
+        if removed and "hooks" not in features:
+            updated = ensure_toml_section_bool_key(updated, "features", "hooks", True)
+        if updated == original:
+            return {
+                "ok": True,
+                "changed": False,
+                "message": "活跃 config 未发现 codex_hooks",
+                "config_path": str(config_path),
+                "backup": None,
+                "removed": [],
+                "restart_required": False,
+            }
+        backup = self._backup_file(config_path, "codex-hooks-config")
+        write_private_text_file(config_path, updated)
+        return {
+            "ok": True,
+            "changed": True,
+            "message": "已清理 [features].codex_hooks，并保留 hooks=true",
+            "config_path": str(config_path),
+            "backup": backup,
+            "removed": removed,
+            "restart_required": True,
         }
 
     def services(self, *, server_port: int = DEFAULT_PORT) -> dict[str, Any]:
@@ -5848,6 +6428,13 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
                     launcher["path"] = redact_path_value(launcher.get("path"))
                     launcher["codex_home"] = redact_path_value(launcher.get("codex_home"))
                     launcher["account_id"] = mask_id_value(launcher.get("account_id"))
+            for home in row.get("codex_cli_homes", []):
+                if isinstance(home, dict):
+                    home["path"] = redact_path_value(home.get("path"))
+                    home["run_command"] = redact_path_value(home.get("run_command"))
+                    home["token_account_id"] = mask_id_value(home.get("token_account_id"))
+                    home["access_account_id"] = mask_id_value(home.get("access_account_id"))
+                    home["email"] = mask_email_value(home.get("email"))
     for quota in redacted.get("quotas", []):
         if isinstance(quota, dict):
             quota["account_id"] = mask_id_value(quota.get("account_id"))
@@ -5916,6 +6503,36 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         for process in native_proxy.get("proxy_processes", []):
             if isinstance(process, dict):
                 process.pop("command", None)
+    doctor = redacted.get("codex_desktop_doctor")
+    if isinstance(doctor, dict):
+        config = doctor.get("config")
+        if isinstance(config, dict):
+            config["config_path"] = redact_path_value(config.get("config_path"))
+            config["backup_legacy_refs"] = [redact_path_value(item) for item in config.get("backup_legacy_refs", []) if isinstance(item, str)]
+        native = doctor.get("codex_native_proxy")
+        if isinstance(native, dict):
+            native["env_path"] = redact_path_value(native.get("env_path"))
+            for key in ("proxy_url", "proxy_url_masked", "repair_proxy_url", "repair_proxy_url_masked"):
+                if native.get(key):
+                    native[key] = "<redacted>"
+        logs = doctor.get("logs")
+        if isinstance(logs, dict):
+            logs["log_root"] = redact_path_value(logs.get("log_root"))
+            logs["paths"] = [redact_path_value(item) for item in logs.get("paths", []) if isinstance(item, str)]
+        desktop_doctor = doctor.get("codex_desktop")
+        if isinstance(desktop_doctor, dict):
+            desktop_doctor["config_path"] = redact_path_value(desktop_doctor.get("config_path"))
+            desktop_doctor["base_url"] = re.sub(r"/accounts/[^/?#]+", "/accounts/<redacted>", str(desktop_doctor.get("base_url") or ""))
+            desktop_doctor["account_id"] = mask_id_value(desktop_doctor.get("account_id"))
+        versions = doctor.get("versions")
+        if isinstance(versions, dict):
+            versions["global_cli_path"] = redact_path_value(versions.get("global_cli_path"))
+            versions["bundled_cli_path"] = redact_path_value(versions.get("bundled_cli_path"))
+        process = doctor.get("process")
+        if isinstance(process, dict):
+            for item in process.get("processes", []):
+                if isinstance(item, dict):
+                    item.pop("command", None)
     return redacted
 
 
@@ -6714,9 +7331,12 @@ INDEX_HTML = """<!doctype html>
               <div id="serviceStatus" class="serviceGrid">服务状态加载中...</div>
               <div class="row">
                 <button class="miniBtn" data-action="refresh-services">刷新服务</button>
+                <button class="miniBtn" data-action="install-scan">安装扫描</button>
                 <button class="miniBtn" data-action="proxy-diagnosis">一键网络检测</button>
+                <button class="miniBtn" data-action="codex-desktop-doctor">Codex Desktop Doctor</button>
                 <button class="miniBtn" data-action="codex-native-proxy-status">诊断 Codex 原生代理</button>
                 <button class="miniBtn" data-action="repair-codex-native-proxy">修复 Codex 原生代理</button>
+                <button class="miniBtn" data-action="normalize-codex-hooks-config">清理 hooks legacy key</button>
                 <button class="miniBtn" data-action="repair-quota-query">一键修复额度查询</button>
                 <button class="miniBtn" data-action="repair-codex-env-conflicts">清理环境冲突</button>
                 <button class="miniBtn" data-action="start-local-bridge">启动 Local Bridge</button>
@@ -6725,6 +7345,8 @@ INDEX_HTML = """<!doctype html>
                 <button class="miniBtn warn" data-action="stop-bridgedeck-ui">关闭 BridgeDeck UI</button>
               </div>
               <div id="serviceMessage" class="muted mt10">关闭 BridgeDeck UI 只停 8899，不影响 8876 Local Bridge。Codex 原生代理修复只改 ~/.codex/.env，不改模型、provider 或 config.toml。</div>
+              <div id="installScan" class="recommend mt10">安装扫描未运行</div>
+              <div id="codexDesktopDoctor" class="recommend mt10">Codex Desktop Doctor 未运行</div>
               <div id="proxyDiagnosis" class="recommend">未诊断</div>
             </div>
           </section>
@@ -7528,6 +8150,45 @@ INDEX_HTML = """<!doctype html>
       const recs = Array.isArray(payload.recommendations) ? payload.recommendations.slice(0, 4) : [];
       box.innerHTML = `<b>${esc(payload.message || '代理诊断完成')}</b>${lines.length ? `<br>${lines.map((line) => esc(line)).join('<br>')}` : ''}${ownerLines.length ? `<br>${ownerLines.map((line) => esc(line)).join('<br>')}` : ''}${recs.length ? `<br>${recs.map((line) => `- ${esc(line)}`).join('<br>')}` : ''}`;
     }
+    function renderInstallScan(payload) {
+      const box = document.getElementById('installScan');
+      if (!box) return;
+      const status = payload.status || 'unknown';
+      const state = status === 'ok' ? 'okState' : (status === 'failed' ? 'badState' : 'warnState');
+      box.className = `recommend mt10 ${state}`;
+      const checks = Array.isArray(payload.checks) ? payload.checks : [];
+      const lines = checks.map((item) => `${item.label || item.id}: ${item.status || '-'}${item.detail ? ` · ${item.detail}` : ''}`);
+      const recs = Array.isArray(payload.recommendations) ? payload.recommendations.slice(0, 4) : [];
+      box.innerHTML = `<b>安装扫描：${esc(status)}</b><br><span class="muted">version ${esc(payload.version || '-')}</span>${lines.length ? `<br>${lines.map((line) => esc(line)).join('<br>')}` : ''}${recs.length ? `<br>${recs.map((line) => `- ${esc(line)}`).join('<br>')}` : ''}`;
+    }
+    async function runInstallScan() {
+      const payload = await api('/api/install-scan');
+      renderInstallScan(payload);
+      document.getElementById('serviceMessage').textContent = payload.status === 'failed' ? '安装扫描失败' : '安装扫描完成';
+      log(`安装扫描: ${payload.status || 'unknown'}`);
+      return payload;
+    }
+    function renderCodexDesktopDoctor(payload) {
+      const box = document.getElementById('codexDesktopDoctor');
+      if (!box) return;
+      const status = payload.status || 'unknown';
+      const state = status === 'healthy' ? 'okState'
+        : (['active_config_legacy_key', 'native_proxy_missing', 'native_proxy_incomplete', 'native_proxy_proxy_down', 'native_proxy_blocked', 'desktop_state_stale', 'desktop_event_session_unhealthy'].includes(status) ? 'badState' : 'warnState');
+      box.className = `recommend mt10 ${state}`;
+      const checks = Array.isArray(payload.checks) ? payload.checks : [];
+      const checkLines = checks.map((item) => `${item.label || item.id}: ${item.status || '-'}${item.detail ? ` · ${item.detail}` : ''}`);
+      const recs = Array.isArray(payload.recommendations) ? payload.recommendations.slice(0, 5) : [];
+      const versions = payload.versions || {};
+      const versionLine = versions.version_split ? `CLI 版本不同：global ${versions.global_cli_version || '-'} / app ${versions.bundled_cli_version || '-'}` : '';
+      box.innerHTML = `<b>${esc(payload.message || 'Codex Desktop Doctor 完成')}</b><br><span class="muted">status ${esc(status)} · action ${esc(payload.action || '-')}</span>${versionLine ? `<br><span class="warnText">${esc(versionLine)}</span>` : ''}${checkLines.length ? `<br>${checkLines.map((line) => esc(line)).join('<br>')}` : ''}${recs.length ? `<br>${recs.map((line) => `- ${esc(line)}`).join('<br>')}` : ''}`;
+    }
+    async function refreshCodexDesktopDoctor() {
+      const payload = await api('/api/codex-desktop-doctor');
+      renderCodexDesktopDoctor(payload);
+      document.getElementById('serviceMessage').textContent = payload.message || 'Codex Desktop Doctor 完成';
+      log(`Codex Desktop Doctor: ${payload.status || 'unknown'} / ${payload.action || '-'}`);
+      return payload;
+    }
     function renderStreamDiagnostics(data) {
       const box = document.getElementById('streamDiagnostics');
       if (!box) return;
@@ -7545,7 +8206,7 @@ INDEX_HTML = """<!doctype html>
         : '最近: -';
       const detail = latest.kind === 'client_disconnect'
         ? `上游事件 ${latest.upstream_events || 0}，下游写入 ${latest.downstream_writes || 0}，终止事件 ${latest.terminal_event_seen ? '已看到' : '未看到'}，思考 ${latest.requested_effort || '-'}/${latest.actual_effort || '-'}，工具参数 ${latest.tool_args_mode || '-'} ${latest.tool_arg_delta_events || 0}片/${latest.tool_arg_buffer_chars || 0}字。`
-        : `可见文本 ${latest.visible_text_events || 0}，reasoning ${latest.reasoning_events || 0}，tool ${latest.tool_events || 0}，terminal ${latest.terminal_events || 0}，思考 ${latest.requested_effort || '-'}/${latest.actual_effort || '-'}，工具参数 ${latest.tool_args_mode || '-'} ${latest.tool_arg_delta_events || 0}片。`;
+        : `可见文本 ${latest.visible_text_events || 0}/${latest.visible_text_chars || 0}字，结尾 ${latest.answer_end_class || '-'}${latest.answer_incomplete_risk ? ' · 疑似半句' : ''}，reasoning ${latest.reasoning_events || 0}，tool ${latest.tool_events || 0}，terminal ${latest.terminal_events || 0}，思考 ${latest.requested_effort || '-'}/${latest.actual_effort || '-'}，工具参数 ${latest.tool_args_mode || '-'} ${latest.tool_arg_delta_events || 0}片。`;
       box.innerHTML = `<b>${esc(active.request_id ? '检测到活跃流。若长时间停在 tool_arguments_streaming，通常是上游持续生成工具参数，不是断网。' : (diag.message || '流式诊断未知'))}</b><br>${esc(activeLine)}<br>${esc(latestLine)}<br>${esc(detail)}<br><span class="muted">client_disconnect ${counts.client_disconnect || 0} · idle_timeout ${counts.bridge_idle_timeout || 0} · long_stream ${counts.long_stream || 0} · stream_end ${counts.stream_end || 0}</span>`;
     }
     function renderHookRiskDiagnostics(data) {
@@ -7597,6 +8258,18 @@ INDEX_HTML = """<!doctype html>
       const box = document.getElementById('proxyDiagnosis');
       if (box) box.innerHTML = `<b>${esc(message)}</b><br>${esc(nativeProxyMessage(status))}`;
       log(`Codex 原生代理修复: ${message}`);
+      return res;
+    }
+    async function normalizeCodexHooksConfig() {
+      const res = await api('/api/normalize-codex-hooks-config', 'POST', {});
+      const message = res.restart_required
+        ? `${res.message || 'hooks config 已清理'}。完全重启 Codex Desktop 后生效。`
+        : (res.message || 'hooks config 无需清理');
+      document.getElementById('serviceMessage').textContent = message;
+      const box = document.getElementById('codexDesktopDoctor');
+      if (box) box.innerHTML = `<b>${esc(message)}</b>`;
+      log(`hooks config 清理: ${message}`);
+      await refreshCodexDesktopDoctor();
       return res;
     }
     async function controlLocalBridge(action) {
@@ -8650,6 +9323,10 @@ INDEX_HTML = """<!doctype html>
         const box = document.getElementById('serviceStatus');
         if (box) box.textContent = `服务状态失败: ${e.message}`;
       });
+      refreshCodexDesktopDoctor().catch((e) => {
+        const box = document.getElementById('codexDesktopDoctor');
+        if (box) box.textContent = `Codex Desktop Doctor 失败: ${e.message}`;
+      });
       refreshQuotas();
       if (data.auto_switch && data.auto_switch.enabled) {
         runAutoSwitch(false, false).catch((e) => log(`自动切换失败: ${e.message}`));
@@ -8913,9 +9590,12 @@ INDEX_HTML = """<!doctype html>
           if (action === 'preview-ccswitch-315-desktop-routes') return repairCcswitch315DesktopRoutes(false);
           if (action === 'apply-ccswitch-315-desktop-routes') return repairCcswitch315DesktopRoutes(true);
           if (action === 'refresh-services') return refreshServices();
+          if (action === 'install-scan') return runInstallScan();
           if (action === 'proxy-diagnosis') return runProxyDiagnosis();
+          if (action === 'codex-desktop-doctor') return refreshCodexDesktopDoctor();
           if (action === 'codex-native-proxy-status') return runCodexNativeProxyStatus();
           if (action === 'repair-codex-native-proxy') return repairCodexNativeProxy();
+          if (action === 'normalize-codex-hooks-config') return normalizeCodexHooksConfig();
           if (action === 'repair-quota-query') return repairQuotaQuery();
           if (action === 'repair-codex-env-conflicts') return repairCodexEnvConflicts();
           if (action === 'repair-claude-attribution-header') return repairClaudeAttributionHeader();
@@ -9061,6 +9741,36 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
+            if parsed.path in {"/healthz", "/api/public-health"}:
+                try:
+                    host = host_from_header(self.headers.get("Host"))
+                    if not is_loopback_host(host):
+                        json_response(self, 403, {"ok": False, "error": "Loopback host required"})
+                        return
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    payload = manager.health()
+                    if hasattr(manager, "codex_desktop_doctor"):
+                        payload["codex_desktop_doctor"] = manager.codex_desktop_doctor()
+                    payload = redact_snapshot(payload)
+                    json_response(self, 200, payload)
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
+            if parsed.path == "/api/install-scan":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    payload = bridge_install_scan()
+                    json_response(self, 200 if payload.get("ok") else 500, payload)
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
             if parsed.path == "/api/services":
                 try:
                     if not self._valid_fetch_metadata():
@@ -9072,6 +9782,21 @@ def build_handler(
                     payload = manager.services(server_port=int(self.server.server_port))
                     if not allow_sensitive:
                         payload = redact_snapshot(payload)
+                    json_response(self, 200, payload)
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
+            if parsed.path == "/api/codex-desktop-doctor":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    payload = manager.codex_desktop_doctor()
+                    if not allow_sensitive:
+                        payload = redact_snapshot({"codex_desktop_doctor": payload})["codex_desktop_doctor"]
                     json_response(self, 200, payload)
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
@@ -9336,6 +10061,10 @@ def build_handler(
                     result = manager.repair_codex_native_proxy()
                     json_response(self, 200 if result.get("ok", True) else 400, result)
                     return
+                if self.path == "/api/normalize-codex-hooks-config":
+                    result = manager.normalize_codex_hooks_config()
+                    json_response(self, 200 if result.get("ok", True) else 400, result)
+                    return
                 if self.path == "/api/repair-claude-attribution-header":
                     result = manager.repair_claude_attribution_header()
                     json_response(self, 200 if result.get("ok", True) else 400, result)
@@ -9377,11 +10106,32 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow stopping/restarting Local Bridge even when active client connections exist.",
     )
+    parser.add_argument(
+        "--install-scan",
+        action="store_true",
+        help="Run first-install compile/package scan and exit.",
+    )
+    parser.add_argument(
+        "--write-install-state",
+        action="store_true",
+        help="Write install-state marker after --install-scan.",
+    )
+    parser.add_argument(
+        "--install-scan-tests",
+        action="store_true",
+        help="Include unit tests in --install-scan.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.install_scan:
+        scan = bridge_install_scan(include_tests=bool(args.install_scan_tests))
+        if args.write_install_state:
+            write_install_state(scan)
+        print(json.dumps(scan, ensure_ascii=False))
+        return 0 if scan.get("ok") else 2
     host_is_loopback = is_loopback_host(str(args.host))
     if not args.allow_remote and not host_is_loopback:
         raise SystemExit("Refusing to listen on non-loopback host without --allow-remote")
