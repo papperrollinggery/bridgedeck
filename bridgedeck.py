@@ -39,6 +39,9 @@ DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH = Path.home() / ".claude" / "plugins" / "i
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CODEX_AUTH_PATH = DEFAULT_CODEX_HOME / "auth.json"
 CODEX_DESKTOP_LOG_ROOT = Path.home() / "Library" / "Logs" / "com.openai.codex"
+CODEX_DESKTOP_SENTRY_SCOPE_PATH = (
+    Path.home() / "Library" / "Application Support" / "Codex" / "sentry" / "scope_v3.json"
+)
 DEFAULT_INSTALL_STATE_PATH = Path(
     os.environ.get(
         "BRIDGEDECK_INSTALL_STATE_PATH",
@@ -1957,6 +1960,189 @@ def codex_desktop_log_state(*, limit: int = 5, max_bytes_per_log: int = 1_500_00
     }
 
 
+CODEX_DESKTOP_APP_STATE_NUMERIC_KEYS = (
+    "thread_count_total",
+    "thread_count_active",
+    "thread_count_streaming_owner",
+    "thread_count_streaming_with_active_runtime",
+    "thread_count_streaming_without_active_runtime",
+    "thread_count_with_inflight_turn",
+    "pending_request_count",
+    "inflight_turn_count",
+    "host_child_process_count_total",
+    "host_child_app_server_process_count",
+    "host_descendant_app_server_process_count",
+    "main_process_rss_bytes",
+    "renderer_process_working_set_kb",
+)
+CODEX_DESKTOP_APP_STATE_FRESH_SECONDS = 10 * 60
+
+
+def _timestamp_epoch(value: Any) -> tuple[float, str]:
+    if isinstance(value, bool):
+        return 0.0, ""
+    if isinstance(value, (int, float)):
+        epoch = safe_float(value, 0.0)
+        if epoch > 0:
+            return epoch, dt.datetime.fromtimestamp(epoch, dt.UTC).isoformat().replace("+00:00", "Z")
+        return 0.0, ""
+    text = str(value or "").strip()
+    if not text:
+        return 0.0, ""
+    numeric = safe_float(text, 0.0)
+    if numeric > 10_000_000:
+        return numeric, dt.datetime.fromtimestamp(numeric, dt.UTC).isoformat().replace("+00:00", "Z")
+    try:
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        parsed = dt.datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.UTC)
+        parsed = parsed.astimezone(dt.UTC)
+        return parsed.timestamp(), parsed.isoformat().replace("+00:00", "Z")
+    except ValueError:
+        return 0.0, text
+
+
+def codex_desktop_app_state(
+    scope_path: Path | None = None,
+    *,
+    max_age_seconds: int = CODEX_DESKTOP_APP_STATE_FRESH_SECONDS,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
+    path = scope_path or CODEX_DESKTOP_SENTRY_SCOPE_PATH
+    checked_at = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    base: dict[str, Any] = {
+        "ok": True,
+        "status": "missing",
+        "message": "Codex Desktop Sentry app-state 文件不存在。",
+        "scope_path": str(path),
+        "checked_at": checked_at.isoformat().replace("+00:00", "Z"),
+        "latest": {},
+        "signals": [],
+        "stale_stream_count": 0,
+        "maybe_resume_marked_streaming_count": 0,
+        "app_state_snapshot_count": 0,
+        "fresh": False,
+        "freshness_source": "",
+        "latest_age_seconds": 0,
+        "max_age_seconds": max_age_seconds,
+    }
+    if path.is_symlink():
+        return {
+            **base,
+            "ok": False,
+            "status": "unreadable",
+            "message": "Codex Desktop Sentry app-state 文件是符号链接，已跳过。",
+        }
+    if not path.exists() or not path.is_file():
+        return base
+    mtime_epoch, mtime_at = _file_mtime(path)
+    base["scope_mtime"] = mtime_at
+    base["scope_mtime_epoch"] = mtime_epoch
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return {
+            **base,
+            "ok": False,
+            "status": "unreadable",
+            "message": f"Codex Desktop Sentry app-state 读取失败：{exc}",
+        }
+
+    scope = payload.get("scope") if isinstance(payload, dict) else {}
+    breadcrumbs = scope.get("breadcrumbs") if isinstance(scope, dict) else []
+    if not isinstance(breadcrumbs, list):
+        breadcrumbs = payload.get("breadcrumbs") if isinstance(payload, dict) else []
+    if not isinstance(breadcrumbs, list):
+        breadcrumbs = []
+
+    latest: dict[str, Any] = {}
+    app_state_snapshot_count = 0
+    maybe_resume_marked_streaming_count = 0
+    latest_turn_completed_but_marked_streaming = False
+    for breadcrumb in breadcrumbs:
+        if not isinstance(breadcrumb, dict):
+            continue
+        category = str(breadcrumb.get("category") or "")
+        message = str(breadcrumb.get("message") or "")
+        data = breadcrumb.get("data") if isinstance(breadcrumb.get("data"), dict) else {}
+        if category == "app_state" and message == "app_state_snapshot":
+            app_state_snapshot_count += 1
+            latest = {key: safe_int(data.get(key), 0) for key in CODEX_DESKTOP_APP_STATE_NUMERIC_KEYS}
+            latest["snapshot_reason"] = str(data.get("snapshot_reason") or "")
+            _, timestamp_at = _timestamp_epoch(breadcrumb.get("timestamp"))
+            latest["timestamp"] = timestamp_at or str(breadcrumb.get("timestamp") or "")
+        if "maybe_resume_success" in message and "markedStreaming=true" in message:
+            maybe_resume_marked_streaming_count += 1
+            if "latestTurnStatus=completed" in message:
+                latest_turn_completed_but_marked_streaming = True
+
+    if not latest:
+        return {
+            **base,
+            "status": "no_app_state",
+            "message": "Codex Desktop Sentry scope 内没有 app_state_snapshot。",
+            "app_state_snapshot_count": 0,
+        }
+
+    stale_stream_count = safe_int(latest.get("thread_count_streaming_without_active_runtime"), 0)
+    latest_timestamp_epoch, latest_timestamp_at = _timestamp_epoch(latest.get("timestamp"))
+    freshness_source = "app_state_timestamp" if latest_timestamp_epoch else ("scope_mtime" if mtime_epoch else "")
+    freshness_epoch = latest_timestamp_epoch or mtime_epoch
+    latest_age_seconds = 0
+    fresh = False
+    if freshness_epoch:
+        latest_age_seconds = max(0, int(checked_at.timestamp() - freshness_epoch))
+        fresh = latest_age_seconds <= max(0, int(max_age_seconds))
+    app_server_children = max(
+        safe_int(latest.get("host_child_app_server_process_count"), 0),
+        safe_int(latest.get("host_descendant_app_server_process_count"), 0),
+    )
+    signals: list[str] = []
+    if stale_stream_count:
+        signals.append("streaming_without_active_runtime")
+    if latest_turn_completed_but_marked_streaming:
+        signals.append("completed_turn_marked_streaming")
+    if app_server_children >= 6:
+        signals.append("app_server_children_high")
+    if signals and not fresh:
+        signals.append("unfresh_app_state_evidence")
+
+    status = "ok"
+    message = "Codex Desktop Sentry app-state 未发现 stale streaming。"
+    ok = True
+    if stale_stream_count or latest_turn_completed_but_marked_streaming:
+        ok = False
+        if fresh:
+            status = "stale_stream_state"
+            message = "Codex Desktop 存在 streaming owner 但没有 active runtime。"
+        else:
+            status = "stale_stream_state_unfresh"
+            message = "Codex Desktop Sentry app-state 存在 stale stream 信号，但证据已过期。"
+    elif "app_server_children_high" in signals:
+        status = "app_server_children_high"
+        message = f"Codex Desktop app-server 子进程偏高：{app_server_children}。"
+
+    return {
+        **base,
+        "ok": ok,
+        "status": status,
+        "message": message,
+        "latest": latest,
+        "signals": signals,
+        "fresh": fresh,
+        "freshness_source": freshness_source,
+        "latest_timestamp": latest_timestamp_at,
+        "latest_timestamp_epoch": latest_timestamp_epoch,
+        "latest_age_seconds": latest_age_seconds,
+        "max_age_seconds": max_age_seconds,
+        "stale_stream_count": stale_stream_count,
+        "maybe_resume_marked_streaming_count": maybe_resume_marked_streaming_count,
+        "latest_turn_completed_but_marked_streaming": latest_turn_completed_but_marked_streaming,
+        "app_state_snapshot_count": app_state_snapshot_count,
+    }
+
+
 def pids_listening_on_port(port: int) -> list[int]:
     proc = run_quiet(["/usr/sbin/lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"])
     if not proc or proc.returncode not in (0, 1):
@@ -3368,6 +3554,81 @@ class BridgeManager:
             "claude_hook_risks": hook_risks,
         }
 
+    def codex_stability_route_canary(
+        self,
+        *,
+        desktop: dict[str, Any] | None = None,
+        native_proxy: dict[str, Any] | None = None,
+        app_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        desktop = desktop or self._codex_desktop_status()
+        native_proxy = native_proxy or self.codex_native_proxy_status()
+        app_state = app_state or codex_desktop_app_state()
+        bridge_running = tcp_open("127.0.0.1", LOCAL_BRIDGE_PORT)
+        route_active = desktop.get("bridge_mode") == "bridgedeck_provider"
+        fresh_stale_stream = app_state.get("status") == "stale_stream_state" and bool(app_state.get("fresh"))
+        native_status = str(native_proxy.get("status") or "unknown")
+        account_id = str(desktop.get("account_id") or "")
+        checks = [
+            {
+                "id": "fresh_app_state",
+                "status": "ok" if fresh_stale_stream else "blocked",
+                "detail": app_state.get("message", ""),
+            },
+            {
+                "id": "local_bridge",
+                "status": "ok" if bridge_running else "blocked",
+                "detail": f"http://127.0.0.1:{LOCAL_BRIDGE_PORT}",
+            },
+            {
+                "id": "native_proxy",
+                "status": "ok" if native_status == "ok" else "blocked",
+                "detail": native_proxy.get("message", ""),
+            },
+            {
+                "id": "stability_route",
+                "status": "active" if route_active else "ready",
+                "detail": desktop.get("managed_by", "unknown"),
+            },
+        ]
+        pass_criteria = [
+            "Stability Route 写入 supports_websockets=false。",
+            "完成一次真实流式任务并收到 terminal event。",
+            "重新运行 Doctor 后 stale stream count 不再增加。",
+        ]
+        if app_state.get("status") == "stale_stream_state_unfresh":
+            status = "needs_fresh_evidence"
+            action = "collect_fresh_app_state"
+            message = "Sentry app-state 证据已过期，先重新采样再启用 Stability Route canary。"
+            eligible = False
+        elif route_active and fresh_stale_stream and bridge_running:
+            status = "active"
+            action = "run_canary_stream"
+            message = "Stability Route 已启用；执行一次真实流式任务并复查 app-state。"
+            eligible = True
+        elif fresh_stale_stream and bridge_running and native_status == "ok":
+            status = "ready_to_enable"
+            action = "enable_http_bridge_mode"
+            message = "满足 guarded canary 前置条件，可以用 HTTP/SSE Stability Route 绕过原生 WebSocket。"
+            eligible = True
+        else:
+            status = "blocked"
+            action = "fix_prerequisites"
+            message = "Stability Route canary 前置条件未满足。"
+            eligible = False
+        return {
+            "ok": eligible,
+            "status": status,
+            "action": action,
+            "message": message,
+            "eligible": eligible,
+            "route_active": route_active,
+            "bridge_running": bridge_running,
+            "account_id": account_id,
+            "checks": checks,
+            "pass_criteria": pass_criteria,
+        }
+
     def codex_desktop_doctor(self) -> dict[str, Any]:
         config = codex_config_feature_state()
         desktop = self._codex_desktop_status()
@@ -3378,6 +3639,21 @@ class BridgeManager:
         )
         versions = codex_cli_version_state()
         logs = codex_desktop_log_state()
+        app_state = codex_desktop_app_state()
+        stability_route_canary = self.codex_stability_route_canary(
+            desktop=desktop,
+            native_proxy=native_proxy,
+            app_state=app_state,
+        )
+        app_state_status = str(app_state.get("status") or "unknown")
+        if app_state_status == "stale_stream_state":
+            app_state_check_status = "failed"
+        elif app_state_status == "stale_stream_state_unfresh":
+            app_state_check_status = "warning"
+        elif app_state_status in {"ok", "missing", "no_app_state"}:
+            app_state_check_status = app_state_status
+        else:
+            app_state_check_status = "warning"
 
         checks: list[dict[str, Any]] = [
             {
@@ -3407,6 +3683,12 @@ class BridgeManager:
                 ),
             },
             {
+                "id": "desktop_app_state",
+                "label": "Codex Desktop app-state",
+                "status": app_state_check_status,
+                "detail": app_state.get("message", ""),
+            },
+            {
                 "id": "desktop_logs",
                 "label": "Codex Desktop logs",
                 "status": logs.get("status", "unknown"),
@@ -3434,17 +3716,24 @@ class BridgeManager:
         has_deprecation_warning = bool(log_counts.get("codex_hooks_deprecation"))
         has_unknown_conversation = bool(log_counts.get("unknown_conversation"))
         has_slow_app_server_calls = bool(log_counts.get("slow_config_read") or log_counts.get("slow_skills_list"))
+        has_stale_stream_state = app_state_status == "stale_stream_state"
+        has_unfresh_stale_stream_state = app_state_status == "stale_stream_state_unfresh"
 
         if config.get("active_legacy_key_present"):
             status = "active_config_legacy_key"
             action = "normalize_config"
             message = "活跃 ~/.codex/config.toml 仍包含 deprecated codex_hooks。"
             recommendations.append("删除 [features].codex_hooks，保留 [features].hooks = true。")
+        elif desktop.get("bridge_mode") == "bridgedeck_provider" and has_stale_stream_state:
+            status = "stability_route_canary_active"
+            action = "run_canary_stream"
+            message = "Codex Desktop 已处于 Stability Route；执行一次真实流式任务后复查 app-state。"
+            recommendations.append("运行一个短流式任务，然后重新运行 Doctor；通过条件是 terminal event 正常且 stale stream count 不再增加。")
         elif desktop.get("bridge_mode") == "bridgedeck_provider":
             status = "bridge_mode_active"
             action = "restore_native_mode"
-            message = "Codex Desktop 当前处于 BridgeDeck 临时 Bridge 模式。"
-            recommendations.append("如果不是刻意绕过原生路径，先恢复 Codex Desktop 原生模式。")
+            message = "Codex Desktop 当前处于 BridgeDeck Stability Route。"
+            recommendations.append("如果不是刻意绕过原生 WebSocket，恢复 Codex Desktop 原生模式。")
         elif native_status in {"missing", "incomplete", "proxy_down", "blocked"}:
             status = f"native_proxy_{native_status}"
             action = "repair_env" if native_status in {"missing", "incomplete"} else "start_proxy"
@@ -3452,6 +3741,17 @@ class BridgeManager:
             recommendations.append("只修复 ~/.codex/.env；不要改 model/provider。")
             if native_status != "blocked":
                 recommendations.append("修复后完全退出并重启 Codex Desktop。")
+        elif has_stale_stream_state:
+            status = "desktop_stream_state_stale"
+            action = "run_stability_route_canary"
+            message = str(app_state.get("message") or "Codex Desktop streaming 状态卡在无 runtime。")
+            recommendations.append("以 canary 方式启用 BridgeDeck Stability Route（HTTP/SSE，supports_websockets=false）绕过 Codex 原生 WebSocket。")
+            recommendations.append("完成一次真实流式任务后重新运行 Doctor；通过后再把 Stability Route 作为正式恢复动作。")
+        elif has_unfresh_stale_stream_state:
+            status = "desktop_app_state_unfresh"
+            action = "collect_fresh_app_state"
+            message = str(app_state.get("message") or "Codex Desktop app-state 证据已过期。")
+            recommendations.append("先重新运行 Doctor 采集新鲜 app-state，再决定是否启用 Stability Route canary。")
         elif process_state.get("restart_required"):
             status = "desktop_state_stale"
             action = "hard_restart_codex"
@@ -3491,6 +3791,8 @@ class BridgeManager:
             "process": process_state,
             "versions": versions,
             "logs": logs,
+            "app_state": app_state,
+            "stability_route_canary": stability_route_canary,
             "codex_desktop": desktop,
         }
 
@@ -5893,7 +6195,7 @@ class BridgeManager:
                 return {
                     "ok": True,
                     "changed": False,
-                    "message": "Codex Desktop 临时 Bridge 模式已是当前配置",
+                    "message": "Codex Desktop Stability Route 已是当前配置",
                     "account_id": account_id,
                     "config_path": str(config_path),
                     "base_url": f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1",
@@ -5906,7 +6208,7 @@ class BridgeManager:
             return {
                 "ok": True,
                 "changed": True,
-                "message": "已开启 Codex Desktop 临时 Bridge 模式",
+                "message": "已开启 Codex Desktop Stability Route",
                 "account_id": account_id,
                 "email": account_payload.get("email", ""),
                 "config_path": str(config_path),
@@ -6519,6 +6821,9 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(logs, dict):
             logs["log_root"] = redact_path_value(logs.get("log_root"))
             logs["paths"] = [redact_path_value(item) for item in logs.get("paths", []) if isinstance(item, str)]
+        app_state = doctor.get("app_state")
+        if isinstance(app_state, dict):
+            app_state["scope_path"] = redact_path_value(app_state.get("scope_path"))
         desktop_doctor = doctor.get("codex_desktop")
         if isinstance(desktop_doctor, dict):
             desktop_doctor["config_path"] = redact_path_value(desktop_doctor.get("config_path"))
@@ -7477,7 +7782,7 @@ INDEX_HTML = """<!doctype html>
           '“当前实际”显示 CC Switch 当前 Claude Provider。',
           '单独 Codex CLI 只生成独立启动器，不改变全局默认。',
           '全局 Codex CLI 只生成固定入口和 OMC/tmux shim，不改 Codex Desktop。',
-          'Codex Desktop 临时 Bridge 模式必须手动开启，随时可恢复原生。',
+          'Codex Desktop Stability Route 必须手动开启，随时可恢复原生。',
           '三个入口可以同号，也可以不同号。',
           '下方高级区只在排查时使用。'
         ]
@@ -8173,7 +8478,7 @@ INDEX_HTML = """<!doctype html>
       if (!box) return;
       const status = payload.status || 'unknown';
       const state = status === 'healthy' ? 'okState'
-        : (['active_config_legacy_key', 'native_proxy_missing', 'native_proxy_incomplete', 'native_proxy_proxy_down', 'native_proxy_blocked', 'desktop_state_stale', 'desktop_event_session_unhealthy'].includes(status) ? 'badState' : 'warnState');
+        : (['active_config_legacy_key', 'native_proxy_missing', 'native_proxy_incomplete', 'native_proxy_proxy_down', 'native_proxy_blocked', 'desktop_state_stale', 'desktop_stream_state_stale', 'desktop_app_state_unfresh', 'desktop_event_session_unhealthy'].includes(status) ? 'badState' : 'warnState');
       box.className = `recommend mt10 ${state}`;
       const checks = Array.isArray(payload.checks) ? payload.checks : [];
       const checkLines = checks.map((item) => `${item.label || item.id}: ${item.status || '-'}${item.detail ? ` · ${item.detail}` : ''}`);
@@ -9163,7 +9468,7 @@ INDEX_HTML = """<!doctype html>
         default: '默认配置',
         custom: '自定义配置',
         cc_switch: 'CC Switch',
-        bridgedeck_provider: 'BridgeDeck 临时模式',
+        bridgedeck_provider: 'BridgeDeck Stability Route',
         bridgedeck_or_local_bridge: 'BridgeDeck 本地桥',
         unknown: '未知'
       };
@@ -9404,8 +9709,8 @@ INDEX_HTML = """<!doctype html>
     async function enableDesktopBridgeMode() {
       const item = selectedAccount('simpleDefaultAccount') || selectedAccount('simpleApiAccount') || selectedAccount('simpleClaudeAccount');
       if (!item) return setSimpleResult('先选择一个账号。', 'warn');
-      if (!confirm('临时 Bridge 模式会写入 ~/.codex/config.toml 的 model_provider=bridgedeck。仅用于救急测试，之后可点“恢复原生”。继续？')) return;
-      setSimpleResult(`正在开启 Codex Desktop 临时 Bridge 模式：${accountLabel(item)}...`);
+      if (!confirm('Stability Route 会写入 ~/.codex/config.toml 的 model_provider=bridgedeck，并设置 supports_websockets=false。用于 canary 验证后可恢复原生。继续？')) return;
+      setSimpleResult(`正在开启 Codex Desktop Stability Route：${accountLabel(item)}...`);
       const res = await api('/api/codex-desktop-bridge-mode', 'POST', { account_id: item.account_id });
       await refreshData();
       const backup = res.backup ? `；备份：${humanPath(res.backup)}` : '';

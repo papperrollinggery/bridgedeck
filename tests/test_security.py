@@ -471,7 +471,7 @@ class FakeManager:
         return {"ok": True, "account_id": account_id, "desktop_affected": False}
 
     def enable_codex_desktop_bridge_mode(self, account_id: str) -> dict[str, Any]:
-        return {"ok": True, "account_id": account_id, "message": "已开启 Codex Desktop 临时 Bridge 模式"}
+        return {"ok": True, "account_id": account_id, "message": "已开启 Codex Desktop Stability Route"}
 
     def restore_codex_desktop_native_mode(self) -> dict[str, Any]:
         return {"ok": True, "changed": True, "message": "已恢复 Codex Desktop 原生配置"}
@@ -2914,6 +2914,123 @@ class CodexDesktopDoctorCase(ServerCase):
             "last_seen": {},
         }
 
+    def ok_app_state(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "status": "ok",
+            "message": "Codex Desktop Sentry app-state 未发现 stale streaming。",
+            "scope_path": "",
+            "latest": {},
+            "signals": [],
+            "stale_stream_count": 0,
+            "maybe_resume_marked_streaming_count": 0,
+            "app_state_snapshot_count": 0,
+            "fresh": True,
+            "latest_age_seconds": 0,
+        }
+
+    def stale_app_state(self) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "status": "stale_stream_state",
+            "message": "Codex Desktop 存在 streaming owner 但没有 active runtime。",
+            "scope_path": "",
+            "latest": {"thread_count_streaming_without_active_runtime": 2},
+            "signals": ["streaming_without_active_runtime"],
+            "stale_stream_count": 2,
+            "maybe_resume_marked_streaming_count": 0,
+            "app_state_snapshot_count": 1,
+            "fresh": True,
+            "latest_age_seconds": 30,
+        }
+
+    def unfresh_stale_app_state(self) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "status": "stale_stream_state_unfresh",
+            "message": "Codex Desktop Sentry app-state 存在 stale stream 信号，但证据已过期。",
+            "scope_path": "",
+            "latest": {"thread_count_streaming_without_active_runtime": 2},
+            "signals": ["streaming_without_active_runtime", "unfresh_app_state_evidence"],
+            "stale_stream_count": 2,
+            "maybe_resume_marked_streaming_count": 0,
+            "app_state_snapshot_count": 1,
+            "fresh": False,
+            "latest_age_seconds": 1200,
+        }
+
+    def test_codex_desktop_app_state_detects_stale_streaming_without_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            scope_path = Path(tmp) / "scope_v3.json"
+            scope_path.write_text(
+                json.dumps(
+                    {
+                        "scope": {
+                            "breadcrumbs": [
+                                {
+                                    "category": "app_state",
+                                    "message": "app_state_snapshot",
+                                    "timestamp": "2026-05-24T00:00:00.000Z",
+                                    "data": {
+                                        "thread_count_total": 4,
+                                        "thread_count_active": 1,
+                                        "thread_count_streaming_owner": 3,
+                                        "thread_count_streaming_with_active_runtime": 0,
+                                        "thread_count_streaming_without_active_runtime": 3,
+                                        "pending_request_count": 0,
+                                        "inflight_turn_count": 0,
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            now = bridgedeck.dt.datetime(2026, 5, 24, 0, 1, tzinfo=bridgedeck.dt.UTC)
+            result = bridgedeck.codex_desktop_app_state(scope_path, now=now)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "stale_stream_state")
+        self.assertEqual(result["stale_stream_count"], 3)
+        self.assertTrue(result["fresh"])
+        self.assertIn("streaming_without_active_runtime", result["signals"])
+
+    def test_codex_desktop_app_state_marks_old_stale_evidence_unfresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            scope_path = Path(tmp) / "scope_v3.json"
+            scope_path.write_text(
+                json.dumps(
+                    {
+                        "scope": {
+                            "breadcrumbs": [
+                                {
+                                    "category": "app_state",
+                                    "message": "app_state_snapshot",
+                                    "timestamp": "2026-05-24T00:00:00.000Z",
+                                    "data": {
+                                        "thread_count_streaming_owner": 1,
+                                        "thread_count_streaming_with_active_runtime": 0,
+                                        "thread_count_streaming_without_active_runtime": 1,
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            now = bridgedeck.dt.datetime(2026, 5, 24, 0, 30, tzinfo=bridgedeck.dt.UTC)
+            result = bridgedeck.codex_desktop_app_state(scope_path, now=now, max_age_seconds=600)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "stale_stream_state_unfresh")
+        self.assertFalse(result["fresh"])
+        self.assertGreaterEqual(result["latest_age_seconds"], 1800)
+        self.assertIn("unfresh_app_state_evidence", result["signals"])
+
     def test_doctor_classifies_active_legacy_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2928,11 +3045,86 @@ class CodexDesktopDoctorCase(ServerCase):
                 mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state()),
                 mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
                 mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state()),
+                mock.patch.object(bridgedeck, "codex_desktop_app_state", return_value=self.ok_app_state()),
             ):
                 result = manager.codex_desktop_doctor()
 
         self.assertEqual(result["status"], "active_config_legacy_key")
         self.assertEqual(result["action"], "normalize_config")
+
+    def test_doctor_classifies_stale_streaming_state_as_http_bridge_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text("[features]\nhooks = true\n", encoding="utf-8")
+            manager = self.make_manager(root)
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(manager, "codex_native_proxy_status", return_value=self.ok_native_proxy()),
+                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state(restart_required=True)),
+                mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
+                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state(deprecation=2)),
+                mock.patch.object(bridgedeck, "codex_desktop_app_state", return_value=self.stale_app_state()),
+                mock.patch.object(bridgedeck, "tcp_open", return_value=True),
+            ):
+                result = manager.codex_desktop_doctor()
+
+        self.assertEqual(result["status"], "desktop_stream_state_stale")
+        self.assertEqual(result["action"], "run_stability_route_canary")
+        self.assertEqual(result["app_state"]["stale_stream_count"], 2)
+        self.assertEqual(result["stability_route_canary"]["status"], "ready_to_enable")
+        self.assertEqual(result["stability_route_canary"]["action"], "enable_http_bridge_mode")
+        self.assertNotIn("重启", "\n".join(result["recommendations"]))
+
+    def test_doctor_requires_fresh_app_state_before_canary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text("[features]\nhooks = true\n", encoding="utf-8")
+            manager = self.make_manager(root)
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(manager, "codex_native_proxy_status", return_value=self.ok_native_proxy()),
+                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state(restart_required=True)),
+                mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
+                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state(deprecation=2)),
+                mock.patch.object(bridgedeck, "codex_desktop_app_state", return_value=self.unfresh_stale_app_state()),
+                mock.patch.object(bridgedeck, "tcp_open", return_value=True),
+            ):
+                result = manager.codex_desktop_doctor()
+
+        self.assertEqual(result["status"], "desktop_app_state_unfresh")
+        self.assertEqual(result["action"], "collect_fresh_app_state")
+        self.assertEqual(result["stability_route_canary"]["status"], "needs_fresh_evidence")
+        self.assertNotIn("重启", "\n".join(result["recommendations"]))
+
+    def test_doctor_keeps_active_stability_route_in_canary_mode_for_stale_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(bridgedeck.codex_desktop_bridge_block("acct-1"), encoding="utf-8")
+            manager = self.make_manager(root)
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(manager, "codex_native_proxy_status", return_value=self.ok_native_proxy()),
+                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state()),
+                mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
+                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state()),
+                mock.patch.object(bridgedeck, "codex_desktop_app_state", return_value=self.stale_app_state()),
+                mock.patch.object(bridgedeck, "tcp_open", return_value=True),
+            ):
+                result = manager.codex_desktop_doctor()
+
+        self.assertEqual(result["status"], "stability_route_canary_active")
+        self.assertEqual(result["action"], "run_canary_stream")
+        self.assertEqual(result["stability_route_canary"]["status"], "active")
+        self.assertNotEqual(result["action"], "restore_native_mode")
 
     def test_doctor_prefers_stale_process_before_upstream_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2948,6 +3140,7 @@ class CodexDesktopDoctorCase(ServerCase):
                 mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state(restart_required=True)),
                 mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
                 mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state(deprecation=2)),
+                mock.patch.object(bridgedeck, "codex_desktop_app_state", return_value=self.ok_app_state()),
             ):
                 result = manager.codex_desktop_doctor()
 
@@ -2968,6 +3161,7 @@ class CodexDesktopDoctorCase(ServerCase):
                 mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state()),
                 mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
                 mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state(deprecation=2)),
+                mock.patch.object(bridgedeck, "codex_desktop_app_state", return_value=self.ok_app_state()),
             ):
                 result = manager.codex_desktop_doctor()
 
@@ -3082,7 +3276,7 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertIn("refreshData(true)", html)
         self.assertIn("单独 Codex CLI", html)
         self.assertIn("全局 Codex CLI", html)
-        self.assertIn("Codex Desktop 临时 Bridge 模式", html)
+        self.assertIn("Codex Desktop Stability Route", html)
         self.assertIn('data-action="enable-desktop-bridge-mode"', html)
         self.assertIn('data-action="restore-desktop-native-mode"', html)
         self.assertIn("codex-current.command", html)
@@ -3197,7 +3391,7 @@ class CodexDesktopDoctorCase(ServerCase):
             headers={"X-CCSBT-Token": "test-token"},
         )
         self.assertEqual(status, 200)
-        self.assertEqual(payload["message"], "已开启 Codex Desktop 临时 Bridge 模式")
+        self.assertEqual(payload["message"], "已开启 Codex Desktop Stability Route")
 
         status, payload = self.request(
             server,
