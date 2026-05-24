@@ -189,6 +189,10 @@ MANAGED_CODEX_PATH_START = "# >>> BridgeDeck codex shim >>>"
 MANAGED_CODEX_PATH_END = "# <<< BridgeDeck codex shim <<<"
 MANAGED_CODEX_DESKTOP_BRIDGE_START = "# >>> BridgeDeck temporary Codex Desktop bridge >>>"
 MANAGED_CODEX_DESKTOP_BRIDGE_END = "# <<< BridgeDeck temporary Codex Desktop bridge <<<"
+CODEX_DESKTOP_BRIDGE_DISABLED_REASON = "codex_desktop_compact_route_unsupported"
+CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE = (
+    "Codex Desktop Stability Route 已禁用：Local Bridge 不支持 /v1/responses/compact，启用会导致上下文压缩 404。"
+)
 PROXY_DIAG_OPENAI_URL = "https://api.openai.com/v1/models"
 PROXY_DIAG_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_PROXY_LOOKUP_KEYS = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy")
@@ -636,7 +640,7 @@ def strip_legacy_bridgedeck_provider_config(text: str, *, remove_static_keys: bo
         if in_top_level and top_level_key_pattern.match(line):
             removed.append("model_provider")
             continue
-        if in_top_level and (legacy_provider or remove_static_keys) and legacy_static_key_pattern.match(line):
+        if in_top_level and remove_static_keys and legacy_static_key_pattern.match(line):
             removed.append(legacy_static_key_pattern.match(line).group(1))  # type: ignore[union-attr]
             continue
         output.append(line)
@@ -3587,34 +3591,39 @@ class BridgeManager:
             },
             {
                 "id": "stability_route",
-                "status": "active" if route_active else "ready",
+                "status": "blocked",
                 "detail": desktop.get("managed_by", "unknown"),
+            },
+            {
+                "id": "compact_route",
+                "status": "blocked",
+                "detail": "Local Bridge 当前未实现 /v1/responses/compact。",
             },
         ]
         pass_criteria = [
-            "Stability Route 写入 supports_websockets=false。",
-            "完成一次真实流式任务并收到 terminal event。",
-            "重新运行 Doctor 后 stale stream count 不再增加。",
+            "先补齐 Local Bridge /v1/responses/compact 兼容端点。",
+            "确认不会写入 model/provider/model_reasoning_effort。",
+            "再用真实 Codex Desktop 会话验证上下文压缩。",
         ]
-        if app_state.get("status") == "stale_stream_state_unfresh":
+        if route_active:
+            status = "unsafe_active"
+            action = "restore_native_mode"
+            message = CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE
+            eligible = False
+        elif app_state.get("status") == "stale_stream_state_unfresh":
             status = "needs_fresh_evidence"
             action = "collect_fresh_app_state"
-            message = "Sentry app-state 证据已过期，先重新采样再启用 Stability Route canary。"
+            message = "Sentry app-state 证据已过期；Stability Route 暂不启用。"
             eligible = False
-        elif route_active and fresh_stale_stream and bridge_running:
-            status = "active"
-            action = "run_canary_stream"
-            message = "Stability Route 已启用；执行一次真实流式任务并复查 app-state。"
-            eligible = True
         elif fresh_stale_stream and bridge_running and native_status == "ok":
-            status = "ready_to_enable"
-            action = "enable_http_bridge_mode"
-            message = "满足 guarded canary 前置条件，可以用 HTTP/SSE Stability Route 绕过原生 WebSocket。"
-            eligible = True
+            status = "disabled"
+            action = "keep_native_mode"
+            message = CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE
+            eligible = False
         else:
-            status = "blocked"
-            action = "fix_prerequisites"
-            message = "Stability Route canary 前置条件未满足。"
+            status = "disabled"
+            action = "keep_native_mode"
+            message = CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE
             eligible = False
         return {
             "ok": eligible,
@@ -3724,16 +3733,11 @@ class BridgeManager:
             action = "normalize_config"
             message = "活跃 ~/.codex/config.toml 仍包含 deprecated codex_hooks。"
             recommendations.append("删除 [features].codex_hooks，保留 [features].hooks = true。")
-        elif desktop.get("bridge_mode") == "bridgedeck_provider" and has_stale_stream_state:
-            status = "stability_route_canary_active"
-            action = "run_canary_stream"
-            message = "Codex Desktop 已处于 Stability Route；执行一次真实流式任务后复查 app-state。"
-            recommendations.append("运行一个短流式任务，然后重新运行 Doctor；通过条件是 terminal event 正常且 stale stream count 不再增加。")
         elif desktop.get("bridge_mode") == "bridgedeck_provider":
-            status = "bridge_mode_active"
+            status = "bridge_mode_unsupported"
             action = "restore_native_mode"
-            message = "Codex Desktop 当前处于 BridgeDeck Stability Route。"
-            recommendations.append("如果不是刻意绕过原生 WebSocket，恢复 Codex Desktop 原生模式。")
+            message = CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE
+            recommendations.append("恢复 Codex Desktop 原生模式；只移除 BridgeDeck provider，不清理模型或思考等级。")
         elif native_status in {"missing", "incomplete", "proxy_down", "blocked"}:
             status = f"native_proxy_{native_status}"
             action = "repair_env" if native_status in {"missing", "incomplete"} else "start_proxy"
@@ -3743,15 +3747,15 @@ class BridgeManager:
                 recommendations.append("修复后完全退出并重启 Codex Desktop。")
         elif has_stale_stream_state:
             status = "desktop_stream_state_stale"
-            action = "run_stability_route_canary"
+            action = "keep_native_mode"
             message = str(app_state.get("message") or "Codex Desktop streaming 状态卡在无 runtime。")
-            recommendations.append("以 canary 方式启用 BridgeDeck Stability Route（HTTP/SSE，supports_websockets=false）绕过 Codex 原生 WebSocket。")
-            recommendations.append("完成一次真实流式任务后重新运行 Doctor；通过后再把 Stability Route 作为正式恢复动作。")
+            recommendations.append("保持 Codex Desktop 原生配置；不要启用 Stability Route。")
+            recommendations.append("先补齐 Local Bridge /v1/responses/compact 兼容后，再评估是否恢复路由。")
         elif has_unfresh_stale_stream_state:
             status = "desktop_app_state_unfresh"
             action = "collect_fresh_app_state"
             message = str(app_state.get("message") or "Codex Desktop app-state 证据已过期。")
-            recommendations.append("先重新运行 Doctor 采集新鲜 app-state，再决定是否启用 Stability Route canary。")
+            recommendations.append("先重新采样 app-state；Stability Route 暂不启用。")
         elif process_state.get("restart_required"):
             status = "desktop_state_stale"
             action = "hard_restart_codex"
@@ -6173,51 +6177,15 @@ class BridgeManager:
         account_id = account_id.strip()
         if not account_id:
             raise ValueError("account_id 不能为空")
-        with self._lock:
-            store = self._load_auth_store_raw()
-            accounts = store.get("accounts")
-            if not isinstance(accounts, dict):
-                raise ValueError("auth store 缺少 accounts")
-            account_payload = accounts.get(account_id)
-            if not isinstance(account_payload, dict):
-                raise ValueError(f"未找到账号: {account_id}")
-            config_path = DEFAULT_CODEX_HOME / "config.toml"
-            if config_path.is_symlink():
-                raise ValueError("~/.codex/config.toml 不能是符号链接")
-            DEFAULT_CODEX_HOME.mkdir(parents=True, exist_ok=True)
-            os.chmod(DEFAULT_CODEX_HOME, 0o700)
-            original = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-            cleaned, stripped_managed = strip_managed_codex_desktop_bridge(original)
-            cleaned, stripped_legacy_keys = strip_legacy_bridgedeck_provider_config(cleaned, remove_static_keys=True)
-            block = codex_desktop_bridge_block(account_id)
-            updated = f"{block}{cleaned.lstrip()}" if cleaned.strip() else block
-            if updated == original:
-                return {
-                    "ok": True,
-                    "changed": False,
-                    "message": "Codex Desktop Stability Route 已是当前配置",
-                    "account_id": account_id,
-                    "config_path": str(config_path),
-                    "base_url": f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1",
-                    "backup": None,
-                    "stripped_managed": stripped_managed,
-                    "stripped_legacy_keys": stripped_legacy_keys,
-                }
-            backup = self._backup_file(config_path, "codex-desktop-bridge-mode") if config_path.exists() else None
-            write_private_text_file(config_path, updated)
-            return {
-                "ok": True,
-                "changed": True,
-                "message": "已开启 Codex Desktop Stability Route",
-                "account_id": account_id,
-                "email": account_payload.get("email", ""),
-                "config_path": str(config_path),
-                "base_url": f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1",
-                "backup": backup,
-                "stripped_managed": stripped_managed,
-                "stripped_legacy_keys": stripped_legacy_keys,
-                "restart_required": True,
-            }
+        return {
+            "ok": False,
+            "changed": False,
+            "message": CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE,
+            "blocked_reason": CODEX_DESKTOP_BRIDGE_DISABLED_REASON,
+            "account_id": account_id,
+            "config_path": str(DEFAULT_CODEX_HOME / "config.toml"),
+            "restart_required": False,
+        }
 
     def restore_codex_desktop_native_mode(self) -> dict[str, Any]:
         with self._lock:
@@ -6235,7 +6203,7 @@ class BridgeManager:
                 }
             original = config_path.read_text(encoding="utf-8")
             updated, stripped_managed = strip_managed_codex_desktop_bridge(original)
-            updated, stripped_legacy_keys = strip_legacy_bridgedeck_provider_config(updated, remove_static_keys=True)
+            updated, stripped_legacy_keys = strip_legacy_bridgedeck_provider_config(updated, remove_static_keys=False)
             removed = [*stripped_legacy_keys]
             if stripped_managed:
                 removed.append("managed_bridge_block")
@@ -7379,15 +7347,15 @@ INDEX_HTML = """<!doctype html>
                 <div class="toolCard">
                   <div>
                     <div class="toolName">Codex Desktop</div>
-                    <div class="toolText">默认保持原生。恢复原生会移除 BridgeDeck provider 和静态模型/思考等级残留；代理修复只写 .env。</div>
+                    <div class="toolText">默认保持原生。Stability Route 已禁用；恢复原生只移除 BridgeDeck provider，代理修复只写 .env。</div>
                     <div class="actualRow">
                       <div class="actualLine" id="simpleDesktopActual">当前实际：检测中...</div>
                       <button class="miniBtn" data-action="refresh">刷新</button>
                     </div>
                   </div>
                   <div class="apiEnvActions">
-                    <button class="miniBtn warn" data-action="enable-desktop-bridge-mode">临时接入 BridgeDeck</button>
-                    <button class="miniBtn" data-action="restore-desktop-native-mode">恢复原生/清理静态项</button>
+                    <button class="miniBtn warn" data-action="enable-desktop-bridge-mode" disabled title="Local Bridge 不支持 /v1/responses/compact">Stability Route 已禁用</button>
+                    <button class="miniBtn" data-action="restore-desktop-native-mode">恢复原生</button>
                     <button class="miniBtn" data-action="scroll" data-target="statusCard">查看状态</button>
                   </div>
                 </div>
@@ -7782,7 +7750,7 @@ INDEX_HTML = """<!doctype html>
           '“当前实际”显示 CC Switch 当前 Claude Provider。',
           '单独 Codex CLI 只生成独立启动器，不改变全局默认。',
           '全局 Codex CLI 只生成固定入口和 OMC/tmux shim，不改 Codex Desktop。',
-          'Codex Desktop Stability Route 必须手动开启，随时可恢复原生。',
+          'Codex Desktop Stability Route 已禁用，保留原生配置。',
           '三个入口可以同号，也可以不同号。',
           '下方高级区只在排查时使用。'
         ]
@@ -9707,15 +9675,7 @@ INDEX_HTML = """<!doctype html>
       log(`${res.message}: ${currentLauncher || humanPath(res.current_launcher || '')}`);
     }
     async function enableDesktopBridgeMode() {
-      const item = selectedAccount('simpleDefaultAccount') || selectedAccount('simpleApiAccount') || selectedAccount('simpleClaudeAccount');
-      if (!item) return setSimpleResult('先选择一个账号。', 'warn');
-      if (!confirm('Stability Route 会写入 ~/.codex/config.toml 的 model_provider=bridgedeck，并设置 supports_websockets=false。用于 canary 验证后可恢复原生。继续？')) return;
-      setSimpleResult(`正在开启 Codex Desktop Stability Route：${accountLabel(item)}...`);
-      const res = await api('/api/codex-desktop-bridge-mode', 'POST', { account_id: item.account_id });
-      await refreshData();
-      const backup = res.backup ? `；备份：${humanPath(res.backup)}` : '';
-      setSimpleResult(`${res.message}：${accountLabel(item)}${backup}。重启 Codex Desktop 后生效。`, 'warn');
-      log(`${res.message}: ${humanPath(res.config_path)}${backup}`);
+      setSimpleResult('Codex Desktop Stability Route 已禁用：Local Bridge 不支持 /v1/responses/compact，不写入 ~/.codex/config.toml。', 'warn');
     }
     async function restoreDesktopNativeMode() {
       const res = await api('/api/codex-desktop-native-mode', 'POST', {});
@@ -10291,7 +10251,7 @@ def build_handler(
                 if self.path == "/api/codex-desktop-bridge-mode":
                     account_id = str(payload.get("account_id") or "")
                     result = manager.enable_codex_desktop_bridge_mode(account_id)
-                    json_response(self, 200, result)
+                    json_response(self, 200 if result.get("ok", True) else 409, result)
                     return
                 if self.path == "/api/codex-desktop-native-mode":
                     result = manager.restore_codex_desktop_native_mode()

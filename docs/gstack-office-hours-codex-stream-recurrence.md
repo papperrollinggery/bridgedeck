@@ -4,7 +4,23 @@ Date: 2026-05-24
 Branch: `codex/gstack-office-hours-plan`
 Scope: BridgeDeck product/design plan plus Milestone 1 implementation in the Codex-visible worktree.
 
-## Execution Update
+## Rollback Update
+
+Current branch disables Codex Desktop Stability Route.
+
+Reason:
+- Codex Desktop also calls `/v1/responses/compact`.
+- Current Local Bridge supports `/v1/responses` streaming, but not `/v1/responses/compact`.
+- Enabling the route can therefore keep normal prompts working while breaking context compaction with 404.
+
+Changed now:
+- `/api/codex-desktop-bridge-mode` returns blocked instead of writing `~/.codex/config.toml`.
+- UI marks Stability Route disabled.
+- Doctor no longer recommends `enable_http_bridge_mode`.
+- Restore native mode only removes BridgeDeck provider config; it preserves `model`, `model_reasoning_effort`, and `service_tier`.
+- Future work must add and verify compact-route compatibility before this route can be enabled again.
+
+## Prior Execution Update
 
 Milestone 1 plus Council hardening is implemented in this branch.
 
@@ -12,7 +28,7 @@ Changed:
 - Added a read-only Codex Desktop Sentry app-state reader for `scope_v3.json`.
 - Added `desktop_app_state` to Codex Desktop Doctor checks.
 - Classified stale Desktop stream ownership as `desktop_stream_state_stale`.
-- Changed the stale-stream action to `run_stability_route_canary`.
+- Changed the stale-stream action to `run_stability_route_canary` during the prior canary; superseded by the rollback update above.
 - Added app-state freshness checks so old Sentry evidence cannot directly trigger route changes.
 - Added `stability_route_canary` output with guarded preconditions and pass criteria.
 - Renamed the visible Bridge route wording to `Stability Route`.
@@ -29,7 +45,7 @@ Verified:
 - Live read-only Doctor check on this machine returned `desktop_stream_state_stale` with action `run_stability_route_canary`; `stability_route_canary` returned `ready_to_enable` / `enable_http_bridge_mode`.
 
 Next plan:
-- Milestone 2 should run the actual canary: enable Stability Route, execute one real streaming task, then compare fresh app-state before and after.
+- Do not enable Stability Route until Local Bridge supports `/v1/responses/compact`.
 - Milestone 3 should add provider capability matrix storage and request shaping.
 - Milestone 4 should add provider/account circuit breakers.
 
@@ -60,7 +76,8 @@ Remaining observation:
 - The primary Codex Desktop app-server started before the config change, so any current in-flight Desktop session may still be using old in-memory state until that runtime reloads config.
 
 Restore path:
-- Run `BridgeManager.restore_codex_desktop_native_mode()` or use the UI action `恢复原生/清理静态项`.
+- Run `BridgeManager.restore_codex_desktop_native_mode()` or use the UI action `恢复原生`.
+- The restore path preserves static model, reasoning-effort, and service-tier keys.
 - Keep the backup path above as the exact pre-canary config snapshot.
 
 ## Decision

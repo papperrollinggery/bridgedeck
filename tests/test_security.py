@@ -471,7 +471,13 @@ class FakeManager:
         return {"ok": True, "account_id": account_id, "desktop_affected": False}
 
     def enable_codex_desktop_bridge_mode(self, account_id: str) -> dict[str, Any]:
-        return {"ok": True, "account_id": account_id, "message": "已开启 Codex Desktop Stability Route"}
+        return {
+            "ok": False,
+            "changed": False,
+            "account_id": account_id,
+            "message": bridgedeck.CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE,
+            "blocked_reason": bridgedeck.CODEX_DESKTOP_BRIDGE_DISABLED_REASON,
+        }
 
     def restore_codex_desktop_native_mode(self) -> dict[str, Any]:
         return {"ok": True, "changed": True, "message": "已恢复 Codex Desktop 原生配置"}
@@ -3052,7 +3058,7 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertEqual(result["status"], "active_config_legacy_key")
         self.assertEqual(result["action"], "normalize_config")
 
-    def test_doctor_classifies_stale_streaming_state_as_http_bridge_route(self) -> None:
+    def test_doctor_classifies_stale_streaming_state_without_enabling_bridge_route(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             codex_home = root / ".codex"
@@ -3072,10 +3078,12 @@ class CodexDesktopDoctorCase(ServerCase):
                 result = manager.codex_desktop_doctor()
 
         self.assertEqual(result["status"], "desktop_stream_state_stale")
-        self.assertEqual(result["action"], "run_stability_route_canary")
+        self.assertEqual(result["action"], "keep_native_mode")
         self.assertEqual(result["app_state"]["stale_stream_count"], 2)
-        self.assertEqual(result["stability_route_canary"]["status"], "ready_to_enable")
-        self.assertEqual(result["stability_route_canary"]["action"], "enable_http_bridge_mode")
+        self.assertEqual(result["stability_route_canary"]["status"], "disabled")
+        self.assertEqual(result["stability_route_canary"]["action"], "keep_native_mode")
+        self.assertFalse(result["stability_route_canary"]["ok"])
+        self.assertIn("/v1/responses/compact", result["stability_route_canary"]["message"])
         self.assertNotIn("重启", "\n".join(result["recommendations"]))
 
     def test_doctor_requires_fresh_app_state_before_canary(self) -> None:
@@ -3100,9 +3108,10 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertEqual(result["status"], "desktop_app_state_unfresh")
         self.assertEqual(result["action"], "collect_fresh_app_state")
         self.assertEqual(result["stability_route_canary"]["status"], "needs_fresh_evidence")
+        self.assertEqual(result["stability_route_canary"]["action"], "collect_fresh_app_state")
         self.assertNotIn("重启", "\n".join(result["recommendations"]))
 
-    def test_doctor_keeps_active_stability_route_in_canary_mode_for_stale_stream(self) -> None:
+    def test_doctor_restores_active_stability_route_for_stale_stream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             codex_home = root / ".codex"
@@ -3121,10 +3130,11 @@ class CodexDesktopDoctorCase(ServerCase):
             ):
                 result = manager.codex_desktop_doctor()
 
-        self.assertEqual(result["status"], "stability_route_canary_active")
-        self.assertEqual(result["action"], "run_canary_stream")
-        self.assertEqual(result["stability_route_canary"]["status"], "active")
-        self.assertNotEqual(result["action"], "restore_native_mode")
+        self.assertEqual(result["status"], "bridge_mode_unsupported")
+        self.assertEqual(result["action"], "restore_native_mode")
+        self.assertEqual(result["stability_route_canary"]["status"], "unsafe_active")
+        self.assertEqual(result["stability_route_canary"]["action"], "restore_native_mode")
+        self.assertFalse(result["stability_route_canary"]["ok"])
 
     def test_doctor_prefers_stale_process_before_upstream_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3277,6 +3287,7 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertIn("单独 Codex CLI", html)
         self.assertIn("全局 Codex CLI", html)
         self.assertIn("Codex Desktop Stability Route", html)
+        self.assertIn("Stability Route 已禁用", html)
         self.assertIn('data-action="enable-desktop-bridge-mode"', html)
         self.assertIn('data-action="restore-desktop-native-mode"', html)
         self.assertIn("codex-current.command", html)
@@ -3390,8 +3401,10 @@ class CodexDesktopDoctorCase(ServerCase):
             body={"account_id": "acct-1"},
             headers={"X-CCSBT-Token": "test-token"},
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["message"], "已开启 Codex Desktop Stability Route")
+        self.assertEqual(status, 409)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["blocked_reason"], bridgedeck.CODEX_DESKTOP_BRIDGE_DISABLED_REASON)
+        self.assertIn("/v1/responses/compact", payload["message"])
 
         status, payload = self.request(
             server,
@@ -5948,7 +5961,7 @@ class LauncherCase(unittest.TestCase):
                 self.assertIn(bridgedeck.MANAGED_CODEX_SHIM_MARKER, shim_body)
                 self.assertIn(str(launcher), shim_body)
 
-    def test_codex_desktop_bridge_mode_is_explicit_and_restorable(self) -> None:
+    def test_codex_desktop_bridge_mode_is_disabled_and_preserves_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manager = self.make_manager(root)
@@ -5962,29 +5975,21 @@ class LauncherCase(unittest.TestCase):
                 status = manager._codex_desktop_status()
 
             body = config.read_text(encoding="utf-8")
-            self.assertTrue(enabled["changed"])
-            self.assertIn(bridgedeck.MANAGED_CODEX_DESKTOP_BRIDGE_START, body)
-            self.assertIn('model_provider = "bridgedeck"', body)
-            self.assertIn("[model_providers.bridgedeck]", body)
-            self.assertIn('base_url = "http://127.0.0.1:8876/accounts/acct-1/v1"', body)
-            self.assertIn('experimental_bearer_token = "local-bridge"', body)
-            self.assertIn('supports_websockets = false', body)
-            self.assertNotIn('model = "gpt-5.5"', body)
-            self.assertNotIn("model_reasoning_effort", body)
-            self.assertNotIn('service_tier = "fast"', body)
-            self.assertEqual(status["managed_by"], "bridgedeck_provider")
-            self.assertEqual(status["account_id"], "acct-1")
-            self.assertIn("model", enabled["stripped_legacy_keys"])
-            self.assertIn("model_reasoning_effort", enabled["stripped_legacy_keys"])
+            self.assertFalse(enabled["ok"])
+            self.assertFalse(enabled["changed"])
+            self.assertEqual(enabled["blocked_reason"], bridgedeck.CODEX_DESKTOP_BRIDGE_DISABLED_REASON)
+            self.assertEqual(body, 'model = "gpt-5.5"\nmodel_reasoning_effort = "xhigh"\nnotify = ["done"]\n')
+            self.assertEqual(status["managed_by"], "default")
+            self.assertEqual(status["model"], "gpt-5.5")
+            self.assertEqual(status["model_reasoning_effort"], "xhigh")
 
             with mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home):
                 restored = manager.restore_codex_desktop_native_mode()
 
-            self.assertTrue(restored["changed"])
-            self.assertEqual(config.read_text(encoding="utf-8"), 'notify = ["done"]\n')
-            self.assertIn("managed_bridge_block", restored["removed"])
+            self.assertFalse(restored["changed"])
+            self.assertEqual(config.read_text(encoding="utf-8"), 'model = "gpt-5.5"\nmodel_reasoning_effort = "xhigh"\nnotify = ["done"]\n')
 
-    def test_restore_codex_desktop_native_mode_removes_static_native_overrides(self) -> None:
+    def test_restore_codex_desktop_native_mode_preserves_static_native_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manager = self.make_manager(root)
@@ -6010,13 +6015,13 @@ class LauncherCase(unittest.TestCase):
                 result = manager.restore_codex_desktop_native_mode()
 
             body = config.read_text(encoding="utf-8")
-            self.assertTrue(result["changed"])
-            self.assertNotIn('model = "gpt-5.5"', body)
-            self.assertNotIn("model_reasoning_effort", body)
-            self.assertNotIn("service_tier", body)
+            self.assertFalse(result["changed"])
+            self.assertIn('model = "gpt-5.5"', body)
+            self.assertIn('model_reasoning_effort = "xhigh"', body)
+            self.assertIn('service_tier = "fast"', body)
             self.assertIn("[features]", body)
             self.assertIn("hooks = true", body)
-            self.assertEqual(result["removed"], ["model", "model_reasoning_effort", "service_tier"])
+            self.assertEqual(result["removed"], [])
 
     def test_restore_codex_desktop_native_mode_removes_legacy_bridgedeck_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6052,11 +6057,12 @@ class LauncherCase(unittest.TestCase):
             body = config.read_text(encoding="utf-8")
             self.assertTrue(result["changed"])
             self.assertNotIn("bridgedeck", body)
-            self.assertNotIn('model = "gpt-5.5"', body)
-            self.assertNotIn("model_reasoning_effort", body)
-            self.assertNotIn("service_tier", body)
+            self.assertIn('model = "gpt-5.5"', body)
+            self.assertIn('model_reasoning_effort = "xhigh"', body)
+            self.assertIn('service_tier = "fast"', body)
             self.assertIn("[features]", body)
             self.assertIn("hooks = true", body)
+            self.assertEqual(sorted(result["removed"]), ["model_provider", "model_providers.bridgedeck"])
 
     def test_set_default_codex_account_does_not_change_config_if_launcher_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
