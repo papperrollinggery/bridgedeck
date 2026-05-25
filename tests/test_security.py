@@ -2875,6 +2875,58 @@ class CodexDesktopDoctorCase(ServerCase):
             )
         )
 
+    def write_codex_state(self, codex_home: Path, rows: list[dict[str, Any]]) -> Path:
+        state_db = codex_home / "state_5.sqlite"
+        conn = sqlite3.connect(state_db)
+        try:
+            conn.execute(
+                """
+                create table threads (
+                    id text primary key,
+                    created_at integer,
+                    source text,
+                    thread_source text,
+                    cwd text,
+                    title text,
+                    model_provider text
+                )
+                """
+            )
+            conn.execute(
+                """
+                create table thread_dynamic_tools (
+                    thread_id text,
+                    namespace text,
+                    name text
+                )
+                """
+            )
+            for row in rows:
+                conn.execute(
+                    """
+                    insert into threads (id, created_at, source, thread_source, cwd, title, model_provider)
+                    values (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["id"],
+                        row["created_at"],
+                        row.get("source", "vscode"),
+                        row.get("thread_source", ""),
+                        row.get("cwd", str(codex_home)),
+                        row.get("title", ""),
+                        row.get("model_provider", "openai"),
+                    ),
+                )
+                for tool in row.get("tools", []):
+                    conn.execute(
+                        "insert into thread_dynamic_tools (thread_id, namespace, name) values (?, ?, ?)",
+                        (row["id"], "codex_app", tool),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+        return state_db
+
     def ok_native_proxy(self) -> dict[str, Any]:
         return {
             "ok": True,
@@ -3037,6 +3089,71 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertGreaterEqual(result["latest_age_seconds"], 1800)
         self.assertIn("unfresh_app_state_evidence", result["signals"])
 
+    def test_codex_app_dynamic_tools_state_detects_missing_app_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / ".codex"
+            codex_home.mkdir()
+            state_db = self.write_codex_state(
+                codex_home,
+                [
+                    {
+                        "id": "bad-thread",
+                        "created_at": 200,
+                        "thread_source": "",
+                        "cwd": str(Path(tmp) / "bad"),
+                        "tools": [],
+                    },
+                    {
+                        "id": "ok-thread",
+                        "created_at": 100,
+                        "thread_source": "user",
+                        "cwd": str(Path(tmp) / "ok"),
+                        "tools": list(bridgedeck.CODEX_APP_DYNAMIC_TOOLS),
+                    },
+                ],
+            )
+
+            result = bridgedeck.codex_app_dynamic_tools_state(state_db)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "missing_dynamic_tools")
+        self.assertEqual(result["latest"]["id"], "bad-thread")
+        self.assertIn("codex_app.automation_update", result["latest"]["missing_expected_tools"])
+
+    def test_doctor_classifies_dynamic_tools_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text("[features]\nhooks = true\n", encoding="utf-8")
+            self.write_codex_state(
+                codex_home,
+                [
+                    {
+                        "id": "bad-thread",
+                        "created_at": 200,
+                        "thread_source": "",
+                        "cwd": str(root / "bad"),
+                        "tools": [],
+                    }
+                ],
+            )
+            manager = self.make_manager(root)
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(manager, "codex_native_proxy_status", return_value=self.ok_native_proxy()),
+                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state(restart_required=True)),
+                mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
+                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state()),
+                mock.patch.object(bridgedeck, "codex_desktop_app_state", return_value=self.ok_app_state()),
+            ):
+                result = manager.codex_desktop_doctor()
+
+        self.assertEqual(result["status"], "desktop_dynamic_tools_missing")
+        self.assertEqual(result["action"], "new_user_thread_after_hard_restart")
+        self.assertEqual(result["dynamic_tools"]["latest"]["id"], "bad-thread")
+
     def test_doctor_classifies_active_legacy_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3069,9 +3186,9 @@ class CodexDesktopDoctorCase(ServerCase):
             with (
                 mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
                 mock.patch.object(manager, "codex_native_proxy_status", return_value=self.ok_native_proxy()),
-                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state(restart_required=True)),
+                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state()),
                 mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
-                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state(deprecation=2)),
+                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state()),
                 mock.patch.object(bridgedeck, "codex_desktop_app_state", return_value=self.stale_app_state()),
                 mock.patch.object(bridgedeck, "tcp_open", return_value=True),
             ):
@@ -3097,9 +3214,9 @@ class CodexDesktopDoctorCase(ServerCase):
             with (
                 mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
                 mock.patch.object(manager, "codex_native_proxy_status", return_value=self.ok_native_proxy()),
-                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state(restart_required=True)),
+                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state()),
                 mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
-                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state(deprecation=2)),
+                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state()),
                 mock.patch.object(bridgedeck, "codex_desktop_app_state", return_value=self.unfresh_stale_app_state()),
                 mock.patch.object(bridgedeck, "tcp_open", return_value=True),
             ):
@@ -3156,6 +3273,51 @@ class CodexDesktopDoctorCase(ServerCase):
 
         self.assertEqual(result["status"], "desktop_state_stale")
         self.assertEqual(result["action"], "hard_restart_codex")
+
+    def test_doctor_prefers_stale_process_before_stale_stream_when_config_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text("[features]\nhooks = true\n", encoding="utf-8")
+            manager = self.make_manager(root)
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(manager, "codex_native_proxy_status", return_value=self.ok_native_proxy()),
+                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state(restart_required=True)),
+                mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
+                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state(deprecation=2)),
+                mock.patch.object(bridgedeck, "codex_desktop_app_state", return_value=self.stale_app_state()),
+                mock.patch.object(bridgedeck, "tcp_open", return_value=True),
+            ):
+                result = manager.codex_desktop_doctor()
+
+        self.assertEqual(result["status"], "desktop_state_stale")
+        self.assertEqual(result["action"], "hard_restart_codex")
+        self.assertIn("完全退出 Codex Desktop", "\n".join(result["recommendations"]))
+
+    def test_codex_desktop_log_state_keeps_latest_last_seen_across_log_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            newer = root / "newer.log"
+            older = root / "older.log"
+            newer.write_text(
+                '2026-05-25T06:02:03.826Z warning summary="`[features].codex_hooks` is deprecated."\n',
+                encoding="utf-8",
+            )
+            older.write_text(
+                '2026-05-23T23:29:13.739Z warning summary="`[features].codex_hooks` is deprecated."\n',
+                encoding="utf-8",
+            )
+            os.utime(newer, (200, 200))
+            os.utime(older, (100, 100))
+
+            with mock.patch.object(bridgedeck, "CODEX_DESKTOP_LOG_ROOT", root):
+                result = bridgedeck.codex_desktop_log_state(limit=2)
+
+        self.assertEqual(result["counts"]["codex_hooks_deprecation"], 2)
+        self.assertEqual(result["last_seen"]["codex_hooks_deprecation"], "2026-05-25T06:02:03.826Z")
 
     def test_doctor_classifies_clean_config_deprecation_as_upstream_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
