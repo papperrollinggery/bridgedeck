@@ -43,6 +43,7 @@ CODEX_APP_DYNAMIC_TOOLS = (
     "read_thread_terminal",
     "load_workspace_dependencies",
 )
+CODEX_REMOTE_THREAD_CLIENT_MARKERS = ("remote", "ios", "chatgpt")
 CODEX_DESKTOP_LOG_ROOT = Path.home() / "Library" / "Logs" / "com.openai.codex"
 CODEX_DESKTOP_SENTRY_SCOPE_PATH = (
     Path.home() / "Library" / "Application Support" / "Codex" / "sentry" / "scope_v3.json"
@@ -1975,6 +1976,78 @@ def codex_desktop_log_state(*, limit: int = 5, max_bytes_per_log: int = 1_500_00
     }
 
 
+def _otel_log_value(body: str, key: str) -> str:
+    quoted = re.search(rf"{re.escape(key)}=\"([^\"]*)\"", body)
+    if quoted:
+        return quoted.group(1)
+    bare = re.search(rf"{re.escape(key)}=([^\s}}]+)", body)
+    return bare.group(1) if bare else ""
+
+
+def _is_remote_thread_start(origin: dict[str, Any]) -> bool:
+    client_name = str(origin.get("client_name") or "").lower()
+    return any(marker in client_name for marker in CODEX_REMOTE_THREAD_CLIENT_MARKERS)
+
+
+def codex_thread_start_log_origin(thread_id: str, logs_db_path: Path | None = None) -> dict[str, Any]:
+    path = logs_db_path or (DEFAULT_CODEX_HOME / "logs_2.sqlite")
+    base: dict[str, Any] = {
+        "found": False,
+        "logs_db_path": str(path),
+        "thread_id": thread_id,
+        "client_name": "",
+        "client_version": "",
+        "connection_id": "",
+        "dynamic_tool_count": None,
+        "created_local": "",
+        "remote_origin": False,
+    }
+    if not thread_id:
+        return base
+    if path.is_symlink() or not path.exists() or not path.is_file():
+        return base
+
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            table = conn.execute("select name from sqlite_master where type='table' and name='logs'").fetchone()
+            if not table:
+                return base
+            row = conn.execute(
+                """
+                select ts, feedback_log_body
+                from logs
+                where instr(coalesce(feedback_log_body, ''), ?) > 0
+                  and instr(coalesce(feedback_log_body, ''), 'app_server.thread_start.create_thread') > 0
+                order by ts desc, ts_nanos desc, id desc
+                limit 1
+                """,
+                (f"thread_id={thread_id}",),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return base
+
+    if not row:
+        return base
+    body = str(row["feedback_log_body"] or "")
+    dynamic_tool_count_raw = _otel_log_value(body, "thread_start.dynamic_tool_count")
+    ts = safe_int(row["ts"], 0)
+    origin = {
+        **base,
+        "found": True,
+        "client_name": _otel_log_value(body, "app_server.client_name"),
+        "client_version": _otel_log_value(body, "app_server.client_version"),
+        "connection_id": _otel_log_value(body, "app_server.connection_id"),
+        "dynamic_tool_count": safe_int(dynamic_tool_count_raw, 0) if dynamic_tool_count_raw else None,
+        "created_local": dt.datetime.fromtimestamp(ts).isoformat(timespec="seconds") if ts else "",
+    }
+    origin["remote_origin"] = _is_remote_thread_start(origin)
+    return origin
+
+
 CODEX_DESKTOP_APP_STATE_NUMERIC_KEYS = (
     "thread_count_total",
     "thread_count_active",
@@ -2161,10 +2234,12 @@ def codex_desktop_app_state(
 def codex_app_dynamic_tools_state(
     state_db_path: Path | None = None,
     *,
+    logs_db_path: Path | None = None,
     thread_id: str | None = None,
     recent_limit: int = 12,
 ) -> dict[str, Any]:
     path = state_db_path or (DEFAULT_CODEX_HOME / "state_5.sqlite")
+    thread_start_logs_db_path = logs_db_path or (path.parent / "logs_2.sqlite")
     base: dict[str, Any] = {
         "ok": True,
         "status": "missing",
@@ -2262,6 +2337,10 @@ def codex_app_dynamic_tools_state(
     suspects = [item for item in items if missing_expected_tools(item)]
     for item in items:
         item["missing_expected_tools"] = missing_expected_tools(item)
+        if item.get("missing_expected_tools") or item.get("thread_source") != "user":
+            origin = codex_thread_start_log_origin(str(item.get("id") or ""), logs_db_path=thread_start_logs_db_path)
+            if origin.get("found"):
+                item["thread_start_log"] = origin
 
     if thread_id and not latest:
         return {
@@ -2269,6 +2348,19 @@ def codex_app_dynamic_tools_state(
             "ok": False,
             "status": "thread_missing",
             "message": f"Codex state_5.sqlite 未找到线程 {thread_id}。",
+        }
+    latest_origin = latest.get("thread_start_log") if isinstance(latest.get("thread_start_log"), dict) else {}
+    if latest and latest.get("missing_expected_tools") and _is_remote_thread_start(latest_origin):
+        client = str(latest_origin.get("client_name") or "remote client")
+        count = latest_origin.get("dynamic_tool_count")
+        count_part = f"，thread/start dynamic_tool_count={count}" if count is not None else ""
+        return {
+            **base,
+            "ok": False,
+            "status": "remote_dynamic_tools_missing",
+            "message": f"Codex 线程由 {client} 创建{count_part}；重启本机 Codex 不会补回 dynamic tools。",
+            "latest": latest,
+            "suspect_threads": suspects,
         }
     if latest and latest.get("missing_expected_tools"):
         return {
@@ -3907,6 +3999,7 @@ class BridgeManager:
             "missing_dynamic_tools",
             "non_user_thread_source",
             "recent_missing_dynamic_tools",
+            "remote_dynamic_tools_missing",
         }
 
         if config.get("active_legacy_key_present"):
@@ -3927,11 +4020,17 @@ class BridgeManager:
             if native_status != "blocked":
                 recommendations.append("修复后完全退出并重启 Codex Desktop。")
         elif has_dynamic_tools_failure:
-            status = "desktop_dynamic_tools_missing"
-            action = "new_user_thread_after_hard_restart"
             message = str(dynamic_tools.get("message") or "Codex 线程缺失 codex_app dynamic tools。")
-            recommendations.append("不要继续重复改 config 或 BridgeDeck provider；该问题发生在线程启动注入阶段。")
-            recommendations.append("完全退出 Codex Desktop 后新建普通用户会话，并验证 thread_source=user、dynamic_tools=3。")
+            if dynamic_tools.get("status") == "remote_dynamic_tools_missing":
+                status = "remote_thread_dynamic_tools_missing"
+                action = "create_local_desktop_thread"
+                recommendations.append("停止在该 remote/iOS 创建的线程里做 automation；直接用本机 Codex Desktop 新建普通用户会话。")
+                recommendations.append("新线程必须验证 thread_source=user、dynamic_tools=3。")
+            else:
+                status = "desktop_dynamic_tools_missing"
+                action = "new_user_thread_after_hard_restart"
+                recommendations.append("不要继续重复改 config 或 BridgeDeck provider；该问题发生在线程启动注入阶段。")
+                recommendations.append("完全退出 Codex Desktop 后新建普通用户会话，并验证 thread_source=user、dynamic_tools=3。")
         elif process_state.get("restart_required"):
             status = "desktop_state_stale"
             action = "hard_restart_codex"
@@ -6986,9 +7085,15 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             latest = dynamic_tools.get("latest")
             if isinstance(latest, dict):
                 latest["cwd"] = redact_path_value(latest.get("cwd"))
+                thread_start_log = latest.get("thread_start_log")
+                if isinstance(thread_start_log, dict):
+                    thread_start_log["logs_db_path"] = redact_path_value(thread_start_log.get("logs_db_path"))
             for item in dynamic_tools.get("suspect_threads", []):
                 if isinstance(item, dict):
                     item["cwd"] = redact_path_value(item.get("cwd"))
+                    thread_start_log = item.get("thread_start_log")
+                    if isinstance(thread_start_log, dict):
+                        thread_start_log["logs_db_path"] = redact_path_value(thread_start_log.get("logs_db_path"))
         desktop_doctor = doctor.get("codex_desktop")
         if isinstance(desktop_doctor, dict):
             desktop_doctor["config_path"] = redact_path_value(desktop_doctor.get("config_path"))
@@ -8643,7 +8748,7 @@ INDEX_HTML = """<!doctype html>
       if (!box) return;
       const status = payload.status || 'unknown';
       const state = status === 'healthy' ? 'okState'
-        : (['active_config_legacy_key', 'native_proxy_missing', 'native_proxy_incomplete', 'native_proxy_proxy_down', 'native_proxy_blocked', 'desktop_dynamic_tools_missing', 'desktop_state_stale', 'desktop_stream_state_stale', 'desktop_app_state_unfresh', 'desktop_event_session_unhealthy'].includes(status) ? 'badState' : 'warnState');
+        : (['active_config_legacy_key', 'native_proxy_missing', 'native_proxy_incomplete', 'native_proxy_proxy_down', 'native_proxy_blocked', 'desktop_dynamic_tools_missing', 'remote_thread_dynamic_tools_missing', 'desktop_state_stale', 'desktop_stream_state_stale', 'desktop_app_state_unfresh', 'desktop_event_session_unhealthy'].includes(status) ? 'badState' : 'warnState');
       box.className = `recommend mt10 ${state}`;
       const checks = Array.isArray(payload.checks) ? payload.checks : [];
       const checkLines = checks.map((item) => `${item.label || item.id}: ${item.status || '-'}${item.detail ? ` · ${item.detail}` : ''}`);

@@ -2927,6 +2927,52 @@ class CodexDesktopDoctorCase(ServerCase):
             conn.close()
         return state_db
 
+    def write_codex_logs(self, codex_home: Path, rows: list[dict[str, Any]]) -> Path:
+        logs_db = codex_home / "logs_2.sqlite"
+        conn = sqlite3.connect(logs_db)
+        try:
+            conn.execute(
+                """
+                create table logs (
+                    id integer primary key autoincrement,
+                    ts integer not null,
+                    ts_nanos integer not null,
+                    level text not null,
+                    target text not null,
+                    feedback_log_body text,
+                    module_path text,
+                    file text,
+                    line integer,
+                    thread_id text,
+                    process_uuid text,
+                    estimated_bytes integer not null default 0
+                )
+                """
+            )
+            for row in rows:
+                conn.execute(
+                    """
+                    insert into logs (ts, ts_nanos, level, target, feedback_log_body, module_path, file, line, thread_id, process_uuid)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row.get("ts", 1),
+                        row.get("ts_nanos", 0),
+                        row.get("level", "INFO"),
+                        row.get("target", "app_server"),
+                        row["body"],
+                        row.get("module_path"),
+                        row.get("file"),
+                        row.get("line"),
+                        row.get("thread_id"),
+                        row.get("process_uuid"),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return logs_db
+
     def ok_native_proxy(self) -> dict[str, Any]:
         return {
             "ok": True,
@@ -3120,6 +3166,43 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertEqual(result["latest"]["id"], "bad-thread")
         self.assertIn("codex_app.automation_update", result["latest"]["missing_expected_tools"])
 
+    def test_codex_app_dynamic_tools_state_classifies_remote_thread_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / ".codex"
+            codex_home.mkdir()
+            state_db = self.write_codex_state(
+                codex_home,
+                [
+                    {
+                        "id": "bad-thread",
+                        "created_at": 200,
+                        "thread_source": "",
+                        "cwd": str(Path(tmp) / "bad"),
+                        "tools": [],
+                    }
+                ],
+            )
+            logs_db = self.write_codex_logs(
+                codex_home,
+                [
+                    {
+                        "ts": 200,
+                        "body": (
+                            'app_server.request{app_server.connection_id=162 app_server.client_name="codex_chatgpt_ios_remote" '
+                            'app_server.client_version="1.2026.132"}:app_server.thread_start.create_thread{'
+                            "thread_start.dynamic_tool_count=0}: thread_id=bad-thread"
+                        ),
+                    }
+                ],
+            )
+
+            result = bridgedeck.codex_app_dynamic_tools_state(state_db, logs_db_path=logs_db)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "remote_dynamic_tools_missing")
+        self.assertEqual(result["latest"]["thread_start_log"]["client_name"], "codex_chatgpt_ios_remote")
+        self.assertEqual(result["latest"]["thread_start_log"]["dynamic_tool_count"], 0)
+
     def test_doctor_classifies_dynamic_tools_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3153,6 +3236,53 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertEqual(result["status"], "desktop_dynamic_tools_missing")
         self.assertEqual(result["action"], "new_user_thread_after_hard_restart")
         self.assertEqual(result["dynamic_tools"]["latest"]["id"], "bad-thread")
+
+    def test_doctor_classifies_remote_dynamic_tools_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text("[features]\nhooks = true\n", encoding="utf-8")
+            self.write_codex_state(
+                codex_home,
+                [
+                    {
+                        "id": "bad-thread",
+                        "created_at": 200,
+                        "thread_source": "",
+                        "cwd": str(root / "bad"),
+                        "tools": [],
+                    }
+                ],
+            )
+            self.write_codex_logs(
+                codex_home,
+                [
+                    {
+                        "ts": 200,
+                        "body": (
+                            'app_server.request{app_server.connection_id=162 app_server.client_name="codex_chatgpt_ios_remote" '
+                            'app_server.client_version="1.2026.132"}:app_server.thread_start.create_thread{'
+                            "thread_start.dynamic_tool_count=0}: thread_id=bad-thread"
+                        ),
+                    }
+                ],
+            )
+            manager = self.make_manager(root)
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.object(manager, "codex_native_proxy_status", return_value=self.ok_native_proxy()),
+                mock.patch.object(bridgedeck, "codex_desktop_process_state", return_value=self.process_state(restart_required=True)),
+                mock.patch.object(bridgedeck, "codex_cli_version_state", return_value={"version_split": False}),
+                mock.patch.object(bridgedeck, "codex_desktop_log_state", return_value=self.log_state()),
+                mock.patch.object(bridgedeck, "codex_desktop_app_state", return_value=self.ok_app_state()),
+            ):
+                result = manager.codex_desktop_doctor()
+
+        self.assertEqual(result["status"], "remote_thread_dynamic_tools_missing")
+        self.assertEqual(result["action"], "create_local_desktop_thread")
+        self.assertIn("codex_chatgpt_ios_remote", result["message"])
 
     def test_doctor_classifies_active_legacy_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
