@@ -8906,7 +8906,10 @@ INDEX_HTML = """<!doctype html>
                 <h2 class="pageTitle">额度与自动切换</h2>
                 <p class="pageDesc">只接管 Local Codex Bridge。切到 MiniMax、Nvidia、SSSAiCode 时不会自动改回 OpenAI。</p>
               </div>
-              <button class="primary" data-action="run-auto-switch">立即检查并切换</button>
+              <div class="topActions">
+                <button data-action="refresh-quota">刷新额度</button>
+                <button class="primary" data-action="run-auto-switch">立即检查并切换</button>
+              </div>
             </div>
             <div class="card guideSection" data-guide="quota">
               <div id="quotaBoard" class="quotaBar">额度加载中...</div>
@@ -11863,6 +11866,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'sync-claude-plugins') return syncClaudePlugins();
           if (action === 'save-auto-switch') return saveAutoSwitch();
           if (action === 'run-auto-switch') return runAutoSwitch(true, true);
+          if (action === 'refresh-quota') return refreshQuotas();
           if (action === 'create-missing-bridges') return createMissingBridges();
           if (action === 'preview-aimami-import') return previewAimamiImport();
           if (action === 'import-aimami-accounts') return importAimamiAccounts(false);
