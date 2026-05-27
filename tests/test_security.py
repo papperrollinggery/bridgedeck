@@ -6000,7 +6000,7 @@ class LauncherCase(unittest.TestCase):
             )
 
             env = settings["env"]
-            self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8876/accounts/acct-1")
+            self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8876/v1")
             self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "local-bridge")
             self.assertNotIn("ANTHROPIC_MODEL", env)
             self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gpt-5.3-codex-spark")

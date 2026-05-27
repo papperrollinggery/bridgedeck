@@ -666,7 +666,7 @@ def strip_legacy_bridgedeck_provider_config(text: str, *, remove_static_keys: bo
 
 
 def codex_desktop_bridge_block(account_id: str) -> str:
-    base_url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1"
+    base_url = f"{LOCAL_BRIDGE_BASE_URL}/v1"
     return "\n".join(
         [
             MANAGED_CODEX_DESKTOP_BRIDGE_START,
@@ -5958,7 +5958,7 @@ class BridgeManager:
         env = settings.get("env")
         if not isinstance(env, dict):
             env = {}
-        env["ANTHROPIC_BASE_URL"] = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}"
+        env["ANTHROPIC_BASE_URL"] = f"{LOCAL_BRIDGE_BASE_URL}/v1"
         env["ANTHROPIC_AUTH_TOKEN"] = "local-bridge"
         if clear_forced_model:
             clear_forced_bridge_model_from_env(env)

@@ -3157,6 +3157,26 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         session_key = extract_session_key(self.headers, body)
         return self.server.auth_store.account_candidates(requested_account_id, session_key), session_key
 
+    def _is_passthrough_request(self) -> bool:
+        auth = self.headers.get("Authorization", "")
+        return bool(
+            auth
+            and auth != "Bearer local-bridge"
+            and not auth.startswith("Bearer sk-bridgedeck-")
+        )
+
+    def _build_passthrough_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {
+            "Authorization": self.headers["Authorization"],
+            "Content-Type": "application/json",
+            "Accept": self.headers.get("Accept", "application/json"),
+        }
+        if self.headers.get("User-Agent"):
+            headers["User-Agent"] = self.headers["User-Agent"]
+        if self.headers.get("anthropic-beta"):
+            headers["anthropic-beta"] = self.headers["anthropic-beta"]
+        return headers
+
     def _handle_responses(self, route_account_id: str | None, route_path: str) -> None:
         request_id = bridge_request_id()
         try:
@@ -3340,6 +3360,32 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             session_key=session_key,
         )
         usage_context.update(cache_context)
+
+        if self._is_passthrough_request():
+            upstream_headers = self._build_passthrough_headers()
+            try:
+                with build_upstream_http_client(timeout=600.0) as client, client.stream(
+                    "POST",
+                    upstream_url,
+                    headers=upstream_headers,
+                    json=upstream_body,
+                ) as response:
+                    if not response.is_success:
+                        error_body = response.read()
+                        self._send_upstream_headers(response, is_stream=False, content_length=len(error_body))
+                        self._write_bytes(error_body, flush=True)
+                        return
+                    if is_stream:
+                        self._send_upstream_headers(response, is_stream=True)
+                        for chunk in response.iter_bytes():
+                            self._write_bytes(chunk)
+                    else:
+                        body = response.read()
+                        self._send_upstream_headers(response, is_stream=False, content_length=len(body))
+                        self._write_bytes(body, flush=True)
+            except Exception as exc:
+                self._write_json_error(500, upstream_exception_detail(exc))
+            return
 
         for account_index, candidate_account_id in enumerate(candidate_account_ids):
             account_id, access_token = self.server.auth_store.get_access_token(candidate_account_id)
