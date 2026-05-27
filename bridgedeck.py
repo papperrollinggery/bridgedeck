@@ -3752,7 +3752,7 @@ class BridgeManager:
         active_stream = active_stream if isinstance(active_stream, dict) else {}
         return bool(active_connections or active_stream), active_connections, active_stream
 
-    def _bridge_provider_for_account(self, snapshot: dict[str, Any], account_id: str) -> dict[str, Any] | None:
+    def _bridge_provider_from_snapshot(self, snapshot: dict[str, Any], account_id: str) -> dict[str, Any] | None:
         providers = [p for p in snapshot.get("providers", []) if isinstance(p, dict)]
         return next((p for p in providers if p.get("account_id") == account_id and self._is_bridge_provider(p)), None)
 
@@ -3843,7 +3843,7 @@ class BridgeManager:
             self._save_aimami_follow_config({**config, "last_result": result, "last_seen_active_account_key": active_key})
             return result
 
-        target_provider = self._bridge_provider_for_account(snapshot, active_account_id)
+        target_provider = self._bridge_provider_from_snapshot(snapshot, active_account_id)
         provider_created = None
         if not target_provider:
             providers = [p for p in snapshot.get("providers", []) if isinstance(p, dict)]
@@ -3852,7 +3852,7 @@ class BridgeManager:
             provider_name = self._default_provider_name(account, existing_names)
             provider_created = self.create_or_update_provider(active_account_id, provider_name, False)
             snapshot = self.snapshot(include_secrets=False)
-            target_provider = self._bridge_provider_for_account(snapshot, active_account_id)
+            target_provider = self._bridge_provider_from_snapshot(snapshot, active_account_id)
 
         if not target_provider:
             result = {
