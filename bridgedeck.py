@@ -3459,6 +3459,68 @@ class BridgeManager:
         entry = keys.get(key)
         return bool(entry and not entry.get("revoked"))
 
+    def account_pool(self) -> dict[str, Any]:
+        accounts = self._load_accounts()
+        auth_raw = self._load_auth_store_raw()
+        default_id = str(auth_raw.get("default_account_id") or "") if isinstance(auth_raw, dict) else ""
+        pool = []
+        for acct in accounts:
+            pool.append({
+                "account_id": acct["account_id"],
+                "email": acct.get("email", ""),
+                "is_default": acct["account_id"] == default_id,
+                "source": acct.get("source", ""),
+            })
+        return {"ok": True, "default_account_id": default_id, "pool": pool}
+
+    def launchd_status(self) -> dict[str, Any]:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", "com.jinjungao.bridgedeck-ui"],
+                capture_output=True, text=True, timeout=5
+            )
+            loaded = result.returncode == 0
+            pid = None
+            if loaded:
+                for line in result.stdout.splitlines():
+                    if line.startswith("PID"):
+                        parts = line.split("\t")
+                        if len(parts) >= 3:
+                            pid = parts[2]
+            return {"ok": True, "loaded": loaded, "pid": pid}
+        except Exception as e:
+            return {"ok": True, "loaded": False, "error": str(e)}
+
+    def service_control(self, action: str) -> dict[str, Any]:
+        import subprocess
+        try:
+            if action == "stop":
+                subprocess.run(["pkill", "-f", "bridgedeck"], capture_output=True, timeout=5)
+                return {"ok": True, "message": "服务停止信号已发送"}
+            elif action == "start":
+                return {"ok": False, "message": "请通过 launchd 或手动启动服务"}
+            elif action == "restart":
+                subprocess.run(["pkill", "-f", "bridgedeck"], capture_output=True, timeout=5)
+                return {"ok": True, "message": "重启信号已发送"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": "Unknown action"}
+
+    def launchd_control(self, action: str) -> dict[str, Any]:
+        import subprocess
+        plist_path = Path.home() / "Library/LaunchAgents/com.jinjungao.bridgedeck-ui.plist"
+        try:
+            if action == "unload":
+                subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True, timeout=10)
+                return {"ok": True, "message": "Launchd 已卸载"}
+            elif action == "load":
+                subprocess.run(["launchctl", "load", str(plist_path)], capture_output=True, timeout=10)
+                return {"ok": True, "message": "Launchd 已加载"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": "Unknown action"}
+
     def _load_accounts(self) -> list[dict[str, Any]]:
         store = load_json(self.paths.auth_store, {})
         accounts = store.get("accounts") if isinstance(store, dict) else {}
@@ -8404,6 +8466,9 @@ INDEX_HTML = """<!doctype html>
           <button class="navItem" data-page="api">通用 API <span class="navHint">复制</span></button>
           <button class="navItem" data-page="services">本地服务 <span class="navHint">8876</span></button>
           <button class="navItem" data-page="diagnostics">诊断日志 <span class="navHint">排查</span></button>
+          <button class="navItem" data-page="account-pool">账户池 <span class="navHint">轮换</span></button>
+          <button class="navItem" data-page="api-keys">API Keys <span class="navHint">统一入口</span></button>
+          <button class="navItem" data-page="service-control">服务控制 <span class="navHint">launchd</span></button>
         </nav>
         <div class="sidePanel">
           <div id="status" class="muted">加载中...</div>
@@ -9048,6 +9113,102 @@ INDEX_HTML = """<!doctype html>
             <div class="card guideSection" data-guide="log">
               <h2>执行日志</h2>
               <textarea id="log" readonly></textarea>
+            </div>
+          </section>
+
+          <section class="deckPage" id="page-account-pool">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">账户池</h2>
+                <p class="pageDesc">管理默认账户、账户轮换策略。切换账户不影响已配置的工具地址。</p>
+              </div>
+              <button data-action="refresh">刷新</button>
+            </div>
+            <div class="card">
+              <h2>当前默认账户</h2>
+              <div id="defaultAccountDisplay" class="recommend">加载中...</div>
+              <div class="row mt10">
+                <label>切换默认账户</label>
+                <select id="accountPoolSelect"></select>
+                <button class="primary" data-action="set-default-account">切换</button>
+              </div>
+            </div>
+            <div class="card">
+              <h2>账户列表</h2>
+              <div class="tableWrap">
+                <table id="accountPoolTable">
+                  <thead>
+                    <tr>
+                      <th class="accountCol">Account ID</th>
+                      <th class="accountCol">邮箱</th>
+                      <th class="smallCol">默认</th>
+                      <th class="smallCol">来源</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section class="deckPage" id="page-api-keys">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">API Keys</h2>
+                <p class="pageDesc">生成统一入口 API Key，所有工具使用同一地址 <code>http://127.0.0.1:8876/v1</code></p>
+              </div>
+              <button data-action="refresh">刷新</button>
+            </div>
+            <div class="card">
+              <h2>创建新 Key</h2>
+              <div class="row">
+                <input type="text" id="newKeyName" placeholder="Key 名称 (可选)" />
+                <button class="primary" data-action="create-api-key">创建 API Key</button>
+              </div>
+              <div id="newKeyResult" class="recommend hidden"></div>
+            </div>
+            <div class="card">
+              <h2>已创建的 Keys</h2>
+              <div class="tableWrap">
+                <table id="apiKeysTable">
+                  <thead>
+                    <tr>
+                      <th class="nameCol">名称</th>
+                      <th class="urlCol">Key</th>
+                      <th class="smallCol">状态</th>
+                      <th class="smallCol">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section class="deckPage" id="page-service-control">
+            <div class="pageHeader">
+              <div>
+                <h2 class="pageTitle">服务控制</h2>
+                <p class="pageDesc">管理 BridgeDeck 服务、launchd 守护进程。</p>
+              </div>
+              <button data-action="refresh">刷新</button>
+            </div>
+            <div class="card">
+              <h2>当前服务状态</h2>
+              <div id="serviceStatusDisplay" class="recommend">加载中...</div>
+              <div class="row mt10">
+                <button class="primary" data-action="service-start">启动服务</button>
+                <button class="warn" data-action="service-stop">停止服务</button>
+                <button data-action="service-restart">重启服务</button>
+              </div>
+            </div>
+            <div class="card">
+              <h2>Launchd 守护进程</h2>
+              <div id="launchdStatus" class="recommend">加载中...</div>
+              <div class="row mt10">
+                <button data-action="launchd-unload">卸载 launchd</button>
+                <button class="primary" data-action="launchd-load">加载 launchd</button>
+              </div>
             </div>
           </section>
         </div>
@@ -10016,6 +10177,150 @@ INDEX_HTML = """<!doctype html>
       const payload = await api('/api/services');
       renderServices(payload);
       return payload;
+    }
+
+    // Account Pool functions
+    async function refreshAccountPool() {
+      try {
+        const data = await api('/api/account-pool');
+        renderAccountPool(data);
+      } catch (e) {
+        console.error('Account pool refresh failed:', e);
+      }
+    }
+
+    function renderAccountPool(data) {
+      const display = document.getElementById('defaultAccountDisplay');
+      if (!data.ok) {
+        display.className = 'recommend bad';
+        display.textContent = data.error || '加载失败';
+        return;
+      }
+      display.className = 'recommend ok';
+      display.innerHTML = `当前默认账户: <b>${esc(data.default_account_id || '未设置')}</b>`;
+
+      const select = document.getElementById('accountPoolSelect');
+      select.innerHTML = '<option value="">选择账户...</option>';
+      data.pool.forEach((acct) => {
+        const opt = document.createElement('option');
+        opt.value = acct.account_id;
+        opt.textContent = `${esc(acct.email)} (${acct.account_id.substring(0, 8)}...)`;
+        if (acct.is_default) opt.selected = true;
+        select.appendChild(opt);
+      });
+
+      const tbody = document.querySelector('#accountPoolTable tbody');
+      tbody.innerHTML = '';
+      data.pool.forEach((acct) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="mono">${esc(acct.account_id.substring(0, 12))}...</td>
+          <td>${esc(acct.email)}</td>
+          <td>${acct.is_default ? '<span class="ok">✓ 默认</span>' : ''}</td>
+          <td class="muted">${esc(acct.source || '')}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+
+    async function setDefaultAccount() {
+      const select = document.getElementById('accountPoolSelect');
+      const accountId = select.value;
+      if (!accountId) return log('请先选择一个账户');
+      const res = await api('/api/set-default-account', 'POST', { account_id: accountId });
+      if (res.ok) {
+        log(`默认账户已切换为: ${accountId.substring(0, 12)}...`);
+        await refreshAccountPool();
+      } else {
+        log(`切换失败: ${res.error}`);
+      }
+    }
+
+    // API Keys functions
+    async function refreshApiKeys() {
+      try {
+        const data = await api('/api/keys');
+        renderApiKeys(data);
+      } catch (e) {
+        console.error('API keys refresh failed:', e);
+      }
+    }
+
+    function renderApiKeys(data) {
+      const tbody = document.querySelector('#apiKeysTable tbody');
+      tbody.innerHTML = '';
+      if (!data.ok || !data.keys) return;
+      data.keys.forEach((key) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${esc(key.name || '未命名')}</td>
+          <td class="mono">${esc(key.key_prefix || '****')}...</td>
+          <td><span class="ok">有效</span></td>
+          <td><button class="miniBtn warn" data-revoke-key="${esc(key.key_prefix)}">撤销</button></td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+
+    async function createApiKey() {
+      const nameInput = document.getElementById('newKeyName');
+      const name = nameInput.value.trim() || 'default';
+      const res = await api('/api/keys/create', 'POST', { name });
+      const resultDiv = document.getElementById('newKeyResult');
+      resultDiv.className = 'recommend ok';
+      resultDiv.innerHTML = `API Key 已创建：<code class="mono">${esc(res.key)}</code><br><small>请复制保存，关闭后无法再次查看</small>`;
+      resultDiv.classList.remove('hidden');
+      nameInput.value = '';
+      await refreshApiKeys();
+    }
+
+    async function revokeApiKey(keyPrefix) {
+      if (!confirm(`确认撤销 Key ${keyPrefix}...？`)) return;
+      const res = await api('/api/keys/revoke', 'POST', { key_prefix: keyPrefix });
+      if (res.ok) {
+        log(`Key ${keyPrefix}... 已撤销`);
+        await refreshApiKeys();
+      } else {
+        log(`撤销失败: ${res.error}`);
+      }
+    }
+
+    // Service Control functions
+    async function refreshServiceControl() {
+      try {
+        const health = await api('/api/public-health');
+        const display = document.getElementById('serviceStatusDisplay');
+        display.className = health.ok ? 'recommend ok' : 'recommend bad';
+        display.innerHTML = health.ok
+          ? `服务运行中 · 状态: <b>${esc(health.status || 'ok')}</b>`
+          : `服务异常: ${esc(health.error || '未知错误')}`;
+      } catch (e) {
+        document.getElementById('serviceStatusDisplay').className = 'recommend bad';
+        document.getElementById('serviceStatusDisplay').textContent = '无法连接服务';
+      }
+
+      try {
+        const launchd = await api('/api/launchd-status');
+        const box = document.getElementById('launchdStatus');
+        box.className = launchd.loaded ? 'recommend ok' : 'recommend warn';
+        box.innerHTML = launchd.loaded
+          ? `Launchd 已加载 · PID: ${esc(String(launchd.pid || 'N/A'))}`
+          : 'Launchd 未加载';
+      } catch (e) {
+        document.getElementById('launchdStatus').textContent = '无法获取 launchd 状态';
+      }
+    }
+
+    async function serviceControl(action) {
+      const res = await api('/api/service-control', 'POST', { action });
+      log(`服务${action}: ${res.message || res.error || '完成'}`);
+      await refreshServiceControl();
+    }
+
+    async function launchdControl(action) {
+      const res = await api('/api/launchd-control', 'POST', { action });
+      log(`Launchd ${action}: ${res.message || res.error || '完成'}`);
+      await refreshServiceControl();
     }
     async function runProxyDiagnosis() {
       const payload = await api('/api/proxy-diagnosis');
@@ -11133,6 +11438,9 @@ INDEX_HTML = """<!doctype html>
       const refreshedAt = new Date().toLocaleTimeString();
       if (showFeedback) setSimpleResult(`已刷新：${refreshedAt}`, 'ok');
       log(`数据已刷新: ${refreshedAt}`);
+      refreshAccountPool();
+      refreshApiKeys();
+      refreshServiceControl();
     }
     async function createProvider() {
       const accountId = document.getElementById('account').value;
@@ -11403,6 +11711,14 @@ INDEX_HTML = """<!doctype html>
           if (action === 'restart-local-bridge') return controlLocalBridge('restart');
           if (action === 'stop-bridgedeck-ui') return stopBridgeDeckUi();
           if (action === 'select-cli-account') return selectCliAccount(button.dataset.accountId || '');
+          // New Phase 4 actions
+          if (action === 'set-default-account') return setDefaultAccount();
+          if (action === 'create-api-key') return createApiKey();
+          if (action === 'service-start') return serviceControl('start');
+          if (action === 'service-stop') return serviceControl('stop');
+          if (action === 'service-restart') return serviceControl('restart');
+          if (action === 'launchd-load') return launchdControl('load');
+          if (action === 'launchd-unload') return launchdControl('unload');
         };
         const originalText = button.textContent;
         const shouldShowBusy = action === 'refresh';
@@ -11739,6 +12055,27 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
+            if parsed.path == "/api/account-pool":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    json_response(self, 200, manager.account_pool())
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
+            if parsed.path == "/api/launchd-status":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    json_response(self, 200, manager.launchd_status())
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
             json_response(self, 404, {"ok": False, "error": "Not Found"})
 
         def do_POST(self) -> None:
@@ -12000,6 +12337,22 @@ def build_handler(
                     auth_raw["default_account_id"] = account_id
                     manager.paths.auth_store.write_text(json.dumps(auth_raw, ensure_ascii=False, indent=2), encoding="utf-8")
                     json_response(self, 200, {"ok": True, "default_account_id": account_id})
+                    return
+                if self.path == "/api/service-control":
+                    action = str(payload.get("action") or "")
+                    if action not in ("start", "stop", "restart"):
+                        json_response(self, 400, {"ok": False, "error": "Invalid action"})
+                        return
+                    result = manager.service_control(action)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/launchd-control":
+                    action = str(payload.get("action") or "")
+                    if action not in ("load", "unload"):
+                        json_response(self, 400, {"ok": False, "error": "Invalid action"})
+                        return
+                    result = manager.launchd_control(action)
+                    json_response(self, 200, result)
                     return
                 json_response(self, 404, {"ok": False, "error": "Not Found"})
             except Exception as exc:  # noqa: BLE001
