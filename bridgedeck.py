@@ -3417,6 +3417,10 @@ class BridgeManager:
 
     def _save_api_keys(self, keys: dict[str, Any]) -> None:
         dump_json(DEFAULT_API_KEYS_PATH, keys)
+        try:
+            os.chmod(DEFAULT_API_KEYS_PATH, 0o600)
+        except OSError:
+            pass
 
     def create_api_key(self, label: str = "") -> dict[str, Any]:
         import secrets
@@ -11725,6 +11729,12 @@ def build_handler(
                 return
             if parsed.path == "/api/keys":
                 try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
                     json_response(self, 200, manager.list_api_keys())
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
@@ -11983,6 +11993,10 @@ def build_handler(
                     auth_raw = manager._load_auth_store_raw()
                     if not isinstance(auth_raw, dict):
                         auth_raw = {}
+                    accounts = auth_raw.get("accounts") if isinstance(auth_raw.get("accounts"), dict) else {}
+                    if account_id not in accounts:
+                        json_response(self, 400, {"ok": False, "error": f"Account {account_id} not found"})
+                        return
                     auth_raw["default_account_id"] = account_id
                     manager.paths.auth_store.write_text(json.dumps(auth_raw, ensure_ascii=False, indent=2), encoding="utf-8")
                     json_response(self, 200, {"ok": True, "default_account_id": account_id})

@@ -3390,6 +3390,13 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                     headers=upstream_headers,
                     json=upstream_body,
                 ) as response:
+                    log_upstream_result(
+                        request_type,
+                        "passthrough",
+                        response.is_success,
+                        status_code=response.status_code,
+                        detail=None if response.is_success else response.read().decode("utf-8", "replace"),
+                    )
                     if not response.is_success:
                         error_body = response.read()
                         self._send_upstream_headers(response, is_stream=False, content_length=len(error_body))
@@ -3404,6 +3411,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         self._send_upstream_headers(response, is_stream=False, content_length=len(body))
                         self._write_bytes(body, flush=True)
             except Exception as exc:
+                log_upstream_result(request_type, "passthrough", False, detail=str(exc))
                 self._write_json_error(500, upstream_exception_detail(exc))
             return
 
