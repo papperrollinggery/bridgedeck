@@ -791,6 +791,9 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn("event: response.output_text.delta", body)
         self.assertIn('"delta":"hello"', body)
         self.assertIn("event: response.completed", body)
+        completed_block = body.split("event: response.completed\n", 1)[1]
+        completed_payload = json.loads(completed_block.split("data: ", 1)[1])
+        self.assertEqual(completed_payload["response"]["output"], [])
 
     def test_normalize_preserves_reasoning_summary_and_adds_encrypted_content(self) -> None:
         body = {
