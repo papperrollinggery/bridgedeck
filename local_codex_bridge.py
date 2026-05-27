@@ -32,6 +32,7 @@ except Exception:  # noqa: BLE001
 
 AUTH_STORE_PATH = Path.home() / ".cc-switch" / "codex_oauth_auth.json"
 CC_SWITCH_DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
+DEFAULT_API_KEYS_PATH = Path.home() / ".cc-switch" / "bridgedeck-keys.json"
 OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_USER_AGENT = "codex-local-bridge"
@@ -3164,6 +3165,25 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             and auth != "Bearer local-bridge"
             and not auth.startswith("Bearer sk-bridgedeck-")
         )
+
+    def _is_api_key_request(self) -> bool:
+        auth = self.headers.get("Authorization", "")
+        return bool(auth and auth.startswith("Bearer sk-bridgedeck-"))
+
+    def _validate_api_key(self) -> bool:
+        auth = self.headers.get("Authorization", "")
+        if not auth or not auth.startswith("Bearer sk-bridgedeck-"):
+            return False
+        key = auth[7:]
+        try:
+            raw = DEFAULT_API_KEYS_PATH.read_text(encoding="utf-8")
+            keys = json.loads(raw)
+            if not isinstance(keys, dict):
+                return False
+            entry = keys.get(key)
+            return bool(entry and not entry.get("revoked"))
+        except Exception:
+            return False
 
     def _build_passthrough_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {

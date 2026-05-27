@@ -78,6 +78,7 @@ DEFAULT_OMC_CODEX_SHIM_PATHS = (
 DEFAULT_ZPROFILE_PATH = Path.home() / ".zprofile"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
 DEFAULT_AIMAMI_FOLLOW_PATH = Path.home() / ".cc-switch" / "bridgedeck-aimami-follow.json"
+DEFAULT_API_KEYS_PATH = Path.home() / ".cc-switch" / "bridgedeck-keys.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
 APP_VERSION = "0.2.22"
@@ -3409,6 +3410,50 @@ class BridgeManager:
     def update_aimami_follow_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._save_aimami_follow_config({"enabled": bool(payload.get("enabled", False))})
         return {"ok": True, "aimami_follow": self._load_aimami_follow_config()}
+
+    def _load_api_keys(self) -> dict[str, Any]:
+        raw = load_json(DEFAULT_API_KEYS_PATH, {})
+        return raw if isinstance(raw, dict) else {}
+
+    def _save_api_keys(self, keys: dict[str, Any]) -> None:
+        dump_json(DEFAULT_API_KEYS_PATH, keys)
+
+    def create_api_key(self, label: str = "") -> dict[str, Any]:
+        import secrets
+        key = f"sk-bridgedeck-{secrets.token_urlsafe(32)}"
+        keys = self._load_api_keys()
+        keys[key] = {
+            "label": label or f"key-{len(keys) + 1}",
+            "created_at": int(time.time()),
+            "revoked": False,
+        }
+        self._save_api_keys(keys)
+        return {"ok": True, "key": key, "label": keys[key]["label"]}
+
+    def revoke_api_key(self, key: str) -> dict[str, Any]:
+        keys = self._load_api_keys()
+        if key not in keys:
+            raise ValueError("API key not found")
+        keys[key]["revoked"] = True
+        self._save_api_keys(keys)
+        return {"ok": True, "key": key}
+
+    def list_api_keys(self) -> dict[str, Any]:
+        keys = self._load_api_keys()
+        result = []
+        for k, v in keys.items():
+            result.append({
+                "key_prefix": k[:20] + "...",
+                "label": str(v.get("label") or ""),
+                "created_at": v.get("created_at"),
+                "revoked": bool(v.get("revoked")),
+            })
+        return {"ok": True, "keys": result}
+
+    def validate_api_key(self, key: str) -> bool:
+        keys = self._load_api_keys()
+        entry = keys.get(key)
+        return bool(entry and not entry.get("revoked"))
 
     def _load_accounts(self) -> list[dict[str, Any]]:
         store = load_json(self.paths.auth_store, {})
@@ -11653,6 +11698,12 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
+            if parsed.path == "/api/keys":
+                try:
+                    json_response(self, 200, manager.list_api_keys())
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
             json_response(self, 404, {"ok": False, "error": "Not Found"})
 
         def do_POST(self) -> None:
@@ -11888,6 +11939,16 @@ def build_handler(
                 if self.path == "/api/repair-claude-attribution-header":
                     result = manager.repair_claude_attribution_header()
                     json_response(self, 200 if result.get("ok", True) else 400, result)
+                    return
+                if self.path == "/api/keys/create":
+                    label = str(payload.get("label") or "")
+                    result = manager.create_api_key(label)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/keys/revoke":
+                    key = str(payload.get("key") or "")
+                    result = manager.revoke_api_key(key)
+                    json_response(self, 200, result)
                     return
                 json_response(self, 404, {"ok": False, "error": "Not Found"})
             except Exception as exc:  # noqa: BLE001
