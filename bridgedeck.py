@@ -38,7 +38,16 @@ DEFAULT_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CODEX_AUTH_PATH = DEFAULT_CODEX_HOME / "auth.json"
+CODEX_APP_DYNAMIC_TOOLS = (
+    "automation_update",
+    "read_thread_terminal",
+    "load_workspace_dependencies",
+)
+CODEX_REMOTE_THREAD_CLIENT_MARKERS = ("remote", "ios", "chatgpt")
 CODEX_DESKTOP_LOG_ROOT = Path.home() / "Library" / "Logs" / "com.openai.codex"
+CODEX_DESKTOP_SENTRY_SCOPE_PATH = (
+    Path.home() / "Library" / "Application Support" / "Codex" / "sentry" / "scope_v3.json"
+)
 DEFAULT_INSTALL_STATE_PATH = Path(
     os.environ.get(
         "BRIDGEDECK_INSTALL_STATE_PATH",
@@ -186,6 +195,10 @@ MANAGED_CODEX_PATH_START = "# >>> BridgeDeck codex shim >>>"
 MANAGED_CODEX_PATH_END = "# <<< BridgeDeck codex shim <<<"
 MANAGED_CODEX_DESKTOP_BRIDGE_START = "# >>> BridgeDeck temporary Codex Desktop bridge >>>"
 MANAGED_CODEX_DESKTOP_BRIDGE_END = "# <<< BridgeDeck temporary Codex Desktop bridge <<<"
+CODEX_DESKTOP_BRIDGE_DISABLED_REASON = "codex_desktop_compact_route_unsupported"
+CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE = (
+    "Codex Desktop Stability Route 已禁用：Local Bridge 不支持 /v1/responses/compact，启用会导致上下文压缩 404。"
+)
 PROXY_DIAG_OPENAI_URL = "https://api.openai.com/v1/models"
 PROXY_DIAG_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_PROXY_LOOKUP_KEYS = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy")
@@ -633,7 +646,7 @@ def strip_legacy_bridgedeck_provider_config(text: str, *, remove_static_keys: bo
         if in_top_level and top_level_key_pattern.match(line):
             removed.append("model_provider")
             continue
-        if in_top_level and (legacy_provider or remove_static_keys) and legacy_static_key_pattern.match(line):
+        if in_top_level and remove_static_keys and legacy_static_key_pattern.match(line):
             removed.append(legacy_static_key_pattern.match(line).group(1))  # type: ignore[union-attr]
             continue
         output.append(line)
@@ -1911,6 +1924,12 @@ def codex_desktop_log_state(*, limit: int = 5, max_bytes_per_log: int = 1_500_00
     timestamp_pattern = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z)")
     duration_pattern = re.compile(r"durationMs=(\d+)")
 
+    def mark_seen(key: str, ts: str) -> None:
+        if not ts:
+            return
+        if not last_seen.get(key) or ts > last_seen[key]:
+            last_seen[key] = ts
+
     for path in paths:
         try:
             raw = path.read_bytes()
@@ -1923,25 +1942,25 @@ def codex_desktop_log_state(*, limit: int = 5, max_bytes_per_log: int = 1_500_00
             lower = line.lower()
             if "codex_hooks" in line and "deprecated" in lower:
                 counts["codex_hooks_deprecation"] += 1
-                last_seen["codex_hooks_deprecation"] = ts
+                mark_seen("codex_hooks_deprecation", ts)
             if "unknown conversation" in lower:
                 counts["unknown_conversation"] += 1
-                last_seen["unknown_conversation"] = ts
+                mark_seen("unknown_conversation", ts)
             if "reconnecting" in lower or "reconnect" in lower:
                 counts["reconnect"] += 1
-                last_seen["reconnect"] = ts
+                mark_seen("reconnect", ts)
             duration_match = duration_pattern.search(line)
             duration_ms = safe_int(duration_match.group(1), 0) if duration_match else 0
             if "method=config/read" in line:
                 max_config_read_ms = max(max_config_read_ms, duration_ms)
                 if duration_ms >= 3000:
                     counts["slow_config_read"] += 1
-                    last_seen["slow_config_read"] = ts
+                    mark_seen("slow_config_read", ts)
             if "method=skills/list" in line:
                 max_skills_list_ms = max(max_skills_list_ms, duration_ms)
                 if duration_ms >= 3000:
                     counts["slow_skills_list"] += 1
-                    last_seen["slow_skills_list"] = ts
+                    mark_seen("slow_skills_list", ts)
 
     signals = [key for key, value in counts.items() if value]
     return {
@@ -1954,6 +1973,434 @@ def codex_desktop_log_state(*, limit: int = 5, max_bytes_per_log: int = 1_500_00
         "signals": signals,
         "max_config_read_ms": max_config_read_ms,
         "max_skills_list_ms": max_skills_list_ms,
+    }
+
+
+def _otel_log_value(body: str, key: str) -> str:
+    quoted = re.search(rf"{re.escape(key)}=\"([^\"]*)\"", body)
+    if quoted:
+        return quoted.group(1)
+    bare = re.search(rf"{re.escape(key)}=([^\s}}]+)", body)
+    return bare.group(1) if bare else ""
+
+
+def _is_remote_thread_start(origin: dict[str, Any]) -> bool:
+    client_name = str(origin.get("client_name") or "").lower()
+    return any(marker in client_name for marker in CODEX_REMOTE_THREAD_CLIENT_MARKERS)
+
+
+def codex_thread_start_log_origin(thread_id: str, logs_db_path: Path | None = None) -> dict[str, Any]:
+    path = logs_db_path or (DEFAULT_CODEX_HOME / "logs_2.sqlite")
+    base: dict[str, Any] = {
+        "found": False,
+        "logs_db_path": str(path),
+        "thread_id": thread_id,
+        "client_name": "",
+        "client_version": "",
+        "connection_id": "",
+        "dynamic_tool_count": None,
+        "created_local": "",
+        "remote_origin": False,
+    }
+    if not thread_id:
+        return base
+    if path.is_symlink() or not path.exists() or not path.is_file():
+        return base
+
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            table = conn.execute("select name from sqlite_master where type='table' and name='logs'").fetchone()
+            if not table:
+                return base
+            row = conn.execute(
+                """
+                select ts, feedback_log_body
+                from logs
+                where instr(coalesce(feedback_log_body, ''), ?) > 0
+                  and instr(coalesce(feedback_log_body, ''), 'app_server.thread_start.create_thread') > 0
+                order by ts desc, ts_nanos desc, id desc
+                limit 1
+                """,
+                (f"thread_id={thread_id}",),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return base
+
+    if not row:
+        return base
+    body = str(row["feedback_log_body"] or "")
+    dynamic_tool_count_raw = _otel_log_value(body, "thread_start.dynamic_tool_count")
+    ts = safe_int(row["ts"], 0)
+    origin = {
+        **base,
+        "found": True,
+        "client_name": _otel_log_value(body, "app_server.client_name"),
+        "client_version": _otel_log_value(body, "app_server.client_version"),
+        "connection_id": _otel_log_value(body, "app_server.connection_id"),
+        "dynamic_tool_count": safe_int(dynamic_tool_count_raw, 0) if dynamic_tool_count_raw else None,
+        "created_local": dt.datetime.fromtimestamp(ts).isoformat(timespec="seconds") if ts else "",
+    }
+    origin["remote_origin"] = _is_remote_thread_start(origin)
+    return origin
+
+
+CODEX_DESKTOP_APP_STATE_NUMERIC_KEYS = (
+    "thread_count_total",
+    "thread_count_active",
+    "thread_count_streaming_owner",
+    "thread_count_streaming_with_active_runtime",
+    "thread_count_streaming_without_active_runtime",
+    "thread_count_with_inflight_turn",
+    "pending_request_count",
+    "inflight_turn_count",
+    "host_child_process_count_total",
+    "host_child_app_server_process_count",
+    "host_descendant_app_server_process_count",
+    "main_process_rss_bytes",
+    "renderer_process_working_set_kb",
+)
+CODEX_DESKTOP_APP_STATE_FRESH_SECONDS = 10 * 60
+
+
+def _timestamp_epoch(value: Any) -> tuple[float, str]:
+    if isinstance(value, bool):
+        return 0.0, ""
+    if isinstance(value, (int, float)):
+        epoch = safe_float(value, 0.0)
+        if epoch > 0:
+            return epoch, dt.datetime.fromtimestamp(epoch, dt.UTC).isoformat().replace("+00:00", "Z")
+        return 0.0, ""
+    text = str(value or "").strip()
+    if not text:
+        return 0.0, ""
+    numeric = safe_float(text, 0.0)
+    if numeric > 10_000_000:
+        return numeric, dt.datetime.fromtimestamp(numeric, dt.UTC).isoformat().replace("+00:00", "Z")
+    try:
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        parsed = dt.datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.UTC)
+        parsed = parsed.astimezone(dt.UTC)
+        return parsed.timestamp(), parsed.isoformat().replace("+00:00", "Z")
+    except ValueError:
+        return 0.0, text
+
+
+def codex_desktop_app_state(
+    scope_path: Path | None = None,
+    *,
+    max_age_seconds: int = CODEX_DESKTOP_APP_STATE_FRESH_SECONDS,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
+    path = scope_path or CODEX_DESKTOP_SENTRY_SCOPE_PATH
+    checked_at = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
+    base: dict[str, Any] = {
+        "ok": True,
+        "status": "missing",
+        "message": "Codex Desktop Sentry app-state 文件不存在。",
+        "scope_path": str(path),
+        "checked_at": checked_at.isoformat().replace("+00:00", "Z"),
+        "latest": {},
+        "signals": [],
+        "stale_stream_count": 0,
+        "maybe_resume_marked_streaming_count": 0,
+        "app_state_snapshot_count": 0,
+        "fresh": False,
+        "freshness_source": "",
+        "latest_age_seconds": 0,
+        "max_age_seconds": max_age_seconds,
+    }
+    if path.is_symlink():
+        return {
+            **base,
+            "ok": False,
+            "status": "unreadable",
+            "message": "Codex Desktop Sentry app-state 文件是符号链接，已跳过。",
+        }
+    if not path.exists() or not path.is_file():
+        return base
+    mtime_epoch, mtime_at = _file_mtime(path)
+    base["scope_mtime"] = mtime_at
+    base["scope_mtime_epoch"] = mtime_epoch
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return {
+            **base,
+            "ok": False,
+            "status": "unreadable",
+            "message": f"Codex Desktop Sentry app-state 读取失败：{exc}",
+        }
+
+    scope = payload.get("scope") if isinstance(payload, dict) else {}
+    breadcrumbs = scope.get("breadcrumbs") if isinstance(scope, dict) else []
+    if not isinstance(breadcrumbs, list):
+        breadcrumbs = payload.get("breadcrumbs") if isinstance(payload, dict) else []
+    if not isinstance(breadcrumbs, list):
+        breadcrumbs = []
+
+    latest: dict[str, Any] = {}
+    app_state_snapshot_count = 0
+    maybe_resume_marked_streaming_count = 0
+    latest_turn_completed_but_marked_streaming = False
+    for breadcrumb in breadcrumbs:
+        if not isinstance(breadcrumb, dict):
+            continue
+        category = str(breadcrumb.get("category") or "")
+        message = str(breadcrumb.get("message") or "")
+        data = breadcrumb.get("data") if isinstance(breadcrumb.get("data"), dict) else {}
+        if category == "app_state" and message == "app_state_snapshot":
+            app_state_snapshot_count += 1
+            latest = {key: safe_int(data.get(key), 0) for key in CODEX_DESKTOP_APP_STATE_NUMERIC_KEYS}
+            latest["snapshot_reason"] = str(data.get("snapshot_reason") or "")
+            _, timestamp_at = _timestamp_epoch(breadcrumb.get("timestamp"))
+            latest["timestamp"] = timestamp_at or str(breadcrumb.get("timestamp") or "")
+        if "maybe_resume_success" in message and "markedStreaming=true" in message:
+            maybe_resume_marked_streaming_count += 1
+            if "latestTurnStatus=completed" in message:
+                latest_turn_completed_but_marked_streaming = True
+
+    if not latest:
+        return {
+            **base,
+            "status": "no_app_state",
+            "message": "Codex Desktop Sentry scope 内没有 app_state_snapshot。",
+            "app_state_snapshot_count": 0,
+        }
+
+    stale_stream_count = safe_int(latest.get("thread_count_streaming_without_active_runtime"), 0)
+    latest_timestamp_epoch, latest_timestamp_at = _timestamp_epoch(latest.get("timestamp"))
+    freshness_source = "app_state_timestamp" if latest_timestamp_epoch else ("scope_mtime" if mtime_epoch else "")
+    freshness_epoch = latest_timestamp_epoch or mtime_epoch
+    latest_age_seconds = 0
+    fresh = False
+    if freshness_epoch:
+        latest_age_seconds = max(0, int(checked_at.timestamp() - freshness_epoch))
+        fresh = latest_age_seconds <= max(0, int(max_age_seconds))
+    app_server_children = max(
+        safe_int(latest.get("host_child_app_server_process_count"), 0),
+        safe_int(latest.get("host_descendant_app_server_process_count"), 0),
+    )
+    signals: list[str] = []
+    if stale_stream_count:
+        signals.append("streaming_without_active_runtime")
+    if latest_turn_completed_but_marked_streaming:
+        signals.append("completed_turn_marked_streaming")
+    if app_server_children >= 6:
+        signals.append("app_server_children_high")
+    if signals and not fresh:
+        signals.append("unfresh_app_state_evidence")
+
+    status = "ok"
+    message = "Codex Desktop Sentry app-state 未发现 stale streaming。"
+    ok = True
+    if stale_stream_count or latest_turn_completed_but_marked_streaming:
+        ok = False
+        if fresh:
+            status = "stale_stream_state"
+            message = "Codex Desktop 存在 streaming owner 但没有 active runtime。"
+        else:
+            status = "stale_stream_state_unfresh"
+            message = "Codex Desktop Sentry app-state 存在 stale stream 信号，但证据已过期。"
+    elif "app_server_children_high" in signals:
+        status = "app_server_children_high"
+        message = f"Codex Desktop app-server 子进程偏高：{app_server_children}。"
+
+    return {
+        **base,
+        "ok": ok,
+        "status": status,
+        "message": message,
+        "latest": latest,
+        "signals": signals,
+        "fresh": fresh,
+        "freshness_source": freshness_source,
+        "latest_timestamp": latest_timestamp_at,
+        "latest_timestamp_epoch": latest_timestamp_epoch,
+        "latest_age_seconds": latest_age_seconds,
+        "max_age_seconds": max_age_seconds,
+        "stale_stream_count": stale_stream_count,
+        "maybe_resume_marked_streaming_count": maybe_resume_marked_streaming_count,
+        "latest_turn_completed_but_marked_streaming": latest_turn_completed_but_marked_streaming,
+        "app_state_snapshot_count": app_state_snapshot_count,
+    }
+
+
+def codex_app_dynamic_tools_state(
+    state_db_path: Path | None = None,
+    *,
+    logs_db_path: Path | None = None,
+    thread_id: str | None = None,
+    recent_limit: int = 12,
+) -> dict[str, Any]:
+    path = state_db_path or (DEFAULT_CODEX_HOME / "state_5.sqlite")
+    thread_start_logs_db_path = logs_db_path or (path.parent / "logs_2.sqlite")
+    base: dict[str, Any] = {
+        "ok": True,
+        "status": "missing",
+        "message": "Codex state_5.sqlite 不存在。",
+        "state_db_path": str(path),
+        "expected_tools": [f"codex_app.{name}" for name in CODEX_APP_DYNAMIC_TOOLS],
+        "latest": {},
+        "suspect_threads": [],
+    }
+    if path.is_symlink():
+        return {
+            **base,
+            "ok": False,
+            "status": "unreadable",
+            "message": "Codex state_5.sqlite 是符号链接，已跳过。",
+        }
+    if not path.exists() or not path.is_file():
+        return base
+
+    def row_public(row: sqlite3.Row) -> dict[str, Any]:
+        names = str(row["dynamic_tool_names"] or "")
+        return {
+            "id": str(row["id"] or ""),
+            "created_local": str(row["created_local"] or ""),
+            "source": str(row["source"] or ""),
+            "thread_source": str(row["thread_source"] or ""),
+            "cwd": str(row["cwd"] or ""),
+            "title": str(row["title"] or ""),
+            "model_provider": str(row["model_provider"] or ""),
+            "dynamic_tools": safe_int(row["dynamic_tools"], 0),
+            "dynamic_tool_names": [name for name in names.split(",") if name],
+        }
+
+    def missing_expected_tools(item: dict[str, Any]) -> list[str]:
+        present = set(item.get("dynamic_tool_names") or [])
+        return [tool for tool in base["expected_tools"] if tool not in present]
+
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            table_rows = conn.execute(
+                "select name from sqlite_master where type='table' and name in ('threads','thread_dynamic_tools')"
+            ).fetchall()
+            tables = {str(row["name"]) for row in table_rows}
+            if {"threads", "thread_dynamic_tools"} - tables:
+                return {
+                    **base,
+                    "ok": False,
+                    "status": "schema_missing",
+                    "message": "Codex state_5.sqlite 缺少 threads/thread_dynamic_tools 表。",
+                    "tables": sorted(tables),
+                }
+
+            sql = """
+                select
+                    t.id,
+                    datetime(t.created_at, 'unixepoch', 'localtime') as created_local,
+                    coalesce(t.source, '') as source,
+                    coalesce(t.thread_source, '') as thread_source,
+                    coalesce(t.cwd, '') as cwd,
+                    coalesce(t.title, '') as title,
+                    coalesce(t.model_provider, '') as model_provider,
+                    coalesce(d.cnt, 0) as dynamic_tools,
+                    coalesce(d.names, '') as dynamic_tool_names
+                from threads t
+                left join (
+                    select
+                        thread_id,
+                        count(*) as cnt,
+                        group_concat(namespace || '.' || name) as names
+                    from thread_dynamic_tools
+                    group by thread_id
+                ) d on d.thread_id = t.id
+            """
+            if thread_id:
+                rows = conn.execute(sql + " where t.id = ?", (thread_id,)).fetchall()
+            else:
+                rows = conn.execute(
+                    sql + " where coalesce(t.source, '') = 'vscode' order by t.created_at desc limit ?",
+                    (max(1, int(recent_limit)),),
+                ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return {
+            **base,
+            "ok": False,
+            "status": "unreadable",
+            "message": f"Codex state_5.sqlite 读取失败：{exc}",
+        }
+
+    items = [row_public(row) for row in rows]
+    latest = items[0] if items else {}
+    suspects = [item for item in items if missing_expected_tools(item)]
+    for item in items:
+        item["missing_expected_tools"] = missing_expected_tools(item)
+        if item.get("missing_expected_tools") or item.get("thread_source") != "user":
+            origin = codex_thread_start_log_origin(str(item.get("id") or ""), logs_db_path=thread_start_logs_db_path)
+            if origin.get("found"):
+                item["thread_start_log"] = origin
+
+    if thread_id and not latest:
+        return {
+            **base,
+            "ok": False,
+            "status": "thread_missing",
+            "message": f"Codex state_5.sqlite 未找到线程 {thread_id}。",
+        }
+    latest_origin = latest.get("thread_start_log") if isinstance(latest.get("thread_start_log"), dict) else {}
+    if latest and latest.get("missing_expected_tools") and _is_remote_thread_start(latest_origin):
+        client = str(latest_origin.get("client_name") or "remote client")
+        count = latest_origin.get("dynamic_tool_count")
+        count_part = f"，thread/start dynamic_tool_count={count}" if count is not None else ""
+        return {
+            **base,
+            "ok": False,
+            "status": "remote_dynamic_tools_missing",
+            "message": f"Codex 线程由 {client} 创建{count_part}；重启本机 Codex 不会补回 dynamic tools。",
+            "latest": latest,
+            "suspect_threads": suspects,
+        }
+    if latest and latest.get("missing_expected_tools"):
+        return {
+            **base,
+            "ok": False,
+            "status": "missing_dynamic_tools",
+            "message": "Codex 线程启动时未注入 codex_app dynamic tools。",
+            "latest": latest,
+            "suspect_threads": suspects,
+        }
+    if latest and latest.get("thread_source") != "user":
+        return {
+            **base,
+            "ok": False,
+            "status": "non_user_thread_source",
+            "message": "Codex 线程 thread_source 不是 user，可能走了非标准启动路径。",
+            "latest": latest,
+            "suspect_threads": suspects,
+        }
+    if suspects:
+        return {
+            **base,
+            "ok": False,
+            "status": "recent_missing_dynamic_tools",
+            "message": "近期 Codex 线程曾缺失 codex_app dynamic tools。",
+            "latest": latest,
+            "suspect_threads": suspects,
+        }
+    if latest:
+        return {
+            **base,
+            "status": "ok",
+            "message": "近期 Codex 用户线程 dynamic tools 正常。",
+            "latest": latest,
+            "suspect_threads": [],
+        }
+    return {
+        **base,
+        "status": "no_vscode_threads",
+        "message": "Codex state_5.sqlite 未找到 vscode 来源线程。",
     }
 
 
@@ -3368,6 +3815,86 @@ class BridgeManager:
             "claude_hook_risks": hook_risks,
         }
 
+    def codex_stability_route_canary(
+        self,
+        *,
+        desktop: dict[str, Any] | None = None,
+        native_proxy: dict[str, Any] | None = None,
+        app_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        desktop = desktop or self._codex_desktop_status()
+        native_proxy = native_proxy or self.codex_native_proxy_status()
+        app_state = app_state or codex_desktop_app_state()
+        bridge_running = tcp_open("127.0.0.1", LOCAL_BRIDGE_PORT)
+        route_active = desktop.get("bridge_mode") == "bridgedeck_provider"
+        fresh_stale_stream = app_state.get("status") == "stale_stream_state" and bool(app_state.get("fresh"))
+        native_status = str(native_proxy.get("status") or "unknown")
+        account_id = str(desktop.get("account_id") or "")
+        checks = [
+            {
+                "id": "fresh_app_state",
+                "status": "ok" if fresh_stale_stream else "blocked",
+                "detail": app_state.get("message", ""),
+            },
+            {
+                "id": "local_bridge",
+                "status": "ok" if bridge_running else "blocked",
+                "detail": f"http://127.0.0.1:{LOCAL_BRIDGE_PORT}",
+            },
+            {
+                "id": "native_proxy",
+                "status": "ok" if native_status == "ok" else "blocked",
+                "detail": native_proxy.get("message", ""),
+            },
+            {
+                "id": "stability_route",
+                "status": "blocked",
+                "detail": desktop.get("managed_by", "unknown"),
+            },
+            {
+                "id": "compact_route",
+                "status": "blocked",
+                "detail": "Local Bridge 当前未实现 /v1/responses/compact。",
+            },
+        ]
+        pass_criteria = [
+            "先补齐 Local Bridge /v1/responses/compact 兼容端点。",
+            "确认不会写入 model/provider/model_reasoning_effort。",
+            "再用真实 Codex Desktop 会话验证上下文压缩。",
+        ]
+        if route_active:
+            status = "unsafe_active"
+            action = "restore_native_mode"
+            message = CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE
+            eligible = False
+        elif app_state.get("status") == "stale_stream_state_unfresh":
+            status = "needs_fresh_evidence"
+            action = "collect_fresh_app_state"
+            message = "Sentry app-state 证据已过期；Stability Route 暂不启用。"
+            eligible = False
+        elif fresh_stale_stream and bridge_running and native_status == "ok":
+            status = "disabled"
+            action = "keep_native_mode"
+            message = CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE
+            eligible = False
+        else:
+            status = "disabled"
+            action = "keep_native_mode"
+            message = CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE
+            eligible = False
+        return {
+            "ok": eligible,
+            "status": status,
+            "action": action,
+            "message": message,
+            "eligible": eligible,
+            "route_active": route_active,
+            "bridge_running": bridge_running,
+            "account_id": account_id,
+            "checks": checks,
+            "pass_criteria": pass_criteria,
+        }
+
     def codex_desktop_doctor(self) -> dict[str, Any]:
         config = codex_config_feature_state()
         desktop = self._codex_desktop_status()
@@ -3378,6 +3905,22 @@ class BridgeManager:
         )
         versions = codex_cli_version_state()
         logs = codex_desktop_log_state()
+        app_state = codex_desktop_app_state()
+        dynamic_tools = codex_app_dynamic_tools_state()
+        stability_route_canary = self.codex_stability_route_canary(
+            desktop=desktop,
+            native_proxy=native_proxy,
+            app_state=app_state,
+        )
+        app_state_status = str(app_state.get("status") or "unknown")
+        if app_state_status == "stale_stream_state":
+            app_state_check_status = "failed"
+        elif app_state_status == "stale_stream_state_unfresh":
+            app_state_check_status = "warning"
+        elif app_state_status in {"ok", "missing", "no_app_state"}:
+            app_state_check_status = app_state_status
+        else:
+            app_state_check_status = "warning"
 
         checks: list[dict[str, Any]] = [
             {
@@ -3407,6 +3950,22 @@ class BridgeManager:
                 ),
             },
             {
+                "id": "desktop_app_state",
+                "label": "Codex Desktop app-state",
+                "status": app_state_check_status,
+                "detail": app_state.get("message", ""),
+            },
+            {
+                "id": "codex_app_dynamic_tools",
+                "label": "Codex App dynamic tools",
+                "status": (
+                    "ok"
+                    if dynamic_tools.get("status") == "ok"
+                    else ("failed" if not dynamic_tools.get("ok") else dynamic_tools.get("status", "unknown"))
+                ),
+                "detail": dynamic_tools.get("message", ""),
+            },
+            {
                 "id": "desktop_logs",
                 "label": "Codex Desktop logs",
                 "status": logs.get("status", "unknown"),
@@ -3434,6 +3993,14 @@ class BridgeManager:
         has_deprecation_warning = bool(log_counts.get("codex_hooks_deprecation"))
         has_unknown_conversation = bool(log_counts.get("unknown_conversation"))
         has_slow_app_server_calls = bool(log_counts.get("slow_config_read") or log_counts.get("slow_skills_list"))
+        has_stale_stream_state = app_state_status == "stale_stream_state"
+        has_unfresh_stale_stream_state = app_state_status == "stale_stream_state_unfresh"
+        has_dynamic_tools_failure = str(dynamic_tools.get("status") or "") in {
+            "missing_dynamic_tools",
+            "non_user_thread_source",
+            "recent_missing_dynamic_tools",
+            "remote_dynamic_tools_missing",
+        }
 
         if config.get("active_legacy_key_present"):
             status = "active_config_legacy_key"
@@ -3441,10 +4008,10 @@ class BridgeManager:
             message = "活跃 ~/.codex/config.toml 仍包含 deprecated codex_hooks。"
             recommendations.append("删除 [features].codex_hooks，保留 [features].hooks = true。")
         elif desktop.get("bridge_mode") == "bridgedeck_provider":
-            status = "bridge_mode_active"
+            status = "bridge_mode_unsupported"
             action = "restore_native_mode"
-            message = "Codex Desktop 当前处于 BridgeDeck 临时 Bridge 模式。"
-            recommendations.append("如果不是刻意绕过原生路径，先恢复 Codex Desktop 原生模式。")
+            message = CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE
+            recommendations.append("恢复 Codex Desktop 原生模式；只移除 BridgeDeck provider，不清理模型或思考等级。")
         elif native_status in {"missing", "incomplete", "proxy_down", "blocked"}:
             status = f"native_proxy_{native_status}"
             action = "repair_env" if native_status in {"missing", "incomplete"} else "start_proxy"
@@ -3452,11 +4019,34 @@ class BridgeManager:
             recommendations.append("只修复 ~/.codex/.env；不要改 model/provider。")
             if native_status != "blocked":
                 recommendations.append("修复后完全退出并重启 Codex Desktop。")
+        elif has_dynamic_tools_failure:
+            message = str(dynamic_tools.get("message") or "Codex 线程缺失 codex_app dynamic tools。")
+            if dynamic_tools.get("status") == "remote_dynamic_tools_missing":
+                status = "remote_thread_dynamic_tools_missing"
+                action = "create_local_desktop_thread"
+                recommendations.append("停止在该 remote/iOS 创建的线程里做 automation；直接用本机 Codex Desktop 新建普通用户会话。")
+                recommendations.append("新线程必须验证 thread_source=user、dynamic_tools=3。")
+            else:
+                status = "desktop_dynamic_tools_missing"
+                action = "new_user_thread_after_hard_restart"
+                recommendations.append("不要继续重复改 config 或 BridgeDeck provider；该问题发生在线程启动注入阶段。")
+                recommendations.append("完全退出 Codex Desktop 后新建普通用户会话，并验证 thread_source=user、dynamic_tools=3。")
         elif process_state.get("restart_required"):
             status = "desktop_state_stale"
             action = "hard_restart_codex"
-            message = "Codex app-server 启动时间早于 config/env 修改时间，当前进程可能仍持有旧状态。"
-            recommendations.append("完全退出 Codex Desktop，再重新打开。")
+            message = "Codex app-server 启动时间早于 config/env 修改时间，当前进程可能仍持有旧 features/config 状态。"
+            recommendations.append("不要继续重复改 config；当前活跃 config 已清理时，必须完全退出 Codex Desktop 再重新打开。")
+        elif has_stale_stream_state:
+            status = "desktop_stream_state_stale"
+            action = "keep_native_mode"
+            message = str(app_state.get("message") or "Codex Desktop streaming 状态卡在无 runtime。")
+            recommendations.append("保持 Codex Desktop 原生配置；不要启用 Stability Route。")
+            recommendations.append("先补齐 Local Bridge /v1/responses/compact 兼容后，再评估是否恢复路由。")
+        elif has_unfresh_stale_stream_state:
+            status = "desktop_app_state_unfresh"
+            action = "collect_fresh_app_state"
+            message = str(app_state.get("message") or "Codex Desktop app-state 证据已过期。")
+            recommendations.append("先重新采样 app-state；Stability Route 暂不启用。")
         elif has_deprecation_warning and clean_hooks_config:
             status = "upstream_hooks_warning_likely"
             action = "report_upstream"
@@ -3491,6 +4081,9 @@ class BridgeManager:
             "process": process_state,
             "versions": versions,
             "logs": logs,
+            "app_state": app_state,
+            "dynamic_tools": dynamic_tools,
+            "stability_route_canary": stability_route_canary,
             "codex_desktop": desktop,
         }
 
@@ -5871,51 +6464,15 @@ class BridgeManager:
         account_id = account_id.strip()
         if not account_id:
             raise ValueError("account_id 不能为空")
-        with self._lock:
-            store = self._load_auth_store_raw()
-            accounts = store.get("accounts")
-            if not isinstance(accounts, dict):
-                raise ValueError("auth store 缺少 accounts")
-            account_payload = accounts.get(account_id)
-            if not isinstance(account_payload, dict):
-                raise ValueError(f"未找到账号: {account_id}")
-            config_path = DEFAULT_CODEX_HOME / "config.toml"
-            if config_path.is_symlink():
-                raise ValueError("~/.codex/config.toml 不能是符号链接")
-            DEFAULT_CODEX_HOME.mkdir(parents=True, exist_ok=True)
-            os.chmod(DEFAULT_CODEX_HOME, 0o700)
-            original = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-            cleaned, stripped_managed = strip_managed_codex_desktop_bridge(original)
-            cleaned, stripped_legacy_keys = strip_legacy_bridgedeck_provider_config(cleaned, remove_static_keys=True)
-            block = codex_desktop_bridge_block(account_id)
-            updated = f"{block}{cleaned.lstrip()}" if cleaned.strip() else block
-            if updated == original:
-                return {
-                    "ok": True,
-                    "changed": False,
-                    "message": "Codex Desktop 临时 Bridge 模式已是当前配置",
-                    "account_id": account_id,
-                    "config_path": str(config_path),
-                    "base_url": f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1",
-                    "backup": None,
-                    "stripped_managed": stripped_managed,
-                    "stripped_legacy_keys": stripped_legacy_keys,
-                }
-            backup = self._backup_file(config_path, "codex-desktop-bridge-mode") if config_path.exists() else None
-            write_private_text_file(config_path, updated)
-            return {
-                "ok": True,
-                "changed": True,
-                "message": "已开启 Codex Desktop 临时 Bridge 模式",
-                "account_id": account_id,
-                "email": account_payload.get("email", ""),
-                "config_path": str(config_path),
-                "base_url": f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1",
-                "backup": backup,
-                "stripped_managed": stripped_managed,
-                "stripped_legacy_keys": stripped_legacy_keys,
-                "restart_required": True,
-            }
+        return {
+            "ok": False,
+            "changed": False,
+            "message": CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE,
+            "blocked_reason": CODEX_DESKTOP_BRIDGE_DISABLED_REASON,
+            "account_id": account_id,
+            "config_path": str(DEFAULT_CODEX_HOME / "config.toml"),
+            "restart_required": False,
+        }
 
     def restore_codex_desktop_native_mode(self) -> dict[str, Any]:
         with self._lock:
@@ -5933,7 +6490,7 @@ class BridgeManager:
                 }
             original = config_path.read_text(encoding="utf-8")
             updated, stripped_managed = strip_managed_codex_desktop_bridge(original)
-            updated, stripped_legacy_keys = strip_legacy_bridgedeck_provider_config(updated, remove_static_keys=True)
+            updated, stripped_legacy_keys = strip_legacy_bridgedeck_provider_config(updated, remove_static_keys=False)
             removed = [*stripped_legacy_keys]
             if stripped_managed:
                 removed.append("managed_bridge_block")
@@ -6519,6 +7076,24 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(logs, dict):
             logs["log_root"] = redact_path_value(logs.get("log_root"))
             logs["paths"] = [redact_path_value(item) for item in logs.get("paths", []) if isinstance(item, str)]
+        app_state = doctor.get("app_state")
+        if isinstance(app_state, dict):
+            app_state["scope_path"] = redact_path_value(app_state.get("scope_path"))
+        dynamic_tools = doctor.get("dynamic_tools")
+        if isinstance(dynamic_tools, dict):
+            dynamic_tools["state_db_path"] = redact_path_value(dynamic_tools.get("state_db_path"))
+            latest = dynamic_tools.get("latest")
+            if isinstance(latest, dict):
+                latest["cwd"] = redact_path_value(latest.get("cwd"))
+                thread_start_log = latest.get("thread_start_log")
+                if isinstance(thread_start_log, dict):
+                    thread_start_log["logs_db_path"] = redact_path_value(thread_start_log.get("logs_db_path"))
+            for item in dynamic_tools.get("suspect_threads", []):
+                if isinstance(item, dict):
+                    item["cwd"] = redact_path_value(item.get("cwd"))
+                    thread_start_log = item.get("thread_start_log")
+                    if isinstance(thread_start_log, dict):
+                        thread_start_log["logs_db_path"] = redact_path_value(thread_start_log.get("logs_db_path"))
         desktop_doctor = doctor.get("codex_desktop")
         if isinstance(desktop_doctor, dict):
             desktop_doctor["config_path"] = redact_path_value(desktop_doctor.get("config_path"))
@@ -7074,15 +7649,15 @@ INDEX_HTML = """<!doctype html>
                 <div class="toolCard">
                   <div>
                     <div class="toolName">Codex Desktop</div>
-                    <div class="toolText">默认保持原生。恢复原生会移除 BridgeDeck provider 和静态模型/思考等级残留；代理修复只写 .env。</div>
+                    <div class="toolText">默认保持原生。Stability Route 已禁用；恢复原生只移除 BridgeDeck provider，代理修复只写 .env。</div>
                     <div class="actualRow">
                       <div class="actualLine" id="simpleDesktopActual">当前实际：检测中...</div>
                       <button class="miniBtn" data-action="refresh">刷新</button>
                     </div>
                   </div>
                   <div class="apiEnvActions">
-                    <button class="miniBtn warn" data-action="enable-desktop-bridge-mode">临时接入 BridgeDeck</button>
-                    <button class="miniBtn" data-action="restore-desktop-native-mode">恢复原生/清理静态项</button>
+                    <button class="miniBtn warn" data-action="enable-desktop-bridge-mode" disabled title="Local Bridge 不支持 /v1/responses/compact">Stability Route 已禁用</button>
+                    <button class="miniBtn" data-action="restore-desktop-native-mode">恢复原生</button>
                     <button class="miniBtn" data-action="scroll" data-target="statusCard">查看状态</button>
                   </div>
                 </div>
@@ -7477,7 +8052,7 @@ INDEX_HTML = """<!doctype html>
           '“当前实际”显示 CC Switch 当前 Claude Provider。',
           '单独 Codex CLI 只生成独立启动器，不改变全局默认。',
           '全局 Codex CLI 只生成固定入口和 OMC/tmux shim，不改 Codex Desktop。',
-          'Codex Desktop 临时 Bridge 模式必须手动开启，随时可恢复原生。',
+          'Codex Desktop Stability Route 已禁用，保留原生配置。',
           '三个入口可以同号，也可以不同号。',
           '下方高级区只在排查时使用。'
         ]
@@ -8173,7 +8748,7 @@ INDEX_HTML = """<!doctype html>
       if (!box) return;
       const status = payload.status || 'unknown';
       const state = status === 'healthy' ? 'okState'
-        : (['active_config_legacy_key', 'native_proxy_missing', 'native_proxy_incomplete', 'native_proxy_proxy_down', 'native_proxy_blocked', 'desktop_state_stale', 'desktop_event_session_unhealthy'].includes(status) ? 'badState' : 'warnState');
+        : (['active_config_legacy_key', 'native_proxy_missing', 'native_proxy_incomplete', 'native_proxy_proxy_down', 'native_proxy_blocked', 'desktop_dynamic_tools_missing', 'remote_thread_dynamic_tools_missing', 'desktop_state_stale', 'desktop_stream_state_stale', 'desktop_app_state_unfresh', 'desktop_event_session_unhealthy'].includes(status) ? 'badState' : 'warnState');
       box.className = `recommend mt10 ${state}`;
       const checks = Array.isArray(payload.checks) ? payload.checks : [];
       const checkLines = checks.map((item) => `${item.label || item.id}: ${item.status || '-'}${item.detail ? ` · ${item.detail}` : ''}`);
@@ -9163,7 +9738,7 @@ INDEX_HTML = """<!doctype html>
         default: '默认配置',
         custom: '自定义配置',
         cc_switch: 'CC Switch',
-        bridgedeck_provider: 'BridgeDeck 临时模式',
+        bridgedeck_provider: 'BridgeDeck Stability Route',
         bridgedeck_or_local_bridge: 'BridgeDeck 本地桥',
         unknown: '未知'
       };
@@ -9402,15 +9977,7 @@ INDEX_HTML = """<!doctype html>
       log(`${res.message}: ${currentLauncher || humanPath(res.current_launcher || '')}`);
     }
     async function enableDesktopBridgeMode() {
-      const item = selectedAccount('simpleDefaultAccount') || selectedAccount('simpleApiAccount') || selectedAccount('simpleClaudeAccount');
-      if (!item) return setSimpleResult('先选择一个账号。', 'warn');
-      if (!confirm('临时 Bridge 模式会写入 ~/.codex/config.toml 的 model_provider=bridgedeck。仅用于救急测试，之后可点“恢复原生”。继续？')) return;
-      setSimpleResult(`正在开启 Codex Desktop 临时 Bridge 模式：${accountLabel(item)}...`);
-      const res = await api('/api/codex-desktop-bridge-mode', 'POST', { account_id: item.account_id });
-      await refreshData();
-      const backup = res.backup ? `；备份：${humanPath(res.backup)}` : '';
-      setSimpleResult(`${res.message}：${accountLabel(item)}${backup}。重启 Codex Desktop 后生效。`, 'warn');
-      log(`${res.message}: ${humanPath(res.config_path)}${backup}`);
+      setSimpleResult('Codex Desktop Stability Route 已禁用：Local Bridge 不支持 /v1/responses/compact，不写入 ~/.codex/config.toml。', 'warn');
     }
     async function restoreDesktopNativeMode() {
       const res = await api('/api/codex-desktop-native-mode', 'POST', {});
@@ -9986,7 +10553,7 @@ def build_handler(
                 if self.path == "/api/codex-desktop-bridge-mode":
                     account_id = str(payload.get("account_id") or "")
                     result = manager.enable_codex_desktop_bridge_mode(account_id)
-                    json_response(self, 200, result)
+                    json_response(self, 200 if result.get("ok", True) else 409, result)
                     return
                 if self.path == "/api/codex-desktop-native-mode":
                     result = manager.restore_codex_desktop_native_mode()

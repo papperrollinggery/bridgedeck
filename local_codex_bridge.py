@@ -3941,6 +3941,29 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
 
         return event_name, payload, data_lines
 
+    def _normalize_responses_completed_sse_block(
+        self,
+        event_name: str | None,
+        payload: dict[str, Any] | None,
+        raw_block: str,
+    ) -> str:
+        if event_name != "response.completed" or not isinstance(payload, dict):
+            return raw_block
+        response_obj = payload.get("response")
+        if not isinstance(response_obj, dict):
+            return raw_block
+        if isinstance(response_obj.get("output"), list):
+            return raw_block
+
+        normalized_payload = dict(payload)
+        normalized_response = dict(response_obj)
+        normalized_response["output"] = []
+        normalized_payload["response"] = normalized_response
+        return (
+            "event: response.completed\n"
+            f"data: {json.dumps(normalized_payload, ensure_ascii=False)}\n\n"
+        )
+
     def _block_has_reasoning_signal(
         self,
         event_name: str | None,
@@ -4058,10 +4081,14 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         upstream_request_id: str | None = None,
         metrics: BridgeStreamMetrics | None = None,
     ):
-        raw_block = "\n".join(block_lines) + "\n\n"
+        event_name, payload, data_lines = self._parse_sse_block(block_lines)
+        raw_block = self._normalize_responses_completed_sse_block(
+            event_name,
+            payload,
+            "\n".join(block_lines) + "\n\n",
+        )
         yield raw_block.encode("utf-8")
 
-        event_name, payload, data_lines = self._parse_sse_block(block_lines)
         if metrics is not None:
             metrics.upstream_events += 1
             event_key = event_name or ""
