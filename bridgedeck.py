@@ -3521,6 +3521,29 @@ class BridgeManager:
             return {"ok": False, "error": str(e)}
         return {"ok": False, "error": "Unknown action"}
 
+    def _rotation_config_path(self) -> Path:
+        return Path.home() / ".cc-switch" / "bridgedeck-rotation.json"
+
+    def get_rotation_strategy(self) -> dict[str, Any]:
+        path = self._rotation_config_path()
+        config = load_json(path, {})
+        if not isinstance(config, dict):
+            config = {}
+        return {
+            "ok": True,
+            "strategy": str(config.get("strategy") or "manual"),
+            "auto_failover": bool(config.get("auto_failover", False)),
+        }
+
+    def save_rotation_strategy(self, strategy: str, auto_failover: bool) -> dict[str, Any]:
+        if strategy not in ("priority", "round-robin", "least-used", "manual"):
+            return {"ok": False, "error": "Invalid strategy"}
+        path = self._rotation_config_path()
+        config = {"strategy": strategy, "auto_failover": auto_failover}
+        path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.chmod(path, 0o600)
+        return {"ok": True, "strategy": strategy, "auto_failover": auto_failover}
+
     def _load_accounts(self) -> list[dict[str, Any]]:
         store = load_json(self.paths.auth_store, {})
         accounts = store.get("accounts") if isinstance(store, dict) else {}
@@ -9269,9 +9292,28 @@ INDEX_HTML = """<!doctype html>
                 </table>
               </div>
             </div>
+            <div class="card">
+              <h2>轮换策略</h2>
+              <div class="sectionHint">配置账户轮换方式。优先级模式按顺序使用，轮询模式交替使用。</div>
+              <div class="row mt10">
+                <label>轮换模式</label>
+                <select id="rotationStrategy">
+                  <option value="priority">优先级（按顺序）</option>
+                  <option value="round-robin">轮询（交替）</option>
+                  <option value="least-used">最少使用</option>
+                  <option value="manual">手动（不自动轮换）</option>
+                </select>
+                <button class="primary" data-action="save-rotation-strategy">保存策略</button>
+              </div>
+              <div class="row mt10">
+                <label>
+                  <input type="checkbox" id="autoFailover" /> 自动故障转移
+                </label>
+                <span class="muted">当前账户失败时自动切换到下一个</span>
+              </div>
+              <div id="rotationStatus" class="recommend mt10">未配置</div>
+            </div>
           </section>
-
-          <section class="deckPage" id="page-api-keys">
             <div class="pageHeader">
               <div>
                 <h2 class="pageTitle">API Keys</h2>
@@ -10353,6 +10395,33 @@ INDEX_HTML = """<!doctype html>
         await refreshAccountPool();
       } else {
         log(`切换失败: ${res.error}`);
+      }
+    }
+
+    async function refreshRotationStrategy() {
+      try {
+        const data = await api('/api/rotation-strategy');
+        if (data.ok) {
+          document.getElementById('rotationStrategy').value = data.strategy || 'manual';
+          document.getElementById('autoFailover').checked = !!data.auto_failover;
+          const status = document.getElementById('rotationStatus');
+          status.className = 'recommend ok';
+          status.textContent = `当前策略: ${data.strategy || 'manual'}, 自动故障转移: ${data.auto_failover ? '开启' : '关闭'}`;
+        }
+      } catch (e) {
+        console.error('Rotation strategy refresh failed:', e);
+      }
+    }
+
+    async function saveRotationStrategy() {
+      const strategy = document.getElementById('rotationStrategy').value;
+      const autoFailover = document.getElementById('autoFailover').checked;
+      const res = await api('/api/rotation-strategy', 'POST', { strategy, auto_failover: autoFailover });
+      if (res.ok) {
+        log(`轮换策略已保存: ${strategy}, 故障转移: ${autoFailover ? '开' : '关'}`);
+        await refreshRotationStrategy();
+      } else {
+        log(`保存失败: ${res.error}`);
       }
     }
 
@@ -11561,6 +11630,7 @@ INDEX_HTML = """<!doctype html>
       refreshAccountPool();
       refreshApiKeys();
       refreshServiceControl();
+      refreshRotationStrategy();
     }
     async function createProvider() {
       const accountId = document.getElementById('account').value;
@@ -11833,6 +11903,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'select-cli-account') return selectCliAccount(button.dataset.accountId || '');
           // New Phase 4 actions
           if (action === 'set-default-account') return setDefaultAccount();
+          if (action === 'save-rotation-strategy') return saveRotationStrategy();
           if (action === 'create-api-key') return createApiKey();
           if (action === 'service-start') return serviceControl('start');
           if (action === 'service-stop') return serviceControl('stop');
@@ -12196,6 +12267,18 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
+            if parsed.path == "/api/rotation-strategy":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    json_response(self, 200, manager.get_rotation_strategy())
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
             json_response(self, 404, {"ok": False, "error": "Not Found"})
 
         def do_POST(self) -> None:
@@ -12472,6 +12555,12 @@ def build_handler(
                         json_response(self, 400, {"ok": False, "error": "Invalid action"})
                         return
                     result = manager.launchd_control(action)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/rotation-strategy":
+                    strategy = str(payload.get("strategy") or "manual")
+                    auto_failover = bool(payload.get("auto_failover", False))
+                    result = manager.save_rotation_strategy(strategy, auto_failover)
                     json_response(self, 200, result)
                     return
                 json_response(self, 404, {"ok": False, "error": "Not Found"})
