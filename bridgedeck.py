@@ -11021,13 +11021,6 @@ INDEX_HTML = """<!doctype html>
     function copyApiKey() {
       return copyText(LOCAL_API_KEY_PLACEHOLDER, 'OPENAI_API_KEY');
     }
-    function copyApiBaseUrl() {
-      return copyText(apiAccessBaseUrl(selectedAccount('simpleApiAccount')), 'OPENAI_BASE_URL');
-    }
-    function copyApiEnv() {
-      const item = selectedAccount('simpleApiAccount');
-      return copyText(item ? apiAccessEnv(item) : '', '.env');
-    }
     function copyAnthropicToken() {
       return copyText(LOCAL_ANTHROPIC_AUTH_TOKEN, 'ANTHROPIC_AUTH_TOKEN');
     }
@@ -11041,9 +11034,6 @@ INDEX_HTML = """<!doctype html>
     function copyAnthropicForcedEnv() {
       const item = selectedAccount('simpleApiAccount');
       return copyText(item ? anthropicForcedModelEnv(item) : '', 'Anthropic forced model env');
-    }
-    function copyClaudeEnv() {
-      return copyAnthropicEnv();
     }
     function bridgeModelOption(modelId) {
       const normalized = String(modelId || '').trim().toLowerCase();
@@ -11836,7 +11826,6 @@ INDEX_HTML = """<!doctype html>
           if (action === 'scroll') return scrollToSection(button.dataset.target || '');
           if (action === 'refresh') return refreshData(true);
           if (action === 'start-codex-oauth') return startCodexOAuth();
-          if (action === 'finish-codex-oauth') return finishCodexOAuth();
           if (action === 'check-codex-oauth') return checkCodexOAuthStatus();
           if (action === 'hide-codex-oauth') return hideCodexOAuth();
           if (action === 'apply-codex-oauth-bridge') return applyCodexOAuthBridge();
