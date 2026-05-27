@@ -11640,6 +11640,31 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
+            if parsed.path == "/api/account-pool":
+                try:
+                    accounts = manager._load_accounts()
+                    quotas = manager.quotas().get("quotas", [])
+                    quota_map = {str(q.get("account_id") or ""): q for q in quotas if isinstance(q, dict)}
+                    default_id = ""
+                    auth_raw = manager._load_auth_store_raw()
+                    if isinstance(auth_raw, dict):
+                        default_id = str(auth_raw.get("default_account_id") or "")
+                    pool = []
+                    for acct in accounts:
+                        aid = str(acct.get("account_id") or "")
+                        q = quota_map.get(aid, {})
+                        pool.append({
+                            "account_id": aid,
+                            "email": str(acct.get("email") or ""),
+                            "is_default": aid == default_id,
+                            "quota": q.get("quota"),
+                            "usage": q.get("usage"),
+                            "source": str(acct.get("source") or ""),
+                        })
+                    json_response(self, 200, {"ok": True, "default_account_id": default_id, "pool": pool})
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
             if parsed.path == "/api/codex-oauth/status":
                 try:
                     if not self._valid_fetch_metadata():
@@ -11949,6 +11974,18 @@ def build_handler(
                     key = str(payload.get("key") or "")
                     result = manager.revoke_api_key(key)
                     json_response(self, 200, result)
+                    return
+                if self.path == "/api/set-default-account":
+                    account_id = str(payload.get("account_id") or "")
+                    if not account_id:
+                        json_response(self, 400, {"ok": False, "error": "Missing account_id"})
+                        return
+                    auth_raw = manager._load_auth_store_raw()
+                    if not isinstance(auth_raw, dict):
+                        auth_raw = {}
+                    auth_raw["default_account_id"] = account_id
+                    manager.paths.auth_store.write_text(json.dumps(auth_raw, ensure_ascii=False, indent=2), encoding="utf-8")
+                    json_response(self, 200, {"ok": True, "default_account_id": account_id})
                     return
                 json_response(self, 404, {"ok": False, "error": "Not Found"})
             except Exception as exc:  # noqa: BLE001
