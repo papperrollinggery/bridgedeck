@@ -8313,6 +8313,14 @@ INDEX_HTML = """<!doctype html>
       --size-px-5: 24px;
       --size-px-6: 28px;
       --size-px-7: 32px;
+      --size-px-8: 48px;
+      --size-px-9: 64px;
+      --size-px-10: 80px;
+      --size-px-11: 120px;
+      --size-px-12: 160px;
+      --size-px-13: 240px;
+      --size-px-14: 320px;
+      --size-px-15: 480px;
 
       /* Open Props - Borders */
       --border-size-1: 1px;
@@ -8328,10 +8336,30 @@ INDEX_HTML = """<!doctype html>
       --shadow-1: 0 1px 2px -1px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 9%));
       --shadow-2: 0 3px 5px -2px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 4%)), 0 7px 14px -5px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 6%));
       --shadow-3: 0 -1px 3px 0 hsl(var(--shadow-color) / calc(var(--shadow-strength) + 3%)), 0 1px 2px -5px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 3%)), 0 2px 5px -5px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 5%)), 0 4px 12px -5px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 6%));
+      --shadow-4: 0 -2px 5px 0 hsl(var(--shadow-color) / calc(var(--shadow-strength) + 3%)), 0 2px 4px -2px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 4%)), 0 5px 10px -4px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 6%));
+      --shadow-5: 0 -4px 8px 0 hsl(var(--shadow-color) / calc(var(--shadow-strength) + 3%)), 0 4px 8px -2px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 5%)), 0 12px 24px -4px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 7%));
+      --shadow-6: 0 -8px 16px 0 hsl(var(--shadow-color) / calc(var(--shadow-strength) + 3%)), 0 8px 16px -4px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 5%)), 0 24px 48px -8px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 8%));
+
+      /* Open Props - Animations */
+      --animation-fade-in: fade-in .3s var(--ease-out-3);
+      --animation-fade-out: fade-out .3s var(--ease-out-3);
+      --animation-scale-up: scale-up .3s var(--ease-out-3);
+      --animation-slide-in-down: slide-in-down .3s var(--ease-out-3);
+      --animation-spin: spin 1s linear infinite;
+      --animation-pulse: pulse 2s var(--ease-out-3) infinite;
+      --ease-out-3: cubic-bezier(.14,.46,.36,1);
+      --ease-squish-2: cubic-bezier(.57,-.25,.53,1.25);
 
       /* Focus ring */
       --focus-ring: 0 0 0 2px var(--brand);
     }
+
+    @keyframes fade-in { to { opacity: 1 } }
+    @keyframes fade-out { to { opacity: 0 } }
+    @keyframes scale-up { to { transform: scale(1.05) } }
+    @keyframes slide-in-down { from { transform: translateY(-100%); opacity: 0 } }
+    @keyframes spin { to { transform: rotate(360deg) } }
+    @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .5 } }
     * { box-sizing:border-box; }
     body { margin:0; font-family:ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
     .wrap { min-height:100vh; }
