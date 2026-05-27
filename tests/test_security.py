@@ -6,6 +6,7 @@ import io
 import base64
 import os
 import sqlite3
+import stat
 import tempfile
 import threading
 import time
@@ -238,6 +239,12 @@ class FakeManager:
                 }
             ],
             "current_provider_from_settings": "",
+            "aimami_follow": {
+                "enabled": False,
+                "last_result": {},
+                "last_seen_active_account_key": "",
+                "last_synced_account_id": "",
+            },
             "claude_attribution_header": {
                 "status": "disabled",
                 "message": "已关闭 Claude Code billing attribution header。",
@@ -505,11 +512,101 @@ class FakeManager:
     def run_auto_switch(self, *, force: bool = False) -> dict[str, Any]:
         return {"ok": True, "enabled": True, "actions": [], "force": force}
 
+    def update_aimami_follow_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True, "aimami_follow": {"enabled": bool(payload.get("enabled")), "last_result": {}}}
+
+    def run_aimami_follow(self, *, force: bool = False) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "enabled": True,
+            "action": "unchanged",
+            "reason": "already_following_active_account",
+            "selected_account_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "force": force,
+        }
+
     def missing_bridge_accounts(self, quotas: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         return []
 
     def create_missing_bridge_providers(self) -> dict[str, Any]:
         return {"ok": True, "created": [], "skipped": [], "missing": []}
+
+    def aimami_import_preview(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "detected": True,
+            "registry_path": f"{Path.home()}/.codex/accounts/registry.json",
+            "snapshots_dir": f"{Path.home()}/.codex/accounts/snapshots",
+            "active_account_key": "openai::01234567-89ab-cdef-0123-456789abcdef",
+            "active_account_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "candidates": [
+                {
+                    "account_key": "openai::01234567-89ab-cdef-0123-456789abcdef",
+                    "account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "email": "person@example.com",
+                    "snapshot_path": f"{Path.home()}/.codex/accounts/snapshots/account.json",
+                    "status": "new",
+                    "reason": "",
+                    "refresh_sha12": "abc123",
+                }
+            ],
+            "summary": {"new": 1, "updated": 0, "unchanged": 0, "skipped": 0, "importable": 1},
+        }
+
+    def import_aimami_accounts(self, *, create_missing: bool = False) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "imported": self.aimami_import_preview()["candidates"],
+            "skipped": [],
+            "summary": {"new": 1, "updated": 0, "unchanged": 0, "skipped": 0, "importable": 1},
+            "bridge_providers": self.create_missing_bridge_providers() if create_missing else {"ok": True, "created": [], "skipped": [], "missing": []},
+        }
+
+    def aimami_export_preview(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "detected": True,
+            "missing_in_aimami": [{"account_id": "01234567-89ab-cdef-0123-456789abcdef", "email": "person@example.com", "refresh_sha12": "abc123"}],
+            "conflicts": [],
+            "recommendation": "export_file",
+        }
+
+    def export_aimami_accounts(self, account_ids: list[str]) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "mode": "export_file",
+            "path": f"{Path.home()}/Downloads/bridgedeck-aimami-accounts-test.json",
+            "exported": [{"account_id": account_ids[0], "email": "person@example.com", "refresh_sha12": "abc123"}] if account_ids else [],
+            "count": len(account_ids),
+        }
+
+    def aimami_inject_preview(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "mode": "codex_snapshot",
+            "verification": {"verified": False, "path": f"{Path.home()}/.cc-switch/bridgedeck-aimami-inject-verification.json"},
+            "can_apply": False,
+            "missing_in_aimami": self.aimami_export_preview()["missing_in_aimami"],
+            "conflicts": [],
+            "aimami_running": False,
+        }
+
+    def inject_aimami_accounts(
+        self,
+        *,
+        account_ids: list[str],
+        mode: str = "codex_snapshot",
+        set_active: bool = False,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason": "injection_verification_required",
+            "account_ids": account_ids,
+            "set_active": set_active,
+            "overwrite": overwrite,
+        }
 
     def services(self, *, server_port: int = 8899) -> dict[str, Any]:
         return {
@@ -2867,6 +2964,125 @@ class ServerCase(unittest.TestCase):
                 payload = json.loads(exc.read().decode("utf-8"))
                 return exc.code, payload
 
+    def test_aimami_status_requires_csrf_and_redacts_remote_payload(self) -> None:
+        server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
+
+        status, payload = self.request(
+            server,
+            "/api/aimami-sync/status",
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("CSRF", payload["error"])
+
+        status, payload = self.request(
+            server,
+            "/api/aimami-sync/status",
+            headers={"Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"},
+        )
+        encoded = json.dumps(payload)
+        self.assertEqual(status, 200)
+        self.assertNotIn("person@example.com", encoded)
+        self.assertNotIn(str(Path.home()), encoded)
+        self.assertEqual(payload["summary"]["importable"], 1)
+
+    def test_aimami_export_and_inject_preview_redact_remote_payloads(self) -> None:
+        server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
+        headers = {"Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"}
+
+        for path in ("/api/aimami-sync/export-preview", "/api/aimami-sync/inject-preview"):
+            status, payload = self.request(server, path, headers=headers)
+            encoded = json.dumps(payload)
+            self.assertEqual(status, 200)
+            self.assertNotIn("person@example.com", encoded)
+            self.assertNotIn(str(Path.home()), encoded)
+            self.assertIn("01234567...cdef", encoded)
+
+    def test_aimami_import_post_calls_manager(self) -> None:
+        server, _ = self.start_server()
+
+        status, payload = self.request(
+            server,
+            "/api/aimami-sync/import",
+            method="POST",
+            body={"create_missing": True},
+            headers={"Origin": f"http://127.0.0.1:{server.server_port}", "Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["imported"]), 1)
+        self.assertIn("bridge_providers", payload)
+
+    def test_aimami_follow_post_endpoints_call_manager(self) -> None:
+        server, _ = self.start_server()
+        headers = {"Origin": f"http://127.0.0.1:{server.server_port}", "Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"}
+
+        status, payload = self.request(
+            server,
+            "/api/aimami-follow-config",
+            method="POST",
+            body={"enabled": True},
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["aimami_follow"]["enabled"])
+
+        status, payload = self.request(
+            server,
+            "/api/aimami-follow-run",
+            method="POST",
+            body={"force": True},
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["action"], "unchanged")
+        self.assertTrue(payload["force"])
+
+    def test_aimami_export_endpoints_preview_and_export(self) -> None:
+        server, _ = self.start_server()
+        headers = {"Origin": f"http://127.0.0.1:{server.server_port}", "Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"}
+
+        status, payload = self.request(
+            server,
+            "/api/aimami-sync/export-preview",
+            headers={"Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["missing_in_aimami"]), 1)
+
+        status, payload = self.request(
+            server,
+            "/api/aimami-sync/export",
+            method="POST",
+            body={"account_ids": ["01234567-89ab-cdef-0123-456789abcdef"]},
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["count"], 1)
+        self.assertNotIn("refresh_token", json.dumps(payload))
+
+    def test_aimami_inject_endpoints_preview_and_gate(self) -> None:
+        server, _ = self.start_server()
+        headers = {"Origin": f"http://127.0.0.1:{server.server_port}", "Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"}
+
+        status, payload = self.request(
+            server,
+            "/api/aimami-sync/inject-preview",
+            headers={"Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"},
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["can_apply"])
+
+        status, payload = self.request(
+            server,
+            "/api/aimami-sync/inject",
+            method="POST",
+            body={"mode": "codex_snapshot", "account_ids": ["01234567-89ab-cdef-0123-456789abcdef"]},
+            headers=headers,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["reason"], "injection_verification_required")
+
 
 class CodexDesktopDoctorCase(ServerCase):
     def make_manager(self, root: Path) -> bridgedeck.BridgeManager:
@@ -4454,6 +4670,542 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertEqual(fake_opener.request.headers["Connection"], "close")
 
 
+class AiMaMiFollowCase(unittest.TestCase):
+    def make_manager(self, root: Path, accounts: dict[str, dict[str, Any]] | None = None) -> bridgedeck.BridgeManager:
+        auth_store = root / ".cc-switch" / "codex_oauth_auth.json"
+        auth_store.parent.mkdir(parents=True, exist_ok=True)
+        auth_store.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "accounts": accounts or {},
+                    "default_account_id": next(iter(accounts or {}), ""),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return bridgedeck.BridgeManager(
+            bridgedeck.ManagerPaths(
+                db=root / ".cc-switch" / "cc-switch.db",
+                settings=root / ".cc-switch" / "settings.json",
+                auth_store=auth_store,
+            )
+        )
+
+    def write_aimami(self, root: Path, account_id: str = "acct-active", refresh: str = "active-refresh") -> tuple[Path, Path]:
+        registry_path = root / ".codex" / "accounts" / "registry.json"
+        snapshots_dir = root / ".codex" / "accounts" / "snapshots"
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
+        (snapshots_dir / "active.json").write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "account_id": account_id,
+                        "refresh_token": refresh,
+                        "id_token": fake_jwt({"https://api.openai.com/profile": {"email": "active@example.com"}}),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "activeAccountKey": f"openai::{account_id}",
+                    "items": [{"accountKey": f"openai::{account_id}", "snapshotPath": "active.json", "email": "active@example.com"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return registry_path, snapshots_dir
+
+    def patch_aimami_paths(self, root: Path):
+        registry_path, snapshots_dir = self.write_aimami(root)
+        follow_path = root / ".cc-switch" / "bridgedeck-aimami-follow.json"
+        follow_path.parent.mkdir(parents=True, exist_ok=True)
+        return (
+            mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_REGISTRY_PATH", registry_path),
+            mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_SNAPSHOTS_DIR", snapshots_dir),
+            mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_FOLLOW_PATH", follow_path),
+        )
+
+    def local_snapshot(self, current: dict[str, Any], target: dict[str, Any] | None = None) -> dict[str, Any]:
+        providers = [current]
+        if target:
+            providers.append(target)
+        return {"providers": providers, "current_provider_from_settings": current.get("id"), "codex_desktop": {}}
+
+    def test_follow_disabled_does_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root, {"acct-active": {"account_id": "acct-active", "email": "active@example.com", "refresh_token": "active-refresh"}})
+            patches = self.patch_aimami_paths(root)
+            with patches[0], patches[1], patches[2], mock.patch.object(manager, "set_current_provider") as set_current:
+                result = manager.run_aimami_follow(force=False)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "follow_disabled")
+        set_current.assert_not_called()
+
+    def test_follow_refuses_third_party_current_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root, {"acct-active": {"account_id": "acct-active", "email": "active@example.com", "refresh_token": "active-refresh"}})
+            third_party = {"id": "minimax", "name": "MiniMax", "is_current": True, "base_url": "https://platform.minimaxi.com", "account_id": ""}
+            target = {"id": "target", "name": "Local Codex Bridge - active", "is_current": False, "base_url": "http://127.0.0.1:8876/accounts/acct-active", "account_id": "acct-active"}
+            patches = self.patch_aimami_paths(root)
+            with patches[0], patches[1], patches[2], \
+                mock.patch.object(manager, "_load_aimami_follow_config", return_value={"enabled": True, "last_result": {}, "last_seen_active_account_key": "", "last_synced_account_id": ""}), \
+                mock.patch.object(manager, "snapshot", return_value=self.local_snapshot(third_party, target)), \
+                mock.patch.object(manager, "set_current_provider") as set_current:
+                result = manager.run_aimami_follow()
+
+        self.assertEqual(result["reason"], "current_provider_is_not_local_bridge")
+        set_current.assert_not_called()
+
+    def test_follow_defers_with_active_bridge_clients(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root, {"acct-active": {"account_id": "acct-active", "email": "active@example.com", "refresh_token": "active-refresh"}})
+            current = {"id": "current", "name": "Local Codex Bridge - old", "is_current": True, "base_url": "http://127.0.0.1:8876/accounts/acct-old", "account_id": "acct-old"}
+            target = {"id": "target", "name": "Local Codex Bridge - active", "is_current": False, "base_url": "http://127.0.0.1:8876/accounts/acct-active", "account_id": "acct-active"}
+            patches = self.patch_aimami_paths(root)
+            with patches[0], patches[1], patches[2], \
+                mock.patch.object(manager, "_load_aimami_follow_config", return_value={"enabled": True, "last_result": {}, "last_seen_active_account_key": "", "last_synced_account_id": ""}), \
+                mock.patch.object(manager, "snapshot", return_value=self.local_snapshot(current, target)), \
+                mock.patch.object(manager, "_local_bridge_has_active_clients", return_value=(True, [{"pid": 1}], {})), \
+                mock.patch.object(manager, "set_current_provider") as set_current:
+                result = manager.run_aimami_follow()
+
+        self.assertEqual(result["action"], "deferred")
+        self.assertEqual(result["reason"], "deferred_active_clients")
+        set_current.assert_not_called()
+
+    def test_follow_switches_to_matching_bridge_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root, {"acct-active": {"account_id": "acct-active", "email": "active@example.com", "refresh_token": "active-refresh"}})
+            current = {"id": "current", "name": "Local Codex Bridge - old", "is_current": True, "base_url": "http://127.0.0.1:8876/accounts/acct-old", "account_id": "acct-old"}
+            target = {"id": "target", "name": "Local Codex Bridge - active", "is_current": False, "base_url": "http://127.0.0.1:8876/accounts/acct-active", "account_id": "acct-active"}
+            patches = self.patch_aimami_paths(root)
+            with patches[0], patches[1], patches[2], \
+                mock.patch.object(manager, "_load_aimami_follow_config", return_value={"enabled": True, "last_result": {}, "last_seen_active_account_key": "", "last_synced_account_id": ""}), \
+                mock.patch.object(manager, "snapshot", return_value=self.local_snapshot(current, target)), \
+                mock.patch.object(manager, "_local_bridge_has_active_clients", return_value=(False, [], {})), \
+                mock.patch.object(manager, "set_current_provider", return_value={"ok": True}) as set_current:
+                result = manager.run_aimami_follow()
+
+        self.assertEqual(result["action"], "switched")
+        self.assertEqual(result["selected_account_id"], "acct-active")
+        set_current.assert_called_once_with("target")
+
+    def test_follow_creates_missing_provider_then_switches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root, {"acct-active": {"account_id": "acct-active", "email": "active@example.com", "refresh_token": "active-refresh"}})
+            current = {"id": "current", "name": "Local Codex Bridge - old", "is_current": True, "base_url": "http://127.0.0.1:8876/accounts/acct-old", "account_id": "acct-old"}
+            target = {"id": "created", "name": "Local Codex Bridge - active", "is_current": False, "base_url": "http://127.0.0.1:8876/accounts/acct-active", "account_id": "acct-active"}
+            patches = self.patch_aimami_paths(root)
+            with patches[0], patches[1], patches[2], \
+                mock.patch.object(manager, "_load_aimami_follow_config", return_value={"enabled": True, "last_result": {}, "last_seen_active_account_key": "", "last_synced_account_id": ""}), \
+                mock.patch.object(manager, "snapshot", side_effect=[self.local_snapshot(current), self.local_snapshot(current, target)]), \
+                mock.patch.object(manager, "_local_bridge_has_active_clients", return_value=(False, [], {})), \
+                mock.patch.object(manager, "create_or_update_provider", return_value={"ok": True, "provider_id": "created"}) as create_provider, \
+                mock.patch.object(manager, "set_current_provider", return_value={"ok": True}) as set_current:
+                result = manager.run_aimami_follow()
+
+        self.assertEqual(result["action"], "switched")
+        create_provider.assert_called_once()
+        self.assertEqual(create_provider.call_args.args[0], "acct-active")
+        set_current.assert_called_once_with("created")
+
+    def test_follow_imports_active_account_then_switches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root, {})
+            current = {"id": "current", "name": "Local Codex Bridge - old", "is_current": True, "base_url": "http://127.0.0.1:8876/accounts/acct-old", "account_id": "acct-old"}
+            target = {"id": "target", "name": "Local Codex Bridge - active", "is_current": False, "base_url": "http://127.0.0.1:8876/accounts/acct-active", "account_id": "acct-active"}
+            patches = self.patch_aimami_paths(root)
+            with patches[0], patches[1], patches[2], \
+                mock.patch.object(manager, "_load_aimami_follow_config", return_value={"enabled": True, "last_result": {}, "last_seen_active_account_key": "", "last_synced_account_id": ""}), \
+                mock.patch.object(manager, "snapshot", return_value=self.local_snapshot(current, target)), \
+                mock.patch.object(manager, "_local_bridge_has_active_clients", return_value=(False, [], {})), \
+                mock.patch.object(manager, "set_current_provider", return_value={"ok": True}) as set_current:
+                result = manager.run_aimami_follow()
+
+            saved = json.loads(manager.paths.auth_store.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["action"], "switched")
+        self.assertEqual(saved["accounts"]["acct-active"]["refresh_token"], "active-refresh")
+        set_current.assert_called_once_with("target")
+
+
+class AiMaMiExportCase(unittest.TestCase):
+    def make_manager(self, root: Path) -> bridgedeck.BridgeManager:
+        auth_store = root / ".cc-switch" / "codex_oauth_auth.json"
+        auth_store.parent.mkdir(parents=True, exist_ok=True)
+        auth_store.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "accounts": {
+                        "acct-bridge": {"account_id": "acct-bridge", "email": "bridge@example.com", "refresh_token": "bridge-refresh"},
+                        "acct-aimami": {"account_id": "acct-aimami", "email": "aimami@example.com", "refresh_token": "same-refresh"},
+                    },
+                    "default_account_id": "acct-bridge",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return bridgedeck.BridgeManager(
+            bridgedeck.ManagerPaths(
+                db=root / ".cc-switch" / "cc-switch.db",
+                settings=root / ".cc-switch" / "settings.json",
+                auth_store=auth_store,
+            )
+        )
+
+    def write_aimami_registry(self, root: Path, refresh: str = "same-refresh") -> tuple[Path, Path]:
+        registry_path = root / ".codex" / "accounts" / "registry.json"
+        snapshots_dir = root / ".codex" / "accounts" / "snapshots"
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
+        (snapshots_dir / "aimami.json").write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "account_id": "acct-aimami",
+                        "refresh_token": refresh,
+                        "id_token": fake_jwt({"https://api.openai.com/profile": {"email": "aimami@example.com"}}),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "activeAccountKey": "openai::acct-aimami",
+                    "items": [{"accountKey": "openai::acct-aimami", "snapshotPath": "aimami.json", "email": "aimami@example.com"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return registry_path, snapshots_dir
+
+    def test_export_preview_lists_bridge_accounts_missing_from_aimami(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            registry_path, snapshots_dir = self.write_aimami_registry(root)
+            with mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_REGISTRY_PATH", registry_path), mock.patch.object(
+                bridgedeck, "DEFAULT_AIMAMI_SNAPSHOTS_DIR", snapshots_dir
+            ):
+                preview = manager.aimami_export_preview()
+
+        self.assertEqual([item["account_id"] for item in preview["missing_in_aimami"]], ["acct-bridge"])
+        self.assertEqual(preview["conflicts"], [])
+        self.assertEqual(preview["recommendation"], "export_file")
+
+    def test_export_writes_owner_only_file_and_does_not_modify_aimami_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            registry_path, snapshots_dir = self.write_aimami_registry(root)
+            export_dir = root / "Downloads"
+            before_registry = registry_path.read_text(encoding="utf-8")
+            before_snapshot = (snapshots_dir / "aimami.json").read_text(encoding="utf-8")
+            access = fake_jwt(
+                {
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "acct-bridge",
+                        "chatgpt_account_user_id": "user-bridge",
+                        "chatgpt_plan_type": "plus",
+                    },
+                    "https://api.openai.com/profile": {"email": "bridge@example.com"},
+                }
+            )
+            token_payload = {"access_token": access, "refresh_token": "bridge-refresh-rotated", "id_token": "id-token"}
+
+            with mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_REGISTRY_PATH", registry_path), \
+                mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_SNAPSHOTS_DIR", snapshots_dir), \
+                mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_EXPORT_DIR", export_dir), \
+                mock.patch.object(bridgedeck, "refresh_codex_oauth_token", return_value=token_payload) as refresh:
+                result = manager.export_aimami_accounts(["acct-bridge"])
+
+            export_path = Path(result["path"])
+            exported = json.loads(export_path.read_text(encoding="utf-8"))
+            export_mode = stat.S_IMODE(export_path.stat().st_mode)
+            saved = json.loads(manager.paths.auth_store.read_text(encoding="utf-8"))
+            after_registry = registry_path.read_text(encoding="utf-8")
+            after_snapshot = (snapshots_dir / "aimami.json").read_text(encoding="utf-8")
+
+        refresh.assert_called_once_with("bridge-refresh")
+        self.assertEqual(result["count"], 1)
+        self.assertNotIn("access_token", json.dumps(result))
+        self.assertNotIn("bridge-refresh-rotated", json.dumps(result))
+        self.assertEqual(exported["kind"], "aimami-accounts-export")
+        self.assertEqual(exported["schemaVersion"], 1)
+        self.assertEqual(exported["accountCount"], 1)
+        self.assertEqual(exported["accounts"][0]["accountKey"], "user-bridge::acct-bridge")
+        self.assertEqual(exported["accounts"][0]["authMode"], "chatgpt")
+        self.assertEqual(exported["accounts"][0]["plan"], "plus")
+        self.assertEqual(exported["accounts"][0]["auth"]["tokens"]["access_token"], access)
+        self.assertEqual(exported["accounts"][0]["auth"]["tokens"]["refresh_token"], "bridge-refresh-rotated")
+        self.assertEqual(export_path.suffixes[-2:], [".aimami-accounts", ".json"])
+        self.assertEqual(export_mode, 0o600)
+        self.assertEqual(after_registry, before_registry)
+        self.assertEqual(after_snapshot, before_snapshot)
+        self.assertEqual(saved["accounts"]["acct-bridge"]["refresh_token"], "bridge-refresh-rotated")
+
+    def test_export_requires_explicit_known_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+
+            with self.assertRaises(ValueError):
+                manager.export_aimami_accounts([])
+            with self.assertRaises(ValueError):
+                manager.export_aimami_accounts(["acct-missing"])
+
+    def test_export_refresh_failure_returns_structured_error_without_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            registry_path, snapshots_dir = self.write_aimami_registry(root)
+            export_dir = root / "Downloads"
+
+            with mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_REGISTRY_PATH", registry_path), \
+                mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_SNAPSHOTS_DIR", snapshots_dir), \
+                mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_EXPORT_DIR", export_dir), \
+                mock.patch.object(bridgedeck, "refresh_codex_oauth_token", side_effect=RuntimeError("refresh_token_reused")):
+                result = manager.export_aimami_accounts(["acct-bridge"])
+
+            redacted = bridgedeck.redact_snapshot(result)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "export_failed")
+        self.assertEqual(result["count"], 0)
+        self.assertNotIn("path", result)
+        self.assertFalse(export_dir.exists())
+        self.assertEqual(redacted["errors"][0]["account_id"], "acct-bridge")
+        self.assertEqual(redacted["errors"][0]["email"], "br***e@example.com")
+        self.assertIn("refresh_token_reused", result["errors"][0]["error"])
+
+
+class AiMaMiInjectCase(unittest.TestCase):
+    def make_manager(self, root: Path) -> bridgedeck.BridgeManager:
+        auth_store = root / ".cc-switch" / "codex_oauth_auth.json"
+        auth_store.parent.mkdir(parents=True, exist_ok=True)
+        auth_store.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "accounts": {
+                        "acct-bridge": {"account_id": "acct-bridge", "email": "bridge@example.com", "refresh_token": "bridge-refresh"},
+                    },
+                    "default_account_id": "acct-bridge",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return bridgedeck.BridgeManager(
+            bridgedeck.ManagerPaths(
+                db=root / ".cc-switch" / "cc-switch.db",
+                settings=root / ".cc-switch" / "settings.json",
+                auth_store=auth_store,
+            )
+        )
+
+    def aimami_paths(self, root: Path, registry: dict[str, Any] | None = None) -> tuple[Path, Path, Path]:
+        registry_path = root / ".codex" / "accounts" / "registry.json"
+        snapshots_dir = root / ".codex" / "accounts" / "snapshots"
+        verification_path = root / ".cc-switch" / "bridgedeck-aimami-inject-verification.json"
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
+        verification_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(json.dumps(registry if registry is not None else {"items": []}), encoding="utf-8")
+        return registry_path, snapshots_dir, verification_path
+
+    def patch_paths(self, registry_path: Path, snapshots_dir: Path, verification_path: Path):
+        return (
+            mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_REGISTRY_PATH", registry_path),
+            mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_SNAPSHOTS_DIR", snapshots_dir),
+            mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_INJECT_VERIFICATION_PATH", verification_path),
+        )
+
+    def token_payload(self, account_id: str = "acct-bridge", refresh: str = "bridge-refresh-rotated") -> dict[str, str]:
+        access = fake_jwt(
+            {
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": account_id,
+                    "chatgpt_account_user_id": "user-bridge",
+                    "chatgpt_plan_type": "plus",
+                },
+                "https://api.openai.com/profile": {"email": "bridge@example.com"},
+            }
+        )
+        return {"access_token": access, "refresh_token": refresh, "id_token": "id-token"}
+
+    def test_inject_refuses_before_verification_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            registry_path, snapshots_dir, verification_path = self.aimami_paths(root)
+            before_registry = registry_path.read_text(encoding="utf-8")
+            patches = self.patch_paths(registry_path, snapshots_dir, verification_path)
+            with patches[0], patches[1], patches[2]:
+                result = manager.inject_aimami_accounts(account_ids=["acct-bridge"])
+                after_registry = registry_path.read_text(encoding="utf-8")
+                snapshot_files = list(snapshots_dir.iterdir())
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "injection_verification_required")
+        self.assertEqual(after_registry, before_registry)
+        self.assertEqual(snapshot_files, [])
+
+    def test_inject_writes_snapshot_and_registry_after_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            registry_path, snapshots_dir, verification_path = self.aimami_paths(root)
+            verification_path.write_text(json.dumps({"reload_verified": True, "private_state_not_required": True}), encoding="utf-8")
+            before_registry = registry_path.read_text(encoding="utf-8")
+            patches = self.patch_paths(registry_path, snapshots_dir, verification_path)
+            with patches[0], patches[1], patches[2], \
+                mock.patch.object(bridgedeck, "refresh_codex_oauth_token", return_value=self.token_payload()) as refresh, \
+                mock.patch.object(bridgedeck, "aimami_processes", return_value=[{"pid": 123, "command": "AiMaMi"}]):
+                result = manager.inject_aimami_accounts(account_ids=["acct-bridge"], set_active=True)
+                snapshot_path = Path(result["written"][0]["snapshot_path"])
+                snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                snapshot_mode = stat.S_IMODE(snapshot_path.stat().st_mode)
+                registry = json.loads(registry_path.read_text(encoding="utf-8"))
+                after_registry_text = registry_path.read_text(encoding="utf-8")
+
+        refresh.assert_called_once_with("bridge-refresh")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["aimami_running"])
+        self.assertIn("reload/restart", result["warning"])
+        self.assertEqual(snapshot["tokens"]["refresh_token"], "bridge-refresh-rotated")
+        self.assertEqual(snapshot["tokens"]["id_token"], "id-token")
+        self.assertNotIn("importedBy", snapshot)
+        self.assertEqual(snapshot_mode, 0o600)
+        self.assertEqual(snapshot_path.name, "user-bridge__acct-bridge.json")
+        self.assertEqual(registry["schemaVersion"], 1)
+        self.assertGreater(registry["updatedAt"], 0)
+        self.assertEqual(registry["activeAccountKey"], "user-bridge::acct-bridge")
+        self.assertEqual(registry["items"][0]["accountKey"], "user-bridge::acct-bridge")
+        self.assertEqual(registry["items"][0]["snapshotPath"], str(snapshot_path.resolve(strict=False)))
+        self.assertEqual(registry["items"][0]["authMode"], "chatgpt")
+        self.assertEqual(registry["items"][0]["plan"], "plus")
+        self.assertTrue(registry["items"][0]["hasActiveSubscription"])
+        self.assertNotEqual(after_registry_text, before_registry)
+        self.assertEqual(len(result["backups"]), 1)
+
+    def test_schema_profile_accepts_native_aimami_registry_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            registry_path, snapshots_dir, verification_path = self.aimami_paths(root, {"schemaVersion": 1, "items": []})
+            snapshot_path = snapshots_dir / "user-native__acct-native.json"
+            snapshot_path.write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "OPENAI_API_KEY": None,
+                        "tokens": {
+                            "account_id": "acct-native",
+                            "access_token": "access",
+                            "refresh_token": "refresh",
+                        },
+                        "last_refresh": "2026-05-27T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "updatedAt": 1,
+                        "activeAccountKey": "user-native::acct-native",
+                        "items": [
+                            {
+                                "accountKey": "user-native::acct-native",
+                                "email": "native@example.com",
+                                "alias": "native@example.com",
+                                "accountName": "native@example.com",
+                                "workspaceName": "",
+                                "profileName": "",
+                                "plan": "plus",
+                                "authMode": "chatgpt",
+                                "hasActiveSubscription": True,
+                                "subscriptionExpiresAt": 0,
+                                "subscriptionWillRenew": None,
+                                "createdAt": 1,
+                                "lastUsedAt": 1,
+                                "lastUsageAt": None,
+                                "cachedPrimaryWindow": None,
+                                "cachedSecondaryWindow": None,
+                                "snapshotPath": str(snapshot_path),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            patches = self.patch_paths(registry_path, snapshots_dir, verification_path)
+            with patches[0], patches[1], patches[2]:
+                profile = manager.aimami_schema_profile()
+                preview = manager.aimami_inject_preview()
+
+        self.assertTrue(profile["compatible_with_injection"])
+        self.assertEqual(profile["account_key_style"], "user_prefix")
+        self.assertEqual(profile["snapshot_path_style"], "absolute")
+        self.assertTrue(preview["schema_profile"]["compatible_with_injection"])
+
+    def test_inject_conflict_requires_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            registry_path, snapshots_dir, verification_path = self.aimami_paths(
+                root,
+                {"items": [{"accountKey": "openai::acct-bridge", "snapshotPath": "existing.json", "email": "bridge@example.com"}]},
+            )
+            (snapshots_dir / "existing.json").write_text(
+                json.dumps({"auth_mode": "chatgpt", "tokens": {"account_id": "acct-bridge", "refresh_token": "different-refresh"}}),
+                encoding="utf-8",
+            )
+            verification_path.write_text(json.dumps({"reload_verified": True, "private_state_not_required": True}), encoding="utf-8")
+            patches = self.patch_paths(registry_path, snapshots_dir, verification_path)
+            with patches[0], patches[1], patches[2], mock.patch.object(bridgedeck, "refresh_codex_oauth_token") as refresh:
+                result = manager.inject_aimami_accounts(account_ids=["acct-bridge"])
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "conflict_requires_overwrite")
+        refresh.assert_not_called()
+
+    def test_inject_refresh_failure_writes_no_partial_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            registry_path, snapshots_dir, verification_path = self.aimami_paths(root)
+            verification_path.write_text(json.dumps({"reload_verified": True, "private_state_not_required": True}), encoding="utf-8")
+            before_registry = registry_path.read_text(encoding="utf-8")
+            patches = self.patch_paths(registry_path, snapshots_dir, verification_path)
+            with patches[0], patches[1], patches[2], mock.patch.object(bridgedeck, "refresh_codex_oauth_token", side_effect=RuntimeError("refresh failed")):
+                with self.assertRaises(RuntimeError):
+                    manager.inject_aimami_accounts(account_ids=["acct-bridge"])
+                pass
+            after_registry = registry_path.read_text(encoding="utf-8")
+            snapshot_files = list(snapshots_dir.iterdir())
+
+        self.assertEqual(after_registry, before_registry)
+        self.assertEqual(snapshot_files, [])
+
+
 class LauncherCase(unittest.TestCase):
     def make_manager(self, root: Path) -> bridgedeck.BridgeManager:
         auth_store = root / ".cc-switch" / "codex_oauth_auth.json"
@@ -4700,6 +5452,183 @@ class LauncherCase(unittest.TestCase):
             self.assertEqual(saved["accounts"]["acct-new"]["email"], "new@example.com")
             self.assertEqual(saved["accounts"]["acct-new"]["refresh_token"], "new-refresh")
             self.assertNotIn("access_token", saved["accounts"]["acct-new"])
+
+    def test_aimami_preview_and_import_upsert_bridge_auth_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry_path = root / ".codex" / "accounts" / "registry.json"
+            snapshots_dir = root / ".codex" / "accounts" / "snapshots"
+            snapshots_dir.mkdir(parents=True)
+            auth_store = root / ".cc-switch" / "codex_oauth_auth.json"
+            auth_store.parent.mkdir(parents=True, exist_ok=True)
+            auth_store.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "accounts": {
+                            "acct-keep": {"account_id": "acct-keep", "email": "keep@example.com", "refresh_token": "keep-refresh"},
+                            "acct-update": {"account_id": "acct-update", "email": "old@example.com", "refresh_token": "old-refresh"},
+                            "acct-same": {"account_id": "acct-same", "email": "same@example.com", "refresh_token": "same-refresh"},
+                        },
+                        "default_account_id": "acct-keep",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            entries = [
+                ("openai::acct-new", "new.json", "acct-new", "new@example.com", "new-refresh"),
+                ("openai::acct-update", "update.json", "acct-update", "updated@example.com", "updated-refresh"),
+                ("openai::acct-same", "same.json", "acct-same", "same@example.com", "same-refresh"),
+            ]
+            for _, filename, account_id, email, refresh in entries:
+                (snapshots_dir / filename).write_text(
+                    json.dumps(
+                        {
+                            "auth_mode": "chatgpt",
+                            "tokens": {
+                                "account_id": account_id,
+                                "refresh_token": refresh,
+                                "id_token": fake_jwt({"https://api.openai.com/profile": {"email": email}}),
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            registry_path.parent.mkdir(parents=True, exist_ok=True)
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "activeAccountKey": "openai::acct-new",
+                        "items": [
+                            {"accountKey": key, "snapshotPath": filename, "email": email}
+                            for key, filename, _, email, _ in entries
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manager = bridgedeck.BridgeManager(
+                bridgedeck.ManagerPaths(
+                    db=root / ".cc-switch" / "cc-switch.db",
+                    settings=root / ".cc-switch" / "settings.json",
+                    auth_store=auth_store,
+                )
+            )
+
+            with mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_REGISTRY_PATH", registry_path), mock.patch.object(
+                bridgedeck, "DEFAULT_AIMAMI_SNAPSHOTS_DIR", snapshots_dir
+            ):
+                preview = manager.aimami_import_preview()
+                with mock.patch.object(manager, "create_missing_bridge_providers", return_value={"ok": True, "created": [{"id": "bridge-new"}], "skipped": [], "missing": []}) as create_missing:
+                    result = manager.import_aimami_accounts(create_missing=True)
+
+            statuses = {item["account_id"]: item["status"] for item in preview["candidates"]}
+            self.assertEqual(statuses["acct-new"], "new")
+            self.assertEqual(statuses["acct-update"], "updated")
+            self.assertEqual(statuses["acct-same"], "unchanged")
+            self.assertNotIn("_refresh_token", json.dumps(preview))
+            saved = json.loads(auth_store.read_text(encoding="utf-8"))
+            self.assertEqual(saved["default_account_id"], "acct-keep")
+            self.assertEqual(saved["accounts"]["acct-keep"]["refresh_token"], "keep-refresh")
+            self.assertEqual(saved["accounts"]["acct-new"]["refresh_token"], "new-refresh")
+            self.assertEqual(saved["accounts"]["acct-update"]["refresh_token"], "updated-refresh")
+            self.assertEqual(saved["accounts"]["acct-update"]["source"], "aimami")
+            self.assertNotIn("access_token", saved["accounts"]["acct-new"])
+            self.assertEqual(result["summary"]["importable"], 3)
+            self.assertEqual(len(result["imported"]), 3)
+            self.assertEqual(result["bridge_providers"]["created"], [{"id": "bridge-new"}])
+            create_missing.assert_called_once()
+
+    def test_aimami_preview_skips_invalid_snapshots_and_outside_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry_path = root / ".codex" / "accounts" / "registry.json"
+            snapshots_dir = root / ".codex" / "accounts" / "snapshots"
+            snapshots_dir.mkdir(parents=True)
+            auth_store = root / ".cc-switch" / "codex_oauth_auth.json"
+            auth_store.parent.mkdir(parents=True, exist_ok=True)
+            auth_store.write_text(json.dumps({"accounts": {}}), encoding="utf-8")
+            (snapshots_dir / "no-refresh.json").write_text(
+                json.dumps({"auth_mode": "chatgpt", "tokens": {"account_id": "acct-no-refresh"}}),
+                encoding="utf-8",
+            )
+            outside = root / "outside.json"
+            outside.write_text(
+                json.dumps({"auth_mode": "chatgpt", "tokens": {"account_id": "acct-out", "refresh_token": "secret"}}),
+                encoding="utf-8",
+            )
+            registry_path.parent.mkdir(parents=True, exist_ok=True)
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {"accountKey": "openai::acct-no-refresh", "snapshotPath": "no-refresh.json"},
+                            {"accountKey": "openai::acct-out", "snapshotPath": str(outside)},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manager = bridgedeck.BridgeManager(
+                bridgedeck.ManagerPaths(
+                    db=root / ".cc-switch" / "cc-switch.db",
+                    settings=root / ".cc-switch" / "settings.json",
+                    auth_store=auth_store,
+                )
+            )
+
+            with mock.patch.object(bridgedeck, "DEFAULT_AIMAMI_REGISTRY_PATH", registry_path), mock.patch.object(
+                bridgedeck, "DEFAULT_AIMAMI_SNAPSHOTS_DIR", snapshots_dir
+            ):
+                preview = manager.aimami_import_preview()
+                result = manager.import_aimami_accounts()
+
+        reasons = {item["account_id"]: item["reason"] for item in preview["candidates"]}
+        self.assertEqual(reasons["acct-no-refresh"], "missing_refresh_token")
+        self.assertEqual(reasons["acct-out"], "snapshot_path_outside_dir")
+        self.assertEqual(preview["summary"]["skipped"], 2)
+        self.assertEqual(result["imported"], [])
+        self.assertEqual(len(result["skipped"]), 2)
+
+    def test_redact_snapshot_masks_aimami_sync_and_import_response(self) -> None:
+        payload = {
+            "aimami_sync": {
+                "registry_path": "/Users/person/.codex/accounts/registry.json",
+                "snapshots_dir": "/Users/person/.codex/accounts/snapshots",
+                "active_account_key": "openai::01234567-89ab-cdef-0123-456789abcdef",
+                "active_account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                "candidates": [
+                    {
+                        "account_key": "openai::01234567-89ab-cdef-0123-456789abcdef",
+                        "account_id": "01234567-89ab-cdef-0123-456789abcdef",
+                        "email": "person@example.com",
+                        "snapshot_path": "/Users/person/.codex/accounts/snapshots/account.json",
+                    }
+                ],
+            },
+            "imported": [{"account_id": "01234567-89ab-cdef-0123-456789abcdef", "email": "person@example.com"}],
+            "bridge_providers": {"missing": [{"account_id": "01234567-89ab-cdef-0123-456789abcdef", "email": "person@example.com"}]},
+            "missing_in_aimami": [{"account_id": "01234567-89ab-cdef-0123-456789abcdef", "email": "person@example.com", "refresh_sha12": "abcdef123456"}],
+            "conflicts": [{"account_id": "01234567-89ab-cdef-0123-456789abcdef", "email": "person@example.com", "aimami_refresh_sha12": "fedcba654321"}],
+        }
+
+        redacted = bridgedeck.redact_snapshot(payload)
+        encoded = json.dumps(redacted)
+
+        self.assertNotIn("person@example.com", encoded)
+        self.assertNotIn("/Users/person", encoded)
+        self.assertNotIn("01234567-89ab-cdef-0123-456789abcdef", encoded)
+        self.assertIn("pe***n@example.com", encoded)
+        self.assertIn("abcdef...3456", encoded)
+        self.assertIn("fedcba...4321", encoded)
+
+    def test_aimami_inject_ui_renders_409_gate_payload(self) -> None:
+        self.assertIn("e.status === 409", bridgedeck.INDEX_HTML)
+        self.assertIn("AiMaMi inject blocked", bridgedeck.INDEX_HTML)
+        self.assertIn("verification required", bridgedeck.INDEX_HTML)
+        self.assertIn(".aimami-accounts.json", bridgedeck.INDEX_HTML)
+        self.assertIn("native schema matched", bridgedeck.INDEX_HTML)
+        self.assertIn("AiMaMi export failed", bridgedeck.INDEX_HTML)
 
     def test_managed_codex_provider_uses_auth_store_binding_over_embedded_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

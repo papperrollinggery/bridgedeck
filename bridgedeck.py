@@ -38,6 +38,11 @@ DEFAULT_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CODEX_AUTH_PATH = DEFAULT_CODEX_HOME / "auth.json"
+DEFAULT_AIMAMI_REGISTRY_PATH = DEFAULT_CODEX_HOME / "accounts" / "registry.json"
+DEFAULT_AIMAMI_SNAPSHOTS_DIR = DEFAULT_CODEX_HOME / "accounts" / "snapshots"
+DEFAULT_AIMAMI_EXPORT_DIR = Path.home() / "Downloads"
+DEFAULT_AIMAMI_INJECT_VERIFICATION_PATH = Path.home() / ".cc-switch" / "bridgedeck-aimami-inject-verification.json"
+DEFAULT_AIMAMI_APP_PATH = Path("/Applications/AiMaMi.app")
 CODEX_APP_DYNAMIC_TOOLS = (
     "automation_update",
     "read_thread_terminal",
@@ -72,6 +77,7 @@ DEFAULT_OMC_CODEX_SHIM_PATHS = (
 )
 DEFAULT_ZPROFILE_PATH = Path.home() / ".zprofile"
 DEFAULT_AUTO_SWITCH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auto-switch.json"
+DEFAULT_AIMAMI_FOLLOW_PATH = Path.home() / ".cc-switch" / "bridgedeck-aimami-follow.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
 APP_VERSION = "0.2.22"
@@ -277,6 +283,12 @@ def mask_token(token: str | None) -> str:
     if len(token) <= 10:
         return token
     return f"{token[:6]}...{token[-4:]}"
+
+
+def mask_token_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    return mask_token(value)
 
 
 def truncate_log_text(value: str | None, *, limit: int = 240) -> str:
@@ -763,8 +775,24 @@ def jwt_identity(token: str | None) -> dict[str, Any]:
         "account_id": auth_obj.get("chatgpt_account_id") or payload.get("chatgpt_account_id") or "",
         "email": profile_obj.get("email") or payload.get("email") or "",
         "plan": auth_obj.get("chatgpt_plan_type") or "",
+        "user_id": auth_obj.get("chatgpt_account_user_id") or auth_obj.get("chatgpt_user_id") or auth_obj.get("user_id") or "",
         "exp": payload.get("exp"),
     }
+
+
+def account_id_from_aimami_key(value: str | None) -> str:
+    text = (value or "").strip()
+    if "::" not in text:
+        return ""
+    return text.rsplit("::", 1)[1].strip()
+
+
+def path_inside_dir(path: Path, base_dir: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(base_dir.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
 
 
 def pkce_challenge(verifier: str) -> str:
@@ -848,7 +876,7 @@ def _post_json_url(url: str, payload: dict[str, Any], *, user_agent: str) -> dic
             code = str(((parsed_detail.get("error") or {}) if isinstance(parsed_detail, dict) else {}).get("code") or "")
         except Exception:
             code = ""
-        if code == "deviceauth_authorization_unknown":
+        if code in ("deviceauth_authorization_unknown", "deviceauth_authorization_pending"):
             raise CodexDeviceAuthorizationPending("等待用户完成设备授权") from exc
         raise RuntimeError(f"Device authorization failed: HTTP {exc.code} {truncate_log_text(detail)}") from exc
     if not isinstance(parsed, dict):
@@ -943,6 +971,38 @@ def exchange_codex_oauth_code(
         raise RuntimeError("OAuth token exchange failed: invalid response")
     if not payload.get("access_token") or not payload.get("refresh_token"):
         raise RuntimeError("OAuth token exchange failed: missing token fields")
+    return payload
+
+
+def refresh_codex_oauth_token(refresh_token: str) -> dict[str, Any]:
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+            "refresh_token": refresh_token,
+            "scope": CODEX_DEVICE_SCOPE,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        CODEX_OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": CODEX_DEVICE_USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with _openai_oauth_opener().open(request, timeout=30) as response:
+            payload = json.loads(response.read(MAX_REQUEST_BYTES).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1200).decode("utf-8", "replace")
+        raise RuntimeError(f"OAuth token refresh failed: HTTP {exc.code} {truncate_log_text(detail)}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("OAuth token refresh failed: invalid response")
+    if not payload.get("access_token") or not payload.get("refresh_token"):
+        raise RuntimeError("OAuth token refresh failed: missing token fields")
     return payload
 
 
@@ -2543,6 +2603,23 @@ def port_processes(port: int) -> list[dict[str, Any]]:
     return [{"pid": pid, "command": process_command(pid)} for pid in pids_listening_on_port(port)]
 
 
+def aimami_processes() -> list[dict[str, Any]]:
+    proc = run_quiet(["/bin/ps", "axo", "pid=,command="], timeout=2)
+    if not proc or proc.returncode != 0:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in proc.stdout.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        pid_text, _, command = text.partition(" ")
+        lowered = command.lower()
+        if "aimami" not in lowered and "ai mommy" not in lowered:
+            continue
+        rows.append({"pid": safe_int(pid_text, 0), "command": command})
+    return [row for row in rows if row.get("pid")]
+
+
 def port_active_connections(port: int) -> list[dict[str, Any]]:
     proc = run_quiet(["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:ESTABLISHED", "-F", "pcn"], timeout=2)
     if not proc or proc.returncode not in (0, 1):
@@ -2998,16 +3075,52 @@ class BridgeManager:
         if not account_id:
             raise RuntimeError("无法从 token 识别 ChatGPT account_id")
         email = str(identity.get("email") or "")
+        self._upsert_oauth_account_record(
+            account_id=account_id,
+            email=email,
+            refresh_token=refresh_token,
+            set_default=set_default,
+            source="codex_oauth",
+        )
+        return account_id
+
+    def _upsert_oauth_account_record(
+        self,
+        *,
+        account_id: str,
+        email: str,
+        refresh_token: str,
+        set_default: bool = False,
+        source: str = "manual",
+    ) -> dict[str, Any]:
+        account_id = account_id.strip()
+        email = email.strip()
+        refresh_token = refresh_token.strip()
+        if not account_id:
+            raise ValueError("account_id 不能为空")
+        if not refresh_token:
+            raise ValueError("refresh_token 不能为空")
         with self._lock:
             raw = load_json(self.paths.auth_store, {})
             store = raw if isinstance(raw, dict) else {}
             accounts = store.get("accounts") if isinstance(store.get("accounts"), dict) else {}
             next_accounts = copy.deepcopy(accounts)
+            existing = next_accounts.get(account_id) if isinstance(next_accounts.get(account_id), dict) else {}
+            existing_refresh = str(existing.get("refresh_token") or "")
+            existing_email = str(existing.get("email") or "")
+            action = "created" if not existing else ("updated" if existing_refresh != refresh_token or (email and email != existing_email) else "unchanged")
+            authenticated_at = existing.get("authenticated_at") if existing else None
+            if action != "unchanged":
+                authenticated_at = int(time.time())
+            merged = dict(existing)
+            if source:
+                merged["source"] = source
             next_accounts[account_id] = {
+                **merged,
                 "account_id": account_id,
-                "email": email,
+                "email": email or existing_email,
                 "refresh_token": refresh_token,
-                "authenticated_at": int(time.time()),
+                "authenticated_at": authenticated_at,
             }
             default_account_id = str(store.get("default_account_id") or "")
             if set_default or not default_account_id:
@@ -3020,9 +3133,14 @@ class BridgeManager:
             before = json.dumps(store, ensure_ascii=False, sort_keys=True)
             after = json.dumps(next_store, ensure_ascii=False, sort_keys=True)
             if before != after:
-                self._backup_file(self.paths.auth_store, "codex-oauth")
+                self._backup_file(self.paths.auth_store, f"{source}-oauth")
                 dump_json(self.paths.auth_store, next_store)
-        return account_id
+        return {
+            "account_id": account_id,
+            "email": email or existing_email,
+            "action": action,
+            "refresh_sha12": sha12(refresh_token),
+        }
 
     def _provider_columns(self, conn: sqlite3.Connection) -> set[str]:
         rows = conn.execute("PRAGMA table_info(providers)").fetchall()
@@ -3266,6 +3384,32 @@ class BridgeManager:
         )
         dump_json(DEFAULT_AUTO_SWITCH_PATH, current)
 
+    def _load_aimami_follow_config(self) -> dict[str, Any]:
+        raw = load_json(DEFAULT_AIMAMI_FOLLOW_PATH, {})
+        config = raw if isinstance(raw, dict) else {}
+        return {
+            "enabled": bool(config.get("enabled", False)),
+            "last_result": config.get("last_result") if isinstance(config.get("last_result"), dict) else {},
+            "last_seen_active_account_key": str(config.get("last_seen_active_account_key") or ""),
+            "last_synced_account_id": str(config.get("last_synced_account_id") or ""),
+        }
+
+    def _save_aimami_follow_config(self, config: dict[str, Any]) -> None:
+        current = self._load_aimami_follow_config()
+        current.update(
+            {
+                "enabled": bool(config.get("enabled", current["enabled"])),
+                "last_result": config.get("last_result", current.get("last_result", {})),
+                "last_seen_active_account_key": str(config.get("last_seen_active_account_key", current.get("last_seen_active_account_key", "")) or ""),
+                "last_synced_account_id": str(config.get("last_synced_account_id", current.get("last_synced_account_id", "")) or ""),
+            }
+        )
+        dump_json(DEFAULT_AIMAMI_FOLLOW_PATH, current)
+
+    def update_aimami_follow_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._save_aimami_follow_config({"enabled": bool(payload.get("enabled", False))})
+        return {"ok": True, "aimami_follow": self._load_aimami_follow_config()}
+
     def _load_accounts(self) -> list[dict[str, Any]]:
         store = load_json(self.paths.auth_store, {})
         accounts = store.get("accounts") if isinstance(store, dict) else {}
@@ -3295,9 +3439,774 @@ class BridgeManager:
     def _account_map(self) -> dict[str, dict[str, Any]]:
         return {item["account_id"]: item for item in self._load_accounts()}
 
+    def _aimami_snapshot_path(self, value: str) -> tuple[Path | None, str]:
+        if not value.strip():
+            return None, "missing_snapshot_path"
+        raw_path = Path(value).expanduser()
+        path = raw_path if raw_path.is_absolute() else DEFAULT_AIMAMI_SNAPSHOTS_DIR / raw_path
+        if not path_inside_dir(path, DEFAULT_AIMAMI_SNAPSHOTS_DIR):
+            return path, "snapshot_path_outside_dir"
+        return path, ""
+
+    def _aimami_candidate_from_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        snapshot_path, path_error = self._aimami_snapshot_path(str(item.get("snapshotPath") or ""))
+        account_key = str(item.get("accountKey") or "")
+        candidate: dict[str, Any] = {
+            "account_key": account_key,
+            "account_id": account_id_from_aimami_key(account_key),
+            "email": str(item.get("email") or ""),
+            "plan": str(item.get("plan") or ""),
+            "snapshot_path": str(snapshot_path or ""),
+            "status": "skipped",
+            "reason": path_error,
+            "refresh_sha12": "",
+        }
+        if path_error:
+            return candidate
+        if not snapshot_path or not snapshot_path.exists():
+            candidate["reason"] = "snapshot_missing"
+            return candidate
+        try:
+            snapshot = load_json(snapshot_path, {})
+        except Exception as exc:  # noqa: BLE001
+            candidate["reason"] = f"snapshot_parse_error: {exc}"
+            return candidate
+        if not isinstance(snapshot, dict):
+            candidate["reason"] = "snapshot_invalid"
+            return candidate
+        if str(snapshot.get("auth_mode") or "") != "chatgpt":
+            candidate["reason"] = "not_chatgpt_auth"
+            return candidate
+        tokens = snapshot.get("tokens") if isinstance(snapshot.get("tokens"), dict) else {}
+        refresh_token = str(tokens.get("refresh_token") or "")
+        account_id = str(tokens.get("account_id") or candidate["account_id"] or "")
+        identity = jwt_identity(str(tokens.get("id_token") or tokens.get("access_token") or ""))
+        email = str(item.get("email") or identity.get("email") or "")
+        if not account_id:
+            candidate.update({"reason": "missing_account_id", "account_id": ""})
+            return candidate
+        if not refresh_token:
+            candidate.update({"reason": "missing_refresh_token", "account_id": account_id, "email": email})
+            return candidate
+        existing = self._account_map().get(account_id)
+        refresh_hash = sha12(refresh_token)
+        existing_hash = str((existing or {}).get("refresh_sha12") or "")
+        if not existing:
+            status = "new"
+            reason = ""
+        elif existing_hash == refresh_hash:
+            status = "unchanged"
+            reason = ""
+        else:
+            status = "updated"
+            reason = "refresh_token_changed"
+        candidate.update(
+            {
+                "account_id": account_id,
+                "email": email,
+                "status": status,
+                "reason": reason,
+                "refresh_sha12": refresh_hash,
+                "_refresh_token": refresh_token,
+            }
+        )
+        return candidate
+
+    def aimami_import_preview(self) -> dict[str, Any]:
+        registry_path = DEFAULT_AIMAMI_REGISTRY_PATH
+        if not registry_path.exists():
+            return {
+                "ok": True,
+                "detected": False,
+                "registry_path": str(registry_path),
+                "snapshots_dir": str(DEFAULT_AIMAMI_SNAPSHOTS_DIR),
+                "active_account_id": "",
+                "candidates": [],
+                "summary": {"new": 0, "updated": 0, "unchanged": 0, "skipped": 0, "importable": 0},
+            }
+        registry = load_json(registry_path, {})
+        if not isinstance(registry, dict):
+            raise RuntimeError("AiMaMi registry is not a JSON object")
+        items = registry.get("items") if isinstance(registry.get("items"), list) else []
+        candidates = [self._aimami_candidate_from_item(item) for item in items if isinstance(item, dict)]
+        for candidate in candidates:
+            candidate.pop("_refresh_token", None)
+        summary = self._aimami_import_summary(candidates)
+        return {
+            "ok": True,
+            "detected": True,
+            "registry_path": str(registry_path),
+            "snapshots_dir": str(DEFAULT_AIMAMI_SNAPSHOTS_DIR),
+            "active_account_key": str(registry.get("activeAccountKey") or ""),
+            "active_account_id": account_id_from_aimami_key(str(registry.get("activeAccountKey") or "")),
+            "candidates": candidates,
+            "summary": summary,
+        }
+
+    def _aimami_import_summary(self, candidates: list[dict[str, Any]]) -> dict[str, int]:
+        summary = {"new": 0, "updated": 0, "unchanged": 0, "skipped": 0, "importable": 0}
+        for candidate in candidates:
+            status = str(candidate.get("status") or "skipped")
+            if status in summary:
+                summary[status] += 1
+            else:
+                summary["skipped"] += 1
+            if status in {"new", "updated", "unchanged"}:
+                summary["importable"] += 1
+        return summary
+
+    def import_aimami_accounts(self, *, create_missing: bool = False) -> dict[str, Any]:
+        registry = load_json(DEFAULT_AIMAMI_REGISTRY_PATH, {})
+        if not isinstance(registry, dict):
+            raise RuntimeError("AiMaMi registry is not a JSON object")
+        items = registry.get("items") if isinstance(registry.get("items"), list) else []
+        raw_candidates = [self._aimami_candidate_from_item(item) for item in items if isinstance(item, dict)]
+        imported: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for candidate in raw_candidates:
+            status = str(candidate.get("status") or "skipped")
+            if status not in {"new", "updated", "unchanged"}:
+                skipped.append({k: v for k, v in candidate.items() if not k.startswith("_")})
+                continue
+            if status == "unchanged":
+                imported.append({k: v for k, v in candidate.items() if not k.startswith("_")})
+                continue
+            result = self._upsert_oauth_account_record(
+                account_id=str(candidate.get("account_id") or ""),
+                email=str(candidate.get("email") or ""),
+                refresh_token=str(candidate.get("_refresh_token") or ""),
+                set_default=False,
+                source="aimami",
+            )
+            imported.append({**{k: v for k, v in candidate.items() if not k.startswith("_")}, "action": result.get("action")})
+        created_payload = {"created": [], "skipped": [], "missing": []}
+        if create_missing:
+            created_payload = self.create_missing_bridge_providers()
+        preview_candidates = [{k: v for k, v in candidate.items() if not k.startswith("_")} for candidate in raw_candidates]
+        return {
+            "ok": True,
+            "imported": imported,
+            "skipped": skipped,
+            "summary": self._aimami_import_summary(preview_candidates),
+            "bridge_providers": created_payload,
+        }
+
+    def _aimami_active_candidate(self) -> dict[str, Any]:
+        registry = load_json(DEFAULT_AIMAMI_REGISTRY_PATH, {})
+        if not isinstance(registry, dict):
+            return {"status": "skipped", "reason": "registry_invalid", "account_id": "", "account_key": ""}
+        active_key = str(registry.get("activeAccountKey") or "")
+        active_account_id = account_id_from_aimami_key(active_key)
+        items = registry.get("items") if isinstance(registry.get("items"), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            account_key = str(item.get("accountKey") or "")
+            if account_key == active_key or account_id_from_aimami_key(account_key) == active_account_id:
+                return self._aimami_candidate_from_item(item)
+        return {
+            "status": "skipped",
+            "reason": "active_account_not_in_registry",
+            "account_id": active_account_id,
+            "account_key": active_key,
+        }
+
+    def _local_bridge_has_active_clients(self) -> tuple[bool, list[dict[str, Any]], dict[str, Any]]:
+        active_connections = port_active_connections(LOCAL_BRIDGE_PORT)
+        bridge_state = read_local_bridge_state()
+        active_stream = bridge_state.get("active_stream") if isinstance(bridge_state, dict) else {}
+        active_stream = active_stream if isinstance(active_stream, dict) else {}
+        return bool(active_connections or active_stream), active_connections, active_stream
+
+    def _bridge_provider_for_account(self, snapshot: dict[str, Any], account_id: str) -> dict[str, Any] | None:
+        providers = [p for p in snapshot.get("providers", []) if isinstance(p, dict)]
+        return next((p for p in providers if p.get("account_id") == account_id and self._is_bridge_provider(p)), None)
+
+    def run_aimami_follow(self, *, force: bool = False) -> dict[str, Any]:
+        config = self._load_aimami_follow_config()
+        now = int(time.time())
+        if not force and not config["enabled"]:
+            result = {
+                "ok": True,
+                "enabled": False,
+                "action": "noop",
+                "reason": "follow_disabled",
+                "selected_account_id": "",
+                "timestamp": now,
+            }
+            self._save_aimami_follow_config({**config, "last_result": result})
+            return result
+
+        preview = self.aimami_import_preview()
+        active_key = str(preview.get("active_account_key") or "")
+        active_account_id = str(preview.get("active_account_id") or "")
+        if not active_account_id:
+            result = {
+                "ok": False,
+                "enabled": config["enabled"],
+                "action": "noop",
+                "reason": "missing_active_account",
+                "selected_account_id": "",
+                "timestamp": now,
+            }
+            self._save_aimami_follow_config({**config, "last_result": result, "last_seen_active_account_key": active_key})
+            return result
+
+        if active_account_id not in self._account_map():
+            candidate = self._aimami_active_candidate()
+            status = str(candidate.get("status") or "skipped")
+            if status not in {"new", "updated", "unchanged"}:
+                result = {
+                    "ok": False,
+                    "enabled": config["enabled"],
+                    "action": "noop",
+                    "reason": str(candidate.get("reason") or "active_account_not_importable"),
+                    "selected_account_id": active_account_id,
+                    "timestamp": now,
+                }
+                self._save_aimami_follow_config({**config, "last_result": result, "last_seen_active_account_key": active_key})
+                return result
+            imported = self.import_aimami_accounts(create_missing=False)
+            if active_account_id not in self._account_map():
+                result = {
+                    "ok": False,
+                    "enabled": config["enabled"],
+                    "action": "import_failed",
+                    "reason": "active_account_missing_after_import",
+                    "selected_account_id": active_account_id,
+                    "imported": imported,
+                    "timestamp": now,
+                }
+                self._save_aimami_follow_config({**config, "last_result": result, "last_seen_active_account_key": active_key})
+                return result
+
+        snapshot = self.snapshot(include_secrets=False)
+        current_provider = self._current_claude_provider(snapshot)
+        if not self._is_bridge_provider(current_provider):
+            result = {
+                "ok": True,
+                "enabled": config["enabled"],
+                "action": "noop",
+                "reason": "current_provider_is_not_local_bridge",
+                "selected_account_id": active_account_id,
+                "timestamp": now,
+            }
+            self._save_aimami_follow_config({**config, "last_result": result, "last_seen_active_account_key": active_key})
+            return result
+
+        busy, active_connections, active_stream = self._local_bridge_has_active_clients()
+        if busy:
+            result = {
+                "ok": True,
+                "enabled": config["enabled"],
+                "action": "deferred",
+                "reason": "deferred_active_clients",
+                "selected_account_id": active_account_id,
+                "active_connection_count": len(active_connections),
+                "active_stream": active_stream,
+                "timestamp": now,
+            }
+            self._save_aimami_follow_config({**config, "last_result": result, "last_seen_active_account_key": active_key})
+            return result
+
+        target_provider = self._bridge_provider_for_account(snapshot, active_account_id)
+        provider_created = None
+        if not target_provider:
+            providers = [p for p in snapshot.get("providers", []) if isinstance(p, dict)]
+            existing_names = {str(p.get("name") or "") for p in providers}
+            account = self._account_for_id(active_account_id) or {"account_id": active_account_id, "email": ""}
+            provider_name = self._default_provider_name(account, existing_names)
+            provider_created = self.create_or_update_provider(active_account_id, provider_name, False)
+            snapshot = self.snapshot(include_secrets=False)
+            target_provider = self._bridge_provider_for_account(snapshot, active_account_id)
+
+        if not target_provider:
+            result = {
+                "ok": False,
+                "enabled": config["enabled"],
+                "action": "noop",
+                "reason": "missing_provider_after_create",
+                "selected_account_id": active_account_id,
+                "created_provider": provider_created,
+                "timestamp": now,
+            }
+            self._save_aimami_follow_config({**config, "last_result": result, "last_seen_active_account_key": active_key})
+            return result
+
+        target_provider_id = str(target_provider.get("id") or "")
+        current_provider_id = str((current_provider or {}).get("id") or "")
+        if target_provider_id and target_provider_id != current_provider_id:
+            changed = self.set_current_provider(target_provider_id)
+            result = {
+                "ok": True,
+                "enabled": config["enabled"],
+                "action": "switched",
+                "reason": "followed_active_account",
+                "selected_account_id": active_account_id,
+                "provider_id": target_provider_id,
+                "created_provider": provider_created,
+                "result": changed,
+                "timestamp": now,
+            }
+        else:
+            result = {
+                "ok": True,
+                "enabled": config["enabled"],
+                "action": "unchanged",
+                "reason": "already_following_active_account",
+                "selected_account_id": active_account_id,
+                "provider_id": target_provider_id,
+                "timestamp": now,
+            }
+        self._save_aimami_follow_config(
+            {
+                **config,
+                "last_result": result,
+                "last_seen_active_account_key": active_key,
+                "last_synced_account_id": active_account_id if result.get("ok") else config.get("last_synced_account_id", ""),
+            }
+        )
+        return result
+
     def _load_auth_store_raw(self) -> dict[str, Any]:
         store = load_json(self.paths.auth_store, {})
         return store if isinstance(store, dict) else {}
+
+    def aimami_export_preview(self) -> dict[str, Any]:
+        aimami = self.aimami_import_preview()
+        aimami_accounts = {
+            str(item.get("account_id") or ""): item
+            for item in aimami.get("candidates", [])
+            if isinstance(item, dict) and item.get("account_id")
+        }
+        missing: list[dict[str, Any]] = []
+        conflicts: list[dict[str, Any]] = []
+        for account in self._load_accounts():
+            account_id = str(account.get("account_id") or "")
+            if not account_id:
+                continue
+            existing = aimami_accounts.get(account_id)
+            row = {
+                "account_id": account_id,
+                "email": account.get("email") or "",
+                "refresh_sha12": account.get("refresh_sha12") or "",
+            }
+            if not existing:
+                missing.append(row)
+                continue
+            aimami_hash = str(existing.get("refresh_sha12") or "")
+            bridge_hash = str(account.get("refresh_sha12") or "")
+            if aimami_hash and bridge_hash and aimami_hash != bridge_hash:
+                conflicts.append({**row, "aimami_refresh_sha12": aimami_hash})
+        return {
+            "ok": True,
+            "detected": bool(aimami.get("detected")),
+            "missing_in_aimami": missing,
+            "conflicts": conflicts,
+            "recommendation": "export_file",
+        }
+
+    def _export_account_token_payload(self, account_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        store = self._load_auth_store_raw()
+        accounts = store.get("accounts") if isinstance(store.get("accounts"), dict) else {}
+        record = accounts.get(account_id) if isinstance(accounts.get(account_id), dict) else None
+        if not record:
+            raise ValueError(f"未找到账号: {account_id}")
+        refresh_token = str(record.get("refresh_token") or "")
+        if not refresh_token:
+            raise ValueError(f"账号缺少 refresh_token: {account_id}")
+        token_payload = refresh_codex_oauth_token(refresh_token)
+        refreshed_access = str(token_payload.get("access_token") or "")
+        refreshed_refresh = str(token_payload.get("refresh_token") or "")
+        identity = jwt_identity(refreshed_access)
+        token_account_id = str(
+            token_payload.get("account_id")
+            or identity.get("account_id")
+            or account_id
+        )
+        if token_account_id != account_id:
+            raise RuntimeError("OAuth refresh returned a different account_id")
+        email = str(record.get("email") or identity.get("email") or "")
+        user_id = str(identity.get("user_id") or "")
+        plan = str(identity.get("plan") or "")
+        if refreshed_refresh and refreshed_refresh != refresh_token:
+            self._upsert_oauth_account_record(
+                account_id=account_id,
+                email=email,
+                refresh_token=refreshed_refresh,
+                set_default=False,
+                source=str(record.get("source") or "bridgedeck"),
+            )
+        export_record = {
+            "account_id": account_id,
+            "email": email,
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": None,
+            "tokens": {
+                "account_id": account_id,
+                "access_token": refreshed_access,
+                "refresh_token": refreshed_refresh,
+            },
+            "last_refresh": int(time.time()),
+        }
+        id_token = str(token_payload.get("id_token") or "")
+        if id_token:
+            export_record["tokens"]["id_token"] = id_token
+        return export_record, {
+            "account_id": account_id,
+            "email": email,
+            "user_id": user_id,
+            "plan": plan,
+            "refresh_sha12": sha12(refreshed_refresh),
+        }
+
+    def export_aimami_accounts(self, account_ids: list[str]) -> dict[str, Any]:
+        selected = [str(item).strip() for item in account_ids if str(item).strip()]
+        if not selected:
+            raise ValueError("请选择至少一个账号")
+        known = {account["account_id"] for account in self._load_accounts()}
+        unknown = [account_id for account_id in selected if account_id not in known]
+        if unknown:
+            raise ValueError(f"未知账号: {', '.join(unknown)}")
+        exported_accounts: list[dict[str, Any]] = []
+        result_accounts: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for account_id in selected:
+            account = self._account_for_id(account_id) or {"account_id": account_id, "email": ""}
+            try:
+                export_record, result_record = self._export_account_token_payload(account_id)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(
+                    {
+                        "account_id": account_id,
+                        "email": account.get("email") or "",
+                        "error": truncate_log_text(str(exc), limit=500),
+                        "error_type": type(exc).__name__,
+                    }
+                )
+                continue
+            exported_accounts.append(self._aimami_export_account_payload(export_record, result_record))
+            result_accounts.append(result_record)
+        if not exported_accounts:
+            return {
+                "ok": False,
+                "mode": "export_file",
+                "reason": "export_failed",
+                "errors": errors,
+                "exported": [],
+                "count": 0,
+                "message": "No AiMaMi export file was written.",
+            }
+        payload = {
+            "schemaVersion": 1,
+            "kind": "aimami-accounts-export",
+            "appVersion": f"BridgeDeck {APP_VERSION}",
+            "exportedAt": int(time.time()),
+            "exportedHostname": socket.gethostname(),
+            "accountCount": len(exported_accounts),
+            "accounts": exported_accounts,
+        }
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        export_path = DEFAULT_AIMAMI_EXPORT_DIR / f"bridgedeck-{stamp}.aimami-accounts.json"
+        write_private_text_file(export_path, json.dumps(payload, ensure_ascii=False, indent=2))
+        return {
+            "ok": not errors,
+            "mode": "export_file",
+            "path": str(export_path),
+            "exported": result_accounts,
+            "errors": errors,
+            "count": len(result_accounts),
+            "message": "AiMaMi-compatible export file written; no AiMaMi files were modified.",
+        }
+
+    def _load_aimami_inject_verification(self) -> dict[str, Any]:
+        raw = load_json(DEFAULT_AIMAMI_INJECT_VERIFICATION_PATH, {})
+        data = raw if isinstance(raw, dict) else {}
+        reload_verified = bool(data.get("reload_verified"))
+        private_state_not_required = bool(data.get("private_state_not_required"))
+        verified = reload_verified and private_state_not_required
+        return {
+            "verified": verified,
+            "reload_verified": reload_verified,
+            "private_state_not_required": private_state_not_required,
+            "path": str(DEFAULT_AIMAMI_INJECT_VERIFICATION_PATH),
+            "message": "snapshot injection verified" if verified else "manual AiMaMi reload verification required",
+        }
+
+    def _aimami_registry(self) -> dict[str, Any]:
+        if not DEFAULT_AIMAMI_REGISTRY_PATH.exists():
+            return {"items": []}
+        raw = load_json(DEFAULT_AIMAMI_REGISTRY_PATH, {})
+        if not isinstance(raw, dict):
+            raise RuntimeError("AiMaMi registry is not a JSON object")
+        if not isinstance(raw.get("items"), list):
+            raw["items"] = []
+        return raw
+
+    def _aimami_existing_by_account(self) -> dict[str, dict[str, Any]]:
+        preview = self.aimami_import_preview()
+        return {
+            str(item.get("account_id") or ""): item
+            for item in preview.get("candidates", [])
+            if isinstance(item, dict) and item.get("account_id")
+        }
+
+    def aimami_schema_profile(self) -> dict[str, Any]:
+        registry = self._aimami_registry()
+        items = [item for item in registry.get("items", []) if isinstance(item, dict)]
+        account_keys = [str(item.get("accountKey") or "") for item in items]
+        snapshot_paths = [str(item.get("snapshotPath") or "") for item in items]
+        user_prefix_keys = [key for key in account_keys if key.startswith("user-") and "::" in key]
+        absolute_snapshots = [path for path in snapshot_paths if path and Path(path).expanduser().is_absolute()]
+        expected_item_fields = {
+            "accountKey",
+            "email",
+            "alias",
+            "accountName",
+            "workspaceName",
+            "profileName",
+            "plan",
+            "authMode",
+            "hasActiveSubscription",
+            "subscriptionExpiresAt",
+            "subscriptionWillRenew",
+            "createdAt",
+            "lastUsedAt",
+            "lastUsageAt",
+            "cachedPrimaryWindow",
+            "cachedSecondaryWindow",
+            "snapshotPath",
+        }
+        observed_fields = set().union(*(set(item.keys()) for item in items)) if items else set()
+        missing_item_fields = sorted(expected_item_fields - observed_fields) if items else []
+        sample_snapshot_ok = False
+        sample_snapshot_keys: list[str] = []
+        for path_text in snapshot_paths:
+            path, path_error = self._aimami_snapshot_path(path_text)
+            if path_error or not path or not path.exists():
+                continue
+            snapshot = load_json(path, {})
+            if isinstance(snapshot, dict):
+                sample_snapshot_keys = sorted(snapshot.keys())
+                tokens = snapshot.get("tokens") if isinstance(snapshot.get("tokens"), dict) else {}
+                sample_snapshot_ok = (
+                    snapshot.get("auth_mode") == "chatgpt"
+                    and "OPENAI_API_KEY" in snapshot
+                    and all(tokens.get(key) for key in ("access_token", "refresh_token", "account_id"))
+                )
+                break
+        return {
+            "detected": bool(items),
+            "registry_schema_version": registry.get("schemaVersion"),
+            "item_count": len(items),
+            "account_key_style": "user_prefix" if user_prefix_keys else ("unknown" if items else "none"),
+            "snapshot_path_style": "absolute" if snapshot_paths and len(absolute_snapshots) == len(snapshot_paths) else ("mixed" if absolute_snapshots else ("relative" if snapshot_paths else "none")),
+            "required_item_fields_present": not missing_item_fields,
+            "missing_item_fields": missing_item_fields,
+            "sample_snapshot_keys": sample_snapshot_keys,
+            "sample_snapshot_valid": sample_snapshot_ok,
+            "expected_injected_account_key_style": "user_prefix",
+            "expected_injected_snapshot_path_style": "absolute",
+            "compatible_with_injection": bool(
+                (not items or user_prefix_keys)
+                and (not snapshot_paths or absolute_snapshots)
+                and (not items or not missing_item_fields)
+                and (not snapshot_paths or sample_snapshot_ok)
+            ),
+        }
+
+    def aimami_inject_preview(self) -> dict[str, Any]:
+        export_preview = self.aimami_export_preview()
+        verification = self._load_aimami_inject_verification()
+        processes = aimami_processes()
+        return {
+            "ok": True,
+            "mode": "codex_snapshot",
+            "verification": verification,
+            "can_apply": bool(verification.get("verified")),
+            "missing_in_aimami": export_preview.get("missing_in_aimami", []),
+            "conflicts": export_preview.get("conflicts", []),
+            "schema_profile": self.aimami_schema_profile(),
+            "aimami_running": bool(processes),
+            "aimami_processes": processes,
+            "warning": "AiMaMi is running; reload/restart AiMaMi after injection." if processes else "",
+        }
+
+    def _aimami_snapshot_filename(self, account_id: str) -> str:
+        return f"bridgedeck-{safe_slug(account_id)}.json"
+
+    def _aimami_account_key(self, account_id: str, user_id: str) -> str:
+        prefix = user_id.strip() or f"bridgedeck-{safe_slug(account_id)}"
+        return f"{prefix}::{account_id}"
+
+    def _aimami_export_account_payload(self, export_record: dict[str, Any], result_record: dict[str, Any]) -> dict[str, Any]:
+        now = int(time.time())
+        account_id = str(result_record.get("account_id") or export_record.get("account_id") or "")
+        email = str(result_record.get("email") or export_record.get("email") or "")
+        plan = str(result_record.get("plan") or "")
+        account_key = self._aimami_account_key(account_id, str(result_record.get("user_id") or ""))
+        return {
+            "accountKey": account_key,
+            "email": email,
+            "alias": email,
+            "accountName": email,
+            "workspaceName": "",
+            "profileName": "",
+            "plan": plan,
+            "authMode": "chatgpt",
+            "hasActiveSubscription": bool(plan and plan.lower() != "free"),
+            "subscriptionExpiresAt": 0,
+            "subscriptionWillRenew": None,
+            "createdAt": now,
+            "lastUsedAt": now,
+            "auth": {
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": None,
+                "tokens": export_record["tokens"],
+                "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        }
+
+    def _aimami_native_snapshot_path(self, account_id: str, user_id: str) -> Path:
+        prefix = (user_id.strip() or f"bridgedeck-{safe_slug(account_id)}").replace("/", "-")
+        return DEFAULT_AIMAMI_SNAPSHOTS_DIR / f"{prefix}__{account_id}.json"
+
+    def _write_aimami_snapshot(self, account_id: str, export_record: dict[str, Any], *, user_id: str = "") -> str:
+        snapshot_path = self._aimami_native_snapshot_path(account_id, user_id)
+        if not path_inside_dir(snapshot_path, DEFAULT_AIMAMI_SNAPSHOTS_DIR):
+            raise ValueError("snapshot path outside AiMaMi snapshots directory")
+        payload = {
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": None,
+            "tokens": export_record["tokens"],
+            "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        write_private_text_file(snapshot_path, json.dumps(payload, ensure_ascii=False, indent=2))
+        return str(snapshot_path)
+
+    def _update_aimami_registry_for_injected(
+        self,
+        *,
+        account_id: str,
+        email: str,
+        user_id: str,
+        plan: str,
+        snapshot_path: str,
+        set_active: bool,
+        overwrite: bool,
+    ) -> str | None:
+        registry = self._aimami_registry()
+        backup = self._backup_file(DEFAULT_AIMAMI_REGISTRY_PATH, "aimami-inject")
+        items = registry.get("items") if isinstance(registry.get("items"), list) else []
+        now = int(time.time())
+        account_key = self._aimami_account_key(account_id, user_id)
+        next_item = {
+            "accountKey": account_key,
+            "email": email,
+            "alias": email,
+            "accountName": email,
+            "workspaceName": "",
+            "profileName": "",
+            "plan": plan,
+            "authMode": "chatgpt",
+            "hasActiveSubscription": bool(plan and plan.lower() != "free"),
+            "subscriptionExpiresAt": 0,
+            "subscriptionWillRenew": None,
+            "createdAt": now,
+            "lastUsedAt": now,
+            "lastUsageAt": None,
+            "cachedPrimaryWindow": None,
+            "cachedSecondaryWindow": None,
+            "snapshotPath": str(Path(snapshot_path).resolve(strict=False)),
+        }
+        replaced = False
+        next_items: list[Any] = []
+        for item in items:
+            if not isinstance(item, dict):
+                next_items.append(item)
+                continue
+            item_account_id = account_id_from_aimami_key(str(item.get("accountKey") or ""))
+            if item_account_id == account_id:
+                if not overwrite:
+                    next_items.append(item)
+                    continue
+                merged = dict(item)
+                next_item["createdAt"] = item.get("createdAt", now)
+                merged.update(next_item)
+                next_items.append(merged)
+                replaced = True
+            else:
+                next_items.append(item)
+        if not replaced:
+            next_items.append(next_item)
+        registry["items"] = next_items
+        registry["schemaVersion"] = registry.get("schemaVersion") or 1
+        registry["updatedAt"] = now
+        if set_active:
+            registry["activeAccountKey"] = account_key
+        write_private_text_file(DEFAULT_AIMAMI_REGISTRY_PATH, json.dumps(registry, ensure_ascii=False, indent=2))
+        return backup
+
+    def inject_aimami_accounts(
+        self,
+        *,
+        account_ids: list[str],
+        mode: str = "codex_snapshot",
+        set_active: bool = False,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        if mode == "export_file":
+            return self.export_aimami_accounts(account_ids)
+        if mode != "codex_snapshot":
+            raise ValueError("unsupported AiMaMi injection mode")
+        verification = self._load_aimami_inject_verification()
+        if not verification.get("verified"):
+            return {
+                "ok": False,
+                "mode": mode,
+                "reason": "injection_verification_required",
+                "verification": verification,
+                "message": "Manual AiMaMi reload verification is required before writing AiMaMi files.",
+            }
+        selected = [str(item).strip() for item in account_ids if str(item).strip()]
+        if not selected:
+            raise ValueError("请选择至少一个账号")
+        existing = self._aimami_existing_by_account()
+        conflicts = [item for item in selected if item in existing and str(existing[item].get("status") or "") == "updated"]
+        if conflicts and not overwrite:
+            return {
+                "ok": False,
+                "mode": mode,
+                "reason": "conflict_requires_overwrite",
+                "conflicts": [{"account_id": account_id} for account_id in conflicts],
+            }
+        written: list[dict[str, Any]] = []
+        backups: list[str] = []
+        for account_id in selected:
+            export_record, result_record = self._export_account_token_payload(account_id)
+            snapshot_path = self._write_aimami_snapshot(account_id, export_record, user_id=str(result_record.get("user_id") or ""))
+            backup = self._update_aimami_registry_for_injected(
+                account_id=account_id,
+                email=str(result_record.get("email") or ""),
+                user_id=str(result_record.get("user_id") or ""),
+                plan=str(result_record.get("plan") or ""),
+                snapshot_path=snapshot_path,
+                set_active=set_active,
+                overwrite=overwrite,
+            )
+            if backup:
+                backups.append(backup)
+            written.append({**result_record, "snapshot_path": snapshot_path})
+        processes = aimami_processes()
+        return {
+            "ok": True,
+            "mode": mode,
+            "written": written,
+            "backups": backups,
+            "set_active": set_active,
+            "aimami_running": bool(processes),
+            "warning": "AiMaMi is running; reload/restart AiMaMi after injection." if processes else "",
+        }
 
     def _codex_auth_summary(self, codex_home: Path) -> dict[str, Any]:
         auth_path = codex_home / "auth.json"
@@ -5367,6 +6276,7 @@ class BridgeManager:
                 "settings": str(self.paths.settings),
                 "auth_store": str(self.paths.auth_store),
                 "auto_switch": str(DEFAULT_AUTO_SWITCH_PATH),
+                "aimami_follow": str(DEFAULT_AIMAMI_FOLLOW_PATH),
                 "ccswitch_common_config": str(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH),
                 "claude_settings": str(DEFAULT_CLAUDE_SETTINGS_PATH),
                 "claude_installed_plugins": str(DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH),
@@ -5393,6 +6303,8 @@ class BridgeManager:
             "account_matrix": [],
             "current_provider_from_settings": self._current_provider_from_settings(),
             "auto_switch": self._load_auto_switch_config(),
+            "aimami_sync": self.aimami_import_preview(),
+            "aimami_follow": self._load_aimami_follow_config(),
             "plugin_sync": plugin_sync,
             "plugin_status": plugin_status,
             "claude_attribution_header": self.claude_attribution_header_status(),
@@ -7001,6 +7913,73 @@ def redact_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             if isinstance(item, dict):
                 item["account_id"] = mask_id_value(item.get("account_id"))
                 item["email"] = mask_email_value(item.get("email"))
+    for key in ("missing_in_aimami", "conflicts", "exported"):
+        for item in redacted.get(key, []):
+            if isinstance(item, dict):
+                item["account_id"] = mask_id_value(item.get("account_id"))
+                item["user_id"] = mask_id_value(item.get("user_id"))
+                item["email"] = mask_email_value(item.get("email"))
+                if item.get("refresh_sha12"):
+                    item["refresh_sha12"] = mask_token_value(str(item.get("refresh_sha12") or ""))
+                if item.get("aimami_refresh_sha12"):
+                    item["aimami_refresh_sha12"] = mask_token_value(str(item.get("aimami_refresh_sha12") or ""))
+    for item in redacted.get("errors", []):
+        if isinstance(item, dict):
+            item["account_id"] = mask_id_value(item.get("account_id"))
+            item["email"] = mask_email_value(item.get("email"))
+    for item in redacted.get("written", []):
+        if isinstance(item, dict):
+            item["account_id"] = mask_id_value(item.get("account_id"))
+            item["user_id"] = mask_id_value(item.get("user_id"))
+            item["email"] = mask_email_value(item.get("email"))
+            item["snapshot_path"] = redact_path_value(item.get("snapshot_path"))
+            if item.get("refresh_sha12"):
+                item["refresh_sha12"] = mask_token_value(str(item.get("refresh_sha12") or ""))
+    if isinstance(redacted.get("verification"), dict):
+        redacted["verification"]["path"] = redact_path_value(redacted["verification"].get("path"))
+    if "path" in redacted:
+        redacted["path"] = redact_path_value(redacted.get("path"))
+    if isinstance(redacted.get("backups"), list):
+        redacted["backups"] = [redact_path_value(item) for item in redacted["backups"] if isinstance(item, str)]
+    aimami = redacted.get("aimami_sync")
+    if isinstance(aimami, dict):
+        aimami["registry_path"] = redact_path_value(aimami.get("registry_path"))
+        aimami["snapshots_dir"] = redact_path_value(aimami.get("snapshots_dir"))
+        aimami["active_account_id"] = mask_id_value(aimami.get("active_account_id"))
+        if aimami.get("active_account_key"):
+            active_id = account_id_from_aimami_key(str(aimami.get("active_account_key") or ""))
+            aimami["active_account_key"] = f"<redacted>::{mask_id_value(active_id)}" if active_id else "<redacted>"
+        for item in aimami.get("candidates", []):
+            if isinstance(item, dict):
+                item["account_id"] = mask_id_value(item.get("account_id"))
+                item["email"] = mask_email_value(item.get("email"))
+                item["snapshot_path"] = redact_path_value(item.get("snapshot_path"))
+                if item.get("account_key"):
+                    account_id = account_id_from_aimami_key(str(item.get("account_key") or ""))
+                    item["account_key"] = f"<redacted>::{mask_id_value(account_id)}" if account_id else "<redacted>"
+    aimami_follow = redacted.get("aimami_follow")
+    if isinstance(aimami_follow, dict):
+        aimami_follow["last_synced_account_id"] = mask_id_value(aimami_follow.get("last_synced_account_id"))
+        if aimami_follow.get("last_seen_active_account_key"):
+            active_id = account_id_from_aimami_key(str(aimami_follow.get("last_seen_active_account_key") or ""))
+            aimami_follow["last_seen_active_account_key"] = f"<redacted>::{mask_id_value(active_id)}" if active_id else "<redacted>"
+        last_result = aimami_follow.get("last_result")
+        if isinstance(last_result, dict):
+            last_result["selected_account_id"] = mask_id_value(last_result.get("selected_account_id"))
+            active_stream = last_result.get("active_stream")
+            if isinstance(active_stream, dict):
+                active_stream["account_id"] = mask_id_value(active_stream.get("account_id"))
+    if "selected_account_id" in redacted:
+        redacted["selected_account_id"] = mask_id_value(redacted.get("selected_account_id"))
+    for key in ("imported", "bridge_providers"):
+        value = redacted.get(key)
+        if isinstance(value, dict):
+            redacted[key] = redact_snapshot(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    item["account_id"] = mask_id_value(item.get("account_id"))
+                    item["email"] = mask_email_value(item.get("email"))
     services = redacted.get("services")
     if isinstance(services, dict):
         for service in services.values():
@@ -7690,6 +8669,31 @@ INDEX_HTML = """<!doctype html>
               </div>
               <div id="missingBridgeStatus" class="muted mt10">新账号检测中...</div>
               <div id="autoSwitchStatus" class="muted mt10">未运行</div>
+            </div>
+            <div class="card guideSection" id="aimamiSyncPanel" data-guide="aimamiSync">
+              <h2>AiMaMi 同步</h2>
+              <div class="sectionHint">只读取 AiMaMi 本机账号快照，导入到 BridgeDeck 自己的 OAuth 存储；不写 AiMaMi 文件。</div>
+              <div class="row">
+                <button class="miniBtn" data-action="preview-aimami-import">预览 AiMaMi 导入</button>
+                <button class="primary" data-action="import-aimami-accounts">导入账号</button>
+                <button class="miniBtn" data-action="import-aimami-and-bridges">导入并创建 Local Bridge</button>
+              </div>
+              <div id="aimamiSyncStatus" class="muted mt10">AiMaMi 账号检测中...</div>
+              <div class="toggleLine mt10">
+                <label><input type="checkbox" id="aimamiFollowEnabled"> Follow AiMaMi active account</label>
+              </div>
+              <div class="row">
+                <button class="miniBtn" data-action="save-aimami-follow">保存 Follow 设置</button>
+                <button class="miniBtn" data-action="run-aimami-follow">立即同步 AiMaMi 当前账号</button>
+              </div>
+              <div id="aimamiFollowStatus" class="muted mt10">Follow 未运行</div>
+              <div class="row mt10">
+                <button class="miniBtn" data-action="preview-aimami-export">预览 BridgeDeck 导出</button>
+                <button class="miniBtn" data-action="export-aimami-accounts">导出选中账号给 AiMaMi</button>
+                <button class="miniBtn warn" data-action="preview-aimami-inject">预览 Snapshot Injection</button>
+                <button class="miniBtn warn" data-action="inject-aimami-accounts">写入 AiMaMi Snapshots</button>
+              </div>
+              <div id="aimamiExportStatus" class="muted mt10">导出未运行</div>
             </div>
           </section>
 
@@ -8623,6 +9627,87 @@ INDEX_HTML = """<!doctype html>
       }
       box.innerHTML = `<span class="warnText">发现 ${missing.length} 个已授权但未桥接的新账号：</span> ${missing.map((item) => esc(maskEmail(item.email || item.label || maskId(item.account_id || '')))).join('，')}`;
     }
+    function renderAimamiSync(payload) {
+      const box = document.getElementById('aimamiSyncStatus');
+      if (!box) return;
+      const data = payload || {};
+      const summary = data.summary || {};
+      if (!data.detected) {
+        box.innerHTML = `<span class="muted">未检测到 AiMaMi registry。</span>`;
+        return;
+      }
+      const candidates = data.candidates || [];
+      const lines = candidates.slice(0, 8).map((item) => {
+        const label = maskEmail(item.email || '') || maskId(item.account_id || '');
+        const status = item.status || 'skipped';
+        const cls = status === 'skipped' ? 'warnText' : (status === 'unchanged' ? 'muted' : 'ok');
+        const reason = item.reason ? ` / ${item.reason}` : '';
+        return `<div><span class="${cls}">${esc(status)}</span> ${esc(label)}${esc(reason)}</div>`;
+      }).join('');
+      const more = candidates.length > 8 ? `<div class="muted">另有 ${candidates.length - 8} 个未显示。</div>` : '';
+      box.innerHTML = `
+        <div>可导入 ${esc(summary.importable || 0)} 个：new ${esc(summary.new || 0)}，updated ${esc(summary.updated || 0)}，unchanged ${esc(summary.unchanged || 0)}，skipped ${esc(summary.skipped || 0)}。</div>
+        ${lines || '<div class="muted">没有账号快照。</div>'}
+        ${more}
+      `;
+    }
+    function renderAimamiFollow(payload) {
+      const data = payload || {};
+      const enabled = Boolean(data.enabled);
+      const checkbox = document.getElementById('aimamiFollowEnabled');
+      if (checkbox) checkbox.checked = enabled;
+      const box = document.getElementById('aimamiFollowStatus');
+      if (!box) return;
+      const result = data.last_result || {};
+      const reason = result.reason || (enabled ? '等待同步' : 'follow_disabled');
+      const action = result.action || 'noop';
+      const account = result.selected_account_id ? accountDisplay(result.selected_account_id) : '-';
+      const cls = action === 'switched' || action === 'unchanged' ? 'ok' : (action === 'deferred' ? 'warnText' : 'muted');
+      box.innerHTML = `<span class="${cls}">${esc(enabled ? 'on' : 'off')}</span> · ${esc(action)} / ${esc(reason)} · ${esc(account)}`;
+    }
+    function renderAimamiExport(payload) {
+      const box = document.getElementById('aimamiExportStatus');
+      if (!box) return;
+      const data = payload || {};
+      if (data.verification) {
+        const verification = data.verification || {};
+        const missing = data.missing_in_aimami || [];
+        const gate = verification.verified ? '<span class="ok">verified</span>' : '<span class="bad">verification required</span>';
+        const running = data.aimami_running ? '<span class="warnText">AiMaMi running: reload after injection</span>' : '<span class="muted">AiMaMi not detected running</span>';
+        const profile = data.schema_profile || {};
+        const compatible = profile.compatible_with_injection ? '<span class="ok">native schema matched</span>' : '<span class="warnText">schema not verified</span>';
+        const reason = data.reason ? `<div class="warnText">${esc(data.reason)}</div>` : '';
+        const rows = missing.map((item) => {
+          const label = maskEmail(item.email || '') || maskId(item.account_id || '');
+          return `<label class="toggleLine"><input type="checkbox" class="aimamiExportAccount" value="${esc(item.account_id || '')}" checked> ${esc(label)}</label>`;
+        }).join('');
+        box.innerHTML = `<div>Snapshot injection: ${gate} · ${compatible} · ${running}</div><div class="muted">推荐优先导出 .aimami-accounts.json 后在 AiMaMi 导入；直接写 snapshots 只在验证门禁通过后启用。</div>${reason}${rows || '<div class="muted">没有可注入的缺失账号。</div>'}`;
+        return;
+      }
+      if (data.path) {
+        const errors = data.errors || [];
+        const errorRows = errors.map((item) => `<div class="warnText">${esc(maskEmail(item.email || '') || maskId(item.account_id || ''))}: ${esc(item.error || item.error_type || 'export failed')}</div>`).join('');
+        box.innerHTML = `<span class="${errors.length ? 'warnText' : 'ok'}">已导出 ${esc(data.count || 0)} 个账号</span> · ${esc(humanPath(data.path))}<div class="muted">这是 AiMaMi 原生导入文件；BridgeDeck 未写入 AiMaMi registry/snapshots。</div>${errorRows}`;
+        return;
+      }
+      if (data.reason === 'export_failed' || (data.errors || []).length) {
+        const errors = data.errors || [];
+        const errorRows = errors.map((item) => `<div class="warnText">${esc(maskEmail(item.email || '') || maskId(item.account_id || ''))}: ${esc(item.error || item.error_type || 'export failed')}</div>`).join('');
+        box.innerHTML = `<span class="bad">导出失败</span>${errorRows || `<div class="warnText">${esc(data.message || data.reason || 'export failed')}</div>`}`;
+        return;
+      }
+      const missing = data.missing_in_aimami || [];
+      const conflicts = data.conflicts || [];
+      const rows = missing.map((item) => {
+        const label = maskEmail(item.email || '') || maskId(item.account_id || '');
+        return `<label class="toggleLine"><input type="checkbox" class="aimamiExportAccount" value="${esc(item.account_id || '')}" checked> ${esc(label)}</label>`;
+      }).join('');
+      box.innerHTML = `
+        <div>BridgeDeck 有 ${esc(missing.length)} 个账号未在 AiMaMi registry 中；冲突 ${esc(conflicts.length)} 个。</div>
+        <div class="muted">推荐导出 .aimami-accounts.json 后在 AiMaMi 导入，避免直接改 AiMaMi 私有状态。</div>
+        ${rows || '<div class="muted">没有可导出的缺失账号。</div>'}
+      `;
+    }
     async function refreshQuotas() {
       try {
         const payload = await api('/api/quotas');
@@ -8675,6 +9760,88 @@ INDEX_HTML = """<!doctype html>
       log(`新账号桥接创建: created=${created.length}, skipped=${skipped.length}`);
       await refreshData();
       return res;
+    }
+    async function previewAimamiImport() {
+      const res = await api('/api/aimami-sync/status');
+      renderAimamiSync(res);
+      const summary = res.summary || {};
+      log(`AiMaMi 导入预览: importable=${summary.importable || 0}, skipped=${summary.skipped || 0}`);
+      return res;
+    }
+    async function importAimamiAccounts(createMissing=false) {
+      const res = await api('/api/aimami-sync/import', 'POST', { create_missing: createMissing });
+      renderAimamiSync({ detected: true, candidates: [...(res.imported || []), ...(res.skipped || [])], summary: res.summary || {} });
+      const created = res.bridge_providers ? (res.bridge_providers.created || []).length : 0;
+      log(`AiMaMi 导入完成: imported=${(res.imported || []).length}, skipped=${(res.skipped || []).length}, bridges=${created}`);
+      await refreshData();
+      return res;
+    }
+    async function saveAimamiFollow() {
+      const enabled = Boolean(document.getElementById('aimamiFollowEnabled')?.checked);
+      const res = await api('/api/aimami-follow-config', 'POST', { enabled });
+      renderAimamiFollow(res.aimami_follow || {});
+      log(`AiMaMi follow: ${enabled ? 'enabled' : 'disabled'}`);
+      if (enabled) await runAimamiFollow(true, true);
+      return res;
+    }
+    async function runAimamiFollow(force=true, refresh=true) {
+      const res = await api('/api/aimami-follow-run', 'POST', { force });
+      renderAimamiFollow({ enabled: res.enabled, last_result: res });
+      log(`AiMaMi follow: ${res.action || 'noop'} / ${res.reason || '-'} / ${res.selected_account_id ? maskId(res.selected_account_id) : '-'}`);
+      if (refresh) await refreshData();
+      return res;
+    }
+    async function previewAimamiExport() {
+      const res = await api('/api/aimami-sync/export-preview');
+      renderAimamiExport(res);
+      log(`AiMaMi export preview: missing=${(res.missing_in_aimami || []).length}, conflicts=${(res.conflicts || []).length}`);
+      return res;
+    }
+    async function exportAimamiAccounts() {
+      let accountIds = Array.from(document.querySelectorAll('.aimamiExportAccount:checked')).map((item) => item.value).filter(Boolean);
+      if (!accountIds.length) {
+        const preview = await previewAimamiExport();
+        accountIds = (preview.missing_in_aimami || []).map((item) => item.account_id).filter(Boolean);
+      }
+      if (!accountIds.length) return log('没有可导出的 BridgeDeck 账号。');
+      const res = await api('/api/aimami-sync/export', 'POST', { account_ids: accountIds });
+      renderAimamiExport(res);
+      log(res.ok === false ? `AiMaMi export failed: ${(res.errors || []).length} errors` : `AiMaMi export written: count=${res.count || 0}, path=${humanPath(res.path || '')}`);
+      return res;
+    }
+    async function previewAimamiInject() {
+      const res = await api('/api/aimami-sync/inject-preview');
+      renderAimamiExport(res);
+      log(`AiMaMi inject preview: can_apply=${Boolean(res.can_apply)}, missing=${(res.missing_in_aimami || []).length}`);
+      return res;
+    }
+    async function injectAimamiAccounts() {
+      let accountIds = Array.from(document.querySelectorAll('.aimamiExportAccount:checked')).map((item) => item.value).filter(Boolean);
+      if (!accountIds.length) {
+        const preview = await previewAimamiInject();
+        accountIds = (preview.missing_in_aimami || []).map((item) => item.account_id).filter(Boolean);
+      }
+      if (!accountIds.length) return log('没有可注入的 BridgeDeck 账号。');
+      try {
+        const res = await api('/api/aimami-sync/inject', 'POST', { mode: 'codex_snapshot', account_ids: accountIds, set_active: false, overwrite: false });
+        renderAimamiExport({ verification: { verified: Boolean(res.ok) }, missing_in_aimami: [], aimami_running: res.aimami_running });
+        log(`AiMaMi inject: ok=${Boolean(res.ok)}, reason=${res.reason || '-'}, written=${(res.written || []).length}`);
+        return res;
+      } catch (e) {
+        const payload = e.payload || {};
+        if (e.status === 409 && payload) {
+          renderAimamiExport({
+            verification: payload.verification || { verified: false },
+            reason: payload.reason || payload.error || e.message,
+            missing_in_aimami: payload.missing_in_aimami || [],
+            conflicts: payload.conflicts || [],
+            aimami_running: payload.aimami_running
+          });
+          log(`AiMaMi inject blocked: ${payload.reason || e.message}`);
+          return payload;
+        }
+        throw e;
+      }
     }
     function renderServices(payload) {
       const box = document.getElementById('serviceStatus');
@@ -9894,6 +11061,8 @@ INDEX_HTML = """<!doctype html>
       renderAttributionHeader(data);
       renderSimpleActuals(data);
       renderAutoSwitchConfig(data);
+      renderAimamiSync(data.aimami_sync || {});
+      renderAimamiFollow(data.aimami_follow || {});
       refreshServices().catch((e) => {
         const box = document.getElementById('serviceStatus');
         if (box) box.textContent = `服务状态失败: ${e.message}`;
@@ -9903,6 +11072,9 @@ INDEX_HTML = """<!doctype html>
         if (box) box.textContent = `Codex Desktop Doctor 失败: ${e.message}`;
       });
       refreshQuotas();
+      if (data.aimami_follow && data.aimami_follow.enabled) {
+        runAimamiFollow(false, false).catch((e) => log(`AiMaMi follow 失败: ${e.message}`));
+      }
       if (data.auto_switch && data.auto_switch.enabled) {
         runAutoSwitch(false, false).catch((e) => log(`自动切换失败: ${e.message}`));
       }
@@ -10152,6 +11324,15 @@ INDEX_HTML = """<!doctype html>
           if (action === 'save-auto-switch') return saveAutoSwitch();
           if (action === 'run-auto-switch') return runAutoSwitch(true, true);
           if (action === 'create-missing-bridges') return createMissingBridges();
+          if (action === 'preview-aimami-import') return previewAimamiImport();
+          if (action === 'import-aimami-accounts') return importAimamiAccounts(false);
+          if (action === 'import-aimami-and-bridges') return importAimamiAccounts(true);
+          if (action === 'save-aimami-follow') return saveAimamiFollow();
+          if (action === 'run-aimami-follow') return runAimamiFollow(true, true);
+          if (action === 'preview-aimami-export') return previewAimamiExport();
+          if (action === 'export-aimami-accounts') return exportAimamiAccounts();
+          if (action === 'preview-aimami-inject') return previewAimamiInject();
+          if (action === 'inject-aimami-accounts') return injectAimamiAccounts();
           if (action === 'preview-bridge-dedupe') return dedupeBridgeProviders(false);
           if (action === 'apply-bridge-dedupe') return dedupeBridgeProviders(true);
           if (action === 'preview-ccswitch-315-desktop-routes') return repairCcswitch315DesktopRoutes(false);
@@ -10427,6 +11608,51 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
+            if parsed.path == "/api/aimami-sync/status":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    payload = manager.aimami_import_preview()
+                    if not allow_sensitive:
+                        payload = redact_snapshot({"aimami_sync": payload})["aimami_sync"]
+                    json_response(self, 200, payload)
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
+            if parsed.path == "/api/aimami-sync/export-preview":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    payload = manager.aimami_export_preview()
+                    if not allow_sensitive:
+                        payload = redact_snapshot(payload)
+                    json_response(self, 200, payload)
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
+            if parsed.path == "/api/aimami-sync/inject-preview":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    payload = manager.aimami_inject_preview()
+                    if not allow_sensitive:
+                        payload = redact_snapshot(payload)
+                    json_response(self, 200, payload)
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
             json_response(self, 404, {"ok": False, "error": "Not Found"})
 
         def do_POST(self) -> None:
@@ -10574,9 +11800,36 @@ def build_handler(
                     result = manager.run_auto_switch(force=bool(payload.get("force", False)))
                     json_response(self, 200, result)
                     return
+                if self.path == "/api/aimami-follow-config":
+                    result = manager.update_aimami_follow_config(payload)
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/aimami-follow-run":
+                    result = manager.run_aimami_follow(force=bool(payload.get("force", False)))
+                    json_response(self, 200, result)
+                    return
                 if self.path == "/api/create-missing-bridges":
                     result = manager.create_missing_bridge_providers()
                     json_response(self, 200, result)
+                    return
+                if self.path == "/api/aimami-sync/import":
+                    result = manager.import_aimami_accounts(create_missing=bool(payload.get("create_missing", False)))
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/aimami-sync/export":
+                    account_ids = payload.get("account_ids") if isinstance(payload.get("account_ids"), list) else []
+                    result = manager.export_aimami_accounts([str(item) for item in account_ids])
+                    json_response(self, 200 if result.get("ok", True) else 409, result)
+                    return
+                if self.path == "/api/aimami-sync/inject":
+                    account_ids = payload.get("account_ids") if isinstance(payload.get("account_ids"), list) else []
+                    result = manager.inject_aimami_accounts(
+                        account_ids=[str(item) for item in account_ids],
+                        mode=str(payload.get("mode") or "codex_snapshot"),
+                        set_active=bool(payload.get("set_active", False)),
+                        overwrite=bool(payload.get("overwrite", False)),
+                    )
+                    json_response(self, 200 if result.get("ok", True) else 409, result)
                     return
                 if self.path == "/api/codex-oauth/start":
                     result = manager.start_codex_oauth(set_default=bool(payload.get("set_default", False)))
