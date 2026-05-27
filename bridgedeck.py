@@ -2851,7 +2851,7 @@ class BridgeManager:
                         "<!doctype html><meta charset='utf-8'>"
                         f"<title>{safe_title}</title>"
                         "<body style='font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
-                        "background:#0c0f14;color:#edf2fb;padding:var(--size-px-7)'>"
+                        "background:#f5f5f7;color:#1d1d1f;padding:48px'>"
                         f"<h1>{safe_title}</h1><p>{safe_detail}</p><p>可以关闭这个窗口。</p></body>"
                     ).encode("utf-8")
                     self.send_response(status)
@@ -8262,65 +8262,38 @@ INDEX_HTML = """<!doctype html>
   <title>BridgeDeck</title>
   <style nonce="__CSP_NONCE__">
     :root {
-      /* Open Props inspired design tokens - BridgeDeck dark theme */
-      /* Grays - cool blue-tinted dark palette */
-      --gray-0: #f8f9fa;
-      --gray-1: #f1f3f5;
-      --gray-2: #e9ecef;
-      --gray-3: #dee2e6;
-      --gray-4: #ced4da;
-      --gray-5: #adb5bd;
-      --gray-6: #868e96;
-      --gray-7: #495057;
-      --gray-8: #343a40;
-      --gray-9: #212529;
-      --gray-10: #16191d;
-      --gray-11: #0d0f12;
-      --gray-12: #030507;
-
-      /* Brand colors - BridgeDeck signature blue */
-      --blue-0: #e7f5ff;
-      --blue-1: #d0ebff;
-      --blue-2: #a5d8ff;
-      --blue-3: #74c0fc;
-      --blue-4: #4dabf7;
-      --blue-5: #339af0;
-      --blue-6: #228be6;
-      --blue-7: #1c7ed6;
-      --blue-8: #1971c2;
-      --blue-9: #1864ab;
-      --blue-10: #145591;
-      --blue-11: #114678;
-      --blue-12: #0d375e;
-
-      /* Status colors */
-      --green-5: #51cf66;
-      --green-6: #40c057;
-      --green-7: #37b24d;
-      --yellow-5: #fcc419;
-      --yellow-6: #fab005;
-      --yellow-7: #f59f00;
-      --red-5: #ff6b6b;
-      --red-6: #fa5252;
-      --red-7: #f03e3e;
+      /* Apple Design System - BridgeDeck */
+      --apple-blue: #0066cc;
+      --apple-blue-focus: #0071e3;
+      --apple-blue-dark: #2997ff;
+      --apple-ink: #1d1d1f;
+      --apple-ink-80: #333333;
+      --apple-ink-48: #7a7a7a;
+      --apple-divider: #f0f0f0;
+      --apple-hairline: #e0e0e0;
+      --apple-canvas: #ffffff;
+      --apple-parchment: #f5f5f7;
+      --apple-pearl: #fafafc;
+      --apple-chip: rgba(210, 210, 215, 0.64);
+      --apple-on-blue: #ffffff;
 
       /* Semantic tokens */
-      --bg: var(--gray-12);
-      --surface: #111722;
-      --panel: #151c29;
-      --panel2: #101621;
-      --line: #263244;
-      --text: var(--gray-0);
-      --muted: var(--gray-5);
-      --soft: var(--gray-3);
-      --ok: var(--green-6);
-      --warn: var(--yellow-6);
-      --bad: var(--red-6);
-      --brand: var(--blue-5);
-      --brand2: var(--blue-3);
-      --focus: var(--blue-9);
+      --bg: var(--apple-parchment);
+      --surface: var(--apple-canvas);
+      --panel: var(--apple-canvas);
+      --panel2: var(--apple-pearl);
+      --line: var(--apple-hairline);
+      --text: var(--apple-ink);
+      --muted: var(--apple-ink-48);
+      --soft: var(--apple-ink-80);
+      --ok: #34c759;
+      --warn: #ff9500;
+      --bad: #ff3b30;
+      --brand: var(--apple-blue);
+      --brand2: var(--apple-blue-focus);
+      --focus: var(--apple-blue-focus);
 
-      /* Open Props - Sizes */
+      /* Apple spacing (8px base) */
       --size-1: .25rem;
       --size-2: .5rem;
       --size-3: 1rem;
@@ -8345,36 +8318,60 @@ INDEX_HTML = """<!doctype html>
       --size-px-14: 320px;
       --size-px-15: 480px;
 
-      /* Open Props - Borders */
+      /* Apple border radius */
       --border-size-1: 1px;
       --border-size-2: 2px;
-      --radius-1: 2px;
-      --radius-2: 5px;
-      --radius-3: 1rem;
-      --radius-round: 1e5px;
+      --radius-1: 5px;
+      --radius-2: 8px;
+      --radius-3: 18px;
+      --radius-round: 9999px;
 
-      /* Open Props - Shadows (dark theme) */
-      --shadow-color: 220 3% 15%;
-      --shadow-strength: 1%;
-      --shadow-1: 0 1px 2px -1px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 9%));
-      --shadow-2: 0 3px 5px -2px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 4%)), 0 7px 14px -5px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 6%));
-      --shadow-3: 0 -1px 3px 0 hsl(var(--shadow-color) / calc(var(--shadow-strength) + 3%)), 0 1px 2px -5px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 3%)), 0 2px 5px -5px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 5%)), 0 4px 12px -5px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 6%));
-      --shadow-4: 0 -2px 5px 0 hsl(var(--shadow-color) / calc(var(--shadow-strength) + 3%)), 0 2px 4px -2px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 4%)), 0 5px 10px -4px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 6%));
-      --shadow-5: 0 -4px 8px 0 hsl(var(--shadow-color) / calc(var(--shadow-strength) + 3%)), 0 4px 8px -2px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 5%)), 0 12px 24px -4px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 7%));
-      --shadow-6: 0 -8px 16px 0 hsl(var(--shadow-color) / calc(var(--shadow-strength) + 3%)), 0 8px 16px -4px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 5%)), 0 24px 48px -8px hsl(var(--shadow-color) / calc(var(--shadow-strength) + 8%));
+      /* Shadows - minimal Apple style */
+      --shadow-color: 0 0% 0%;
+      --shadow-strength: 0%;
+      --shadow-1: 0 1px 2px rgba(0,0,0,0.04);
+      --shadow-2: 0 2px 8px rgba(0,0,0,0.06);
+      --shadow-3: 0 3px 5px rgba(0,0,0,0.22), 0 5px 30px rgba(0,0,0,0.12);
+      --shadow-4: 0 4px 12px rgba(0,0,0,0.08);
+      --shadow-5: 0 8px 24px rgba(0,0,0,0.10);
+      --shadow-6: 0 16px 48px rgba(0,0,0,0.12);
 
-      /* Open Props - Animations */
-      --animation-fade-in: fade-in .3s var(--ease-out-3);
-      --animation-fade-out: fade-out .3s var(--ease-out-3);
-      --animation-scale-up: scale-up .3s var(--ease-out-3);
-      --animation-slide-in-down: slide-in-down .3s var(--ease-out-3);
+      /* Animations */
+      --animation-fade-in: fade-in .3s ease-out;
+      --animation-fade-out: fade-out .3s ease-out;
+      --animation-scale-up: scale-up .2s ease-out;
+      --animation-slide-in-down: slide-in-down .3s ease-out;
       --animation-spin: spin 1s linear infinite;
-      --animation-pulse: pulse 2s var(--ease-out-3) infinite;
+      --animation-pulse: pulse 2s ease-out infinite;
       --ease-out-3: cubic-bezier(.14,.46,.36,1);
       --ease-squish-2: cubic-bezier(.57,-.25,.53,1.25);
 
       /* Focus ring */
-      --focus-ring: 0 0 0 2px var(--brand);
+      --focus-ring: 0 0 0 4px rgba(0, 102, 204, 0.3);
+
+      /* Status colors */
+      --green-5: #34c759;
+      --green-6: #30d158;
+      --green-7: #28a745;
+      --yellow-5: #ff9500;
+      --yellow-6: #ff9f0a;
+      --yellow-7: #e68a00;
+      --red-5: #ff3b30;
+      --red-6: #ff453a;
+      --red-7: #d70015;
+      --blue-0: #f0f7ff;
+      --blue-1: #dceefa;
+      --blue-2: #b4d5f3;
+      --blue-3: #7ab8ed;
+      --blue-4: #4da3e8;
+      --blue-5: #0066cc;
+      --blue-6: #0071e3;
+      --blue-7: #005cbf;
+      --blue-8: #004ea2;
+      --blue-9: #003f85;
+      --blue-10: #003168;
+      --blue-11: #00234b;
+      --blue-12: #00152e;
     }
 
     @keyframes fade-in { to { opacity: 1 } }
@@ -8384,91 +8381,93 @@ INDEX_HTML = """<!doctype html>
     @keyframes spin { to { transform: rotate(360deg) } }
     @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .5 } }
     * { box-sizing:border-box; }
-    body { margin:0; font-family:ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+    body { margin:0; font-family:"SF Pro Text", "SF Pro Display", system-ui, -apple-system, BlinkMacSystemFont, sans-serif; font-size:17px; line-height:1.47; letter-spacing:-0.022em; background:var(--bg); color:var(--text); -webkit-font-smoothing:antialiased; }
     .wrap { min-height:100vh; }
-    .appShell { display:grid; grid-template-columns:260px minmax(0, 1fr); min-height:100vh; }
-    .appSidebar { position:sticky; top:0; height:100vh; padding:18px 14px; border-right:1px solid var(--line); background:#0a0d12; display:flex; flex-direction:column; gap:14px; }
-    .brand { display:grid; gap:4px; padding:4px 6px 12px; border-bottom:1px solid var(--line); }
-    .brandName { font-size:19px; font-weight:850; }
-    .brandSub { color:var(--muted); font-size:12px; }
-    .sideNav { display:grid; gap:6px; }
-    .navItem { width:100%; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:var(--size-px-2) 12px; border:1px solid transparent; border-radius:var(--radius-2); background:transparent; color:var(--soft); text-align:left; font-weight:700; }
-    .navItem:hover, .navItem.active { background:var(--focus); border-color:#315077; color:var(--text); }
-    .navHint { color:var(--muted); font-size:11px; font-weight:600; }
-    .sidePanel { margin-top:auto; border:1px solid var(--line); border-radius:var(--radius-2); padding:var(--size-px-2); background:var(--panel2); }
-    .workspace { width:100%; min-width:0; box-sizing:border-box; padding:20px; display:grid; grid-template-columns:minmax(0, 1fr) 300px; gap:16px; align-items:start; align-content:start; }
-    .topBar { grid-column:1 / -1; grid-row:1; justify-self:stretch; width:100%; display:flex; justify-content:space-between; gap:16px; align-items:flex-start; padding:var(--size-px-3); border:1px solid var(--line); border-radius:var(--radius-2); background:var(--surface); }
-    .topBar h1 { margin:0; font-size:24px; }
-    .topBar p { margin:6px 0 0; color:var(--muted); font-size:13px; }
+    .appShell { display:grid; grid-template-columns:240px minmax(0, 1fr); min-height:100vh; }
+    .appSidebar { position:sticky; top:0; height:100vh; padding:20px 16px; border-right:1px solid var(--apple-divider); background:var(--apple-canvas); color:var(--apple-ink); display:flex; flex-direction:column; gap:12px; }
+    .brand { display:grid; gap:2px; padding:4px 10px 16px; border-bottom:1px solid var(--apple-divider); }
+    .brandName { font-family:"SF Pro Display", system-ui, -apple-system, sans-serif; font-size:21px; font-weight:600; letter-spacing:0.011em; color:var(--apple-ink); }
+    .brandSub { color:var(--muted); font-size:12px; font-weight:400; letter-spacing:-0.012em; }
+    .sideNav { display:grid; gap:2px; }
+    .navItem { width:100%; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:7px 12px; border:1px solid transparent; border-radius:var(--radius-2); background:transparent; color:var(--muted); text-align:left; font-size:12px; font-weight:400; letter-spacing:-0.012em; transition:background .15s, color .15s; }
+    .navItem:hover { background:var(--apple-parchment); color:var(--apple-ink); }
+    .navItem.active { background:var(--apple-parchment); color:var(--apple-ink); font-weight:600; }
+    .navHint { color:var(--apple-ink-48); font-size:11px; font-weight:400; }
+    .sidePanel { margin-top:auto; border:1px solid var(--apple-divider); border-radius:var(--radius-2); padding:10px; background:var(--apple-pearl); }
+    .workspace { width:100%; min-width:0; box-sizing:border-box; padding:24px; display:grid; grid-template-columns:minmax(0, 1fr) 280px; gap:20px; align-items:start; align-content:start; background:var(--apple-parchment); }
+    .topBar { grid-column:1 / -1; grid-row:1; justify-self:stretch; width:100%; display:flex; justify-content:space-between; gap:16px; align-items:flex-start; padding:20px 24px; border:1px solid var(--apple-divider); border-radius:var(--radius-3); background:var(--apple-canvas); }
+    .topBar h1 { margin:0; font-family:"SF Pro Display", system-ui, -apple-system, sans-serif; font-size:28px; font-weight:600; letter-spacing:-0.015em; color:var(--apple-ink); }
+    .topBar p { margin:6px 0 0; color:var(--muted); font-size:14px; }
     .topActions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
     .pageStack { grid-column:1; grid-row:2; justify-self:stretch; width:100%; min-width:0; }
     .deckPage { display:none; }
     .deckPage.active { display:block; }
-    .guideDock { grid-column:2; grid-row:2; justify-self:stretch; width:100%; position:sticky; top:20px; }
+    .guideDock { grid-column:2; grid-row:2; justify-self:stretch; width:100%; position:sticky; top:24px; }
     body.usageMode .workspace { grid-template-columns:minmax(0, 1fr); }
     body.usageMode .guideDock { display:none; }
-    .card, .panel { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius-2); padding:var(--size-px-3); margin-bottom:14px; }
-    .panel.subtle { background:var(--panel2); }
-    .pageHeader { display:flex; justify-content:space-between; gap:14px; align-items:flex-start; margin-bottom:14px; }
-    .pageTitle { margin:0; font-size:21px; font-weight:850; }
-    .pageDesc { margin:5px 0 0; color:var(--muted); font-size:13px; line-height:1.5; }
+    .card, .panel { background:var(--apple-canvas); border:1px solid var(--apple-hairline); border-radius:var(--radius-3); padding:20px; margin-bottom:16px; }
+    .panel.subtle { background:var(--apple-pearl); }
+    .pageHeader { display:flex; justify-content:space-between; gap:14px; align-items:flex-start; margin-bottom:16px; }
+    .pageTitle { margin:0; font-family:"SF Pro Display", system-ui, -apple-system, sans-serif; font-size:21px; font-weight:600; letter-spacing:0.011em; color:var(--apple-ink); }
+    .pageDesc { margin:4px 0 0; color:var(--muted); font-size:14px; line-height:1.43; }
     h1, h2 { margin:0 0 10px; }
-    h2 { font-size:16px; }
-    .sectionHint { color:var(--muted); font-size:12px; margin:-2px 0 12px; line-height:1.5; }
+    h2 { font-size:17px; font-weight:600; }
+    .sectionHint { color:var(--muted); font-size:12px; margin:-2px 0 12px; line-height:1.43; }
     .muted { color:var(--muted); font-size:12px; }
     .row, .toggleLine, .apiEnvActions { display:flex; gap:9px; flex-wrap:wrap; align-items:center; margin-top:10px; }
-    input, select, button, textarea { border-radius:var(--radius-2); border:1px solid var(--line); background:#0d1320; color:var(--text); padding:8px 10px; font:inherit; }
+    input, select, button, textarea { border-radius:var(--radius-2); border:1px solid var(--apple-hairline); background:var(--apple-canvas); color:var(--text); padding:8px 12px; font:inherit; font-size:14px; }
     input, select { min-width:220px; }
     input[type="checkbox"], input[type="radio"] { min-width:0; }
-    button { cursor:pointer; background:#1a2332; }
-    button:hover { border-color:#3f5676; background:#1e2a3d; }
+    button { cursor:pointer; background:var(--apple-pearl); border-color:var(--apple-hairline); transition:background .15s, border-color .15s, transform .1s; }
+    button:hover { background:var(--apple-parchment); border-color:#c7c7cc; }
+    button:active { transform:scale(0.97); }
     button:focus-visible { outline:none; box-shadow:var(--focus-ring); }
-    button:disabled { opacity:.55; cursor:default; }
-    button.primary { background:var(--brand); border-color:var(--blue-7); color:var(--gray-12); font-weight:800; }
-    button.primary:hover { background:var(--blue-4); }
-    button.warn { background:#36260e; border-color:#745018; color:#ffd98f; }
-    button.warn:hover { background:#4a3412; }
-    .miniBtn { padding:6px 9px; font-size:12px; }
+    button:disabled { opacity:.4; cursor:default; }
+    button.primary { background:var(--apple-blue); border-color:var(--apple-blue); color:var(--apple-on-blue); font-weight:600; border-radius:var(--radius-round); padding:8px 22px; }
+    button.primary:hover { background:#0071e3; border-color:#0071e3; }
+    button.warn { background:var(--apple-canvas); border-color:var(--bad); color:var(--bad); border-radius:var(--radius-round); }
+    button.warn:hover { background:#fff5f5; }
+    .miniBtn { padding:5px 12px; font-size:12px; border-radius:var(--radius-round); }
     .mt10 { margin-top:10px; }
-    .ok { color:var(--ok); }
-    .bad { color:var(--bad); }
-    .warnText { color:var(--warn); }
-    .cmd, .mono, .paths, .apiEnvValue { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:anywhere; word-break:break-word; }
+    .ok { color:var(--ok); font-weight:600; }
+    .bad { color:var(--bad); font-weight:600; }
+    .warnText { color:var(--warn); font-weight:600; }
+    .cmd, .mono, .paths, .apiEnvValue { font-family:ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace; overflow-wrap:anywhere; word-break:break-word; }
     .paths { color:var(--muted); font-size:11px; line-height:1.45; white-space:pre-wrap; }
-    .mono, .cmd { color:#b7d8ff; }
-    .topGrid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:10px; }
-    .tile { border:1px solid var(--line); border-radius:var(--radius-2); padding:var(--size-px-2); background:var(--panel2); min-height:76px; }
-    .tileLabel { color:var(--muted); font-size:12px; margin-bottom:6px; }
-    .tileValue { font-size:24px; font-weight:850; }
+    .mono, .cmd { color:var(--apple-blue); }
+    .topGrid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; }
+    .tile { border:1px solid var(--apple-hairline); border-radius:var(--radius-3); padding:16px; background:var(--apple-canvas); min-height:76px; }
+    .tileLabel { color:var(--muted); font-size:12px; margin-bottom:6px; font-weight:600; text-transform:uppercase; letter-spacing:0.02em; }
+    .tileValue { font-size:28px; font-weight:600; letter-spacing:-0.015em; color:var(--apple-ink); }
     .metricGrid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; margin-top:12px; }
-    .metricCard { border:1px solid var(--line); border-radius:var(--radius-2); padding:var(--size-px-3); min-height:148px; background:linear-gradient(180deg, #171a21 0%, #121722 100%); display:grid; align-content:space-between; gap:12px; }
-    .metricHead { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--muted); font-size:15px; font-weight:850; }
-    .metricIcon { width:34px; height:34px; border-radius:var(--radius-3); display:grid; place-items:center; font-size:18px; background:#18263a; color:var(--brand2); }
-    .metricIcon.ok { background:#132b21; color:#53e5a0; }
-    .metricIcon.warn { background:#352711; color:#ffd070; }
-    .metricIcon.bad { background:#351717; color:#ff8e8e; }
-    .metricValue { font-size:32px; line-height:1; font-weight:900; letter-spacing:0; }
-    .metricSub { border-top:1px solid var(--line); padding-top:10px; display:grid; gap:5px; color:var(--muted); font-size:12px; }
+    .metricCard { border:1px solid var(--apple-hairline); border-radius:var(--radius-3); padding:20px; min-height:148px; background:var(--apple-canvas); display:grid; align-content:space-between; gap:12px; }
+    .metricHead { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--muted); font-size:14px; font-weight:600; }
+    .metricIcon { width:34px; height:34px; border-radius:var(--radius-2); display:grid; place-items:center; font-size:16px; background:var(--apple-parchment); color:var(--apple-blue); }
+    .metricIcon.ok { background:#e8f8ed; color:var(--ok); }
+    .metricIcon.warn { background:#fff8eb; color:var(--warn); }
+    .metricIcon.bad { background:#ffeceb; color:var(--bad); }
+    .metricValue { font-size:32px; line-height:1; font-weight:600; letter-spacing:-0.02em; color:var(--apple-ink); }
+    .metricSub { border-top:1px solid var(--apple-divider); padding-top:10px; display:grid; gap:5px; color:var(--muted); font-size:12px; }
     .metricLine { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
     .metricLine span { flex:0 0 auto; white-space:nowrap; }
-    .metricLine strong { flex:1 1 auto; min-width:0; text-align:right; overflow-wrap:anywhere; }
+    .metricLine strong { flex:1 1 auto; min-width:0; text-align:right; overflow-wrap:anywhere; color:var(--apple-ink); }
     .metricEllipsis { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; overflow-wrap:normal; }
-    .hudPanel { border:1px solid var(--line); border-radius:var(--radius-2); padding:var(--size-px-3); background:#101720; display:grid; grid-template-columns:340px minmax(0, 1fr); gap:16px; align-items:center; }
+    .hudPanel { border:1px solid var(--apple-hairline); border-radius:var(--radius-3); padding:24px; background:var(--apple-canvas); display:grid; grid-template-columns:340px minmax(0, 1fr); gap:16px; align-items:center; }
     .hudDial { position:relative; min-height:230px; display:grid; place-items:center; }
     .hudDial::before { content:""; width:220px; height:220px; border-radius:50%; background:
-      conic-gradient(from 225deg, var(--ok) 0 var(--hit-angle, 0deg), #2b3545 var(--hit-angle, 0deg) 270deg, transparent 270deg 360deg);
+      conic-gradient(from 225deg, var(--ok) 0 var(--hit-angle, 0deg), #e8e8ed var(--hit-angle, 0deg) 270deg, transparent 270deg 360deg);
       mask:radial-gradient(circle, transparent 0 63px, #000 64px 100px, transparent 101px);
       -webkit-mask:radial-gradient(circle, transparent 0 63px, #000 64px 100px, transparent 101px);
       transform:rotate(45deg);
     }
-    .hudDial::after { content:""; position:absolute; width:156px; height:156px; border-radius:50%; border:1px solid var(--line); background:#0d121b; }
+    .hudDial::after { content:""; position:absolute; width:156px; height:156px; border-radius:50%; border:1px solid var(--apple-hairline); background:var(--apple-canvas); }
     .hudCenter { position:absolute; z-index:1; text-align:center; display:grid; gap:6px; }
-    .hudValue { font-size:44px; line-height:1; font-weight:900; }
-    .hudLabel { color:var(--muted); font-size:12px; font-weight:850; }
+    .hudValue { font-size:44px; line-height:1; font-weight:600; color:var(--apple-ink); }
+    .hudLabel { color:var(--muted); font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.02em; }
     .hudGrid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
-    .hudStat { border:1px solid var(--line); border-radius:var(--radius-2); padding:var(--size-px-2); background:var(--panel2); min-height:82px; display:grid; align-content:space-between; gap:8px; }
-    .hudStatLabel { color:var(--muted); font-size:12px; font-weight:850; }
-    .hudStatValue { font-size:22px; font-weight:900; overflow-wrap:anywhere; }
+    .hudStat { border:1px solid var(--apple-hairline); border-radius:var(--radius-2); padding:12px; background:var(--apple-pearl); min-height:82px; display:grid; align-content:space-between; gap:8px; }
+    .hudStatLabel { color:var(--muted); font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.02em; }
+    .hudStatValue { font-size:22px; font-weight:600; overflow-wrap:anywhere; color:var(--apple-ink); }
     .usageControls { display:flex; gap:8px; flex-wrap:wrap; justify-content:space-between; align-items:center; margin:12px 0; }
     .usageTable table { min-width:0; }
     .usageTimeCol { width:9%; }
@@ -8477,86 +8476,86 @@ INDEX_HTML = """<!doctype html>
     .usageModelCol { width:17%; }
     .usageNumCol { width:6.2%; }
     .usageStatusCol { width:7%; }
-    .usageEntryMain, .usageModelMain { display:block; color:var(--text); font-weight:850; line-height:1.25; }
+    .usageEntryMain, .usageModelMain { display:block; color:var(--text); font-weight:600; line-height:1.25; }
     .usageMeta { display:block; color:var(--muted); font-size:11px; line-height:1.35; margin-top:3px; overflow-wrap:anywhere; }
-    .usageTag { display:inline-flex; align-items:center; width:max-content; max-width:100%; border:1px solid var(--line); border-radius:999px; padding:2px 6px; margin-top:5px; color:var(--soft); background:#111827; font-size:10px; font-weight:850; line-height:1; }
-    .usageTag.desktop { border-color:#2f5f8f; background:#102033; color:#b9dcff; }
-    .usageTag.chat { border-color:#255c43; background:#0f2018; color:#a6f3c6; }
+    .usageTag { display:inline-flex; align-items:center; width:max-content; max-width:100%; border:1px solid var(--apple-hairline); border-radius:var(--radius-round); padding:2px 8px; margin-top:5px; color:var(--soft); background:var(--apple-parchment); font-size:10px; font-weight:600; line-height:1; }
+    .usageTag.desktop { border-color:var(--apple-blue); background:var(--blue-0); color:var(--apple-blue); }
+    .usageTag.chat { border-color:var(--ok); background:#e8f8ed; color:#1b8a3e; }
     .overviewGrid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; margin-top:12px; }
-    .overviewCard { border:1px solid var(--line); border-radius:var(--radius-2); padding:13px; background:var(--panel2); min-height:122px; display:grid; gap:8px; align-content:start; }
-    .overviewLabel { color:var(--muted); font-size:12px; font-weight:850; }
-    .overviewMain { font-size:16px; font-weight:850; overflow-wrap:anywhere; }
+    .overviewCard { border:1px solid var(--apple-hairline); border-radius:var(--radius-3); padding:16px; background:var(--apple-canvas); min-height:122px; display:grid; gap:8px; align-content:start; }
+    .overviewLabel { color:var(--muted); font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.02em; }
+    .overviewMain { font-size:17px; font-weight:600; overflow-wrap:anywhere; color:var(--apple-ink); }
     .overviewMeta { color:var(--muted); font-size:12px; line-height:1.45; overflow-wrap:anywhere; }
     .taskList { display:grid; gap:8px; }
-    .taskItem { border:1px solid var(--line); border-radius:var(--radius-2); padding:9px 10px; background:#0d1320; color:var(--soft); font-size:12px; line-height:1.45; }
-    .taskItem.bad { border-color:#743333; background:#241313; color:#ffc0c0; }
-    .taskItem.warn { border-color:#73551c; background:#21190d; color:#ffe0a3; }
-    .taskItem.ok { border-color:#245f43; background:#102318; color:#a6f3c6; }
+    .taskItem { border:1px solid var(--apple-hairline); border-radius:var(--radius-2); padding:10px 12px; background:var(--apple-pearl); color:var(--soft); font-size:12px; line-height:1.45; }
+    .taskItem.bad { border-color:#ffc9c9; background:#fff5f5; color:var(--bad); }
+    .taskItem.warn { border-color:#ffe0a3; background:#fffbeb; color:#b35c00; }
+    .taskItem.ok { border-color:#b5e8cd; background:#f0faf4; color:#1b8a3e; }
     .quickActions { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
-    .quickActions button { min-height:38px; font-weight:800; }
+    .quickActions button { min-height:40px; font-weight:600; }
     .summaryGrid, .splitGrid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; }
-    .recommend { margin-top:10px; padding:var(--size-px-2); border:1px solid var(--line); border-radius:var(--radius-2); background:var(--panel2); line-height:1.55; }
-    .recommend.okState { border-color:#255c43; background:#0f2018; }
-    .recommend.warnState { border-color:#77571c; background:#21190d; }
-    .recommend.badState, .recommend.fail { border-color:#7a3030; background:#241313; }
+    .recommend { margin-top:10px; padding:12px; border:1px solid var(--apple-hairline); border-radius:var(--radius-2); background:var(--apple-pearl); line-height:1.55; font-size:14px; }
+    .recommend.okState { border-color:#b5e8cd; background:#f0faf4; }
+    .recommend.warnState { border-color:#ffe0a3; background:#fffbeb; }
+    .recommend.badState, .recommend.fail { border-color:#ffc9c9; background:#fff5f5; }
     .toolGrid, .apiMatrix, .apiExampleGrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }
-    .toolCard, .apiCard, .apiExample, .compactPanel, .serviceItem, .apiEnvLine { border:1px solid var(--line); border-radius:var(--radius-2); background:var(--panel2); padding:var(--size-px-2); }
+    .toolCard, .apiCard, .apiExample, .compactPanel, .serviceItem, .apiEnvLine { border:1px solid var(--apple-hairline); border-radius:var(--radius-3); background:var(--apple-canvas); padding:16px; }
     .toolCard { min-height:176px; display:flex; flex-direction:column; justify-content:space-between; gap:12px; }
-    .toolName, .apiCardTitle, .apiExampleTitle, .compactTitle, .serviceName { font-weight:850; }
-    .toolName { font-size:16px; margin-bottom:6px; }
-    .toolText, .apiCardMeta, .actualLine, .serviceMeta { color:var(--muted); font-size:12px; line-height:1.5; }
+    .toolName, .apiCardTitle, .apiExampleTitle, .compactTitle, .serviceName { font-weight:600; color:var(--apple-ink); }
+    .toolName { font-size:17px; margin-bottom:6px; }
+    .toolText, .apiCardMeta, .actualLine, .serviceMeta { color:var(--muted); font-size:12px; line-height:1.45; }
     .toolSelect { display:grid; gap:6px; margin-top:10px; }
-    .toolSelect label, .apiEnvLabel { color:var(--muted); font-size:11px; }
+    .toolSelect label, .apiEnvLabel { color:var(--muted); font-size:12px; font-weight:600; }
     .toolSelect select { width:100%; min-width:0; }
     .oauthPanel { display:grid; gap:10px; }
     .oauthActions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-    .oauthLinkBox { border:1px solid var(--line); border-radius:var(--radius-2); background:#0d1320; padding:var(--size-px-2); display:grid; gap:8px; }
-    .oauthLinkBox a { color:#9fd0ff; overflow-wrap:anywhere; }
-    #oauthUserCode { width:max-content; max-width:100%; border:1px solid #2f4160; border-radius:var(--radius-2); padding:8px 12px; font-size:22px; letter-spacing:0; color:#f6f8ff; background:#111b2e; }
+    .oauthLinkBox { border:1px solid var(--apple-hairline); border-radius:var(--radius-2); background:var(--apple-pearl); padding:12px; display:grid; gap:8px; }
+    .oauthLinkBox a { color:var(--apple-blue); overflow-wrap:anywhere; }
+    #oauthUserCode { width:max-content; max-width:100%; border:1px solid var(--apple-hairline); border-radius:var(--radius-2); padding:8px 16px; font-size:22px; letter-spacing:0; color:var(--apple-ink); background:var(--apple-parchment); font-family:"SF Mono", monospace; }
     #oauthExpiresAt { color:var(--muted); font-size:12px; }
     .oauthPaste { width:100%; min-height:72px; }
     .hidden { display:none !important; }
     .actualRow { display:flex; gap:8px; align-items:flex-start; margin-top:8px; }
     .actualLine { flex:1 1 auto; min-width:0; }
     .actualLine strong { color:var(--text); }
-    .toolCard button { min-height:40px; font-weight:800; }
+    .toolCard button { min-height:40px; font-weight:600; }
     .toolCard .actualRow button { min-height:0; flex:0 0 auto; }
     .apiEnvBox { margin-top:10px; display:grid; gap:8px; }
-    .apiEnvValue { color:#b7d8ff; font-size:12px; }
-    .simpleResult { margin-top:12px; padding:var(--size-px-2); border:1px solid var(--line); border-radius:var(--radius-2); background:#0d1320; min-height:44px; color:var(--muted); font-size:13px; line-height:1.5; }
+    .apiEnvValue { color:var(--apple-blue); font-size:12px; }
+    .simpleResult { margin-top:12px; padding:12px; border:1px solid var(--apple-hairline); border-radius:var(--radius-2); background:var(--apple-pearl); min-height:44px; color:var(--muted); font-size:14px; line-height:1.43; }
     .quotaBar { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px; margin:12px 0; align-items:stretch; }
-    .quotaPill { border:1px solid var(--line); border-radius:var(--radius-2); padding:13px; background:var(--panel2); display:grid; gap:10px; }
-    .quotaPill.current { border-color:#4c91d9; background:#102033; }
+    .quotaPill { border:1px solid var(--apple-hairline); border-radius:var(--radius-3); padding:16px; background:var(--apple-canvas); display:grid; gap:10px; }
+    .quotaPill.current { border-color:var(--apple-blue); background:var(--blue-0); }
     .quotaHead { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
-    .quotaTitle { font-weight:850; font-size:14px; overflow-wrap:anywhere; }
+    .quotaTitle { font-weight:600; font-size:14px; overflow-wrap:anywhere; color:var(--apple-ink); }
     .quotaMeta { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
-    .badge { display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:999px; padding:3px 7px; font-size:11px; font-weight:800; line-height:1; }
-    .badge.ok { border-color:#245f43; background:#102318; color:#7ff0b5; }
-    .badge.warn { border-color:#75551a; background:#241a0d; color:#ffd680; }
-    .badge.bad { border-color:#733333; background:#261313; color:#ff9b9b; }
+    .badge { display:inline-flex; align-items:center; border:1px solid var(--apple-hairline); border-radius:var(--radius-round); padding:3px 10px; font-size:11px; font-weight:600; line-height:1; }
+    .badge.ok { border-color:#b5e8cd; background:#f0faf4; color:#1b8a3e; }
+    .badge.warn { border-color:#ffe0a3; background:#fffbeb; color:#b35c00; }
+    .badge.bad { border-color:#ffc9c9; background:#fff5f5; color:var(--bad); }
     .quotaMeter { display:grid; gap:5px; }
     .quotaMeterMeta { display:grid; grid-template-columns:1fr auto auto; gap:8px; align-items:center; font-size:12px; color:var(--muted); }
     .quotaMeterMeta strong { color:var(--text); }
-    .quotaReset { color:#7f8ca0; }
-    .quotaProgress { width:100%; height:8px; appearance:none; border:0; border-radius:999px; overflow:hidden; background:#222a36; }
-    .quotaProgress::-webkit-progress-bar { background:#222a36; border-radius:999px; }
-    .quotaProgress::-webkit-progress-value { border-radius:999px; }
+    .quotaReset { color:var(--apple-ink-48); }
+    .quotaProgress { width:100%; height:6px; appearance:none; border:0; border-radius:var(--radius-round); overflow:hidden; background:var(--apple-parchment); }
+    .quotaProgress::-webkit-progress-bar { background:var(--apple-parchment); border-radius:var(--radius-round); }
+    .quotaProgress::-webkit-progress-value { border-radius:var(--radius-round); }
     .quotaProgress.ok::-webkit-progress-value { background:var(--ok); }
     .quotaProgress.warn::-webkit-progress-value { background:var(--warn); }
     .quotaProgress.bad::-webkit-progress-value { background:var(--bad); }
-    .quotaProgress::-moz-progress-bar { border-radius:999px; background:var(--ok); }
-    .quotaWindows { color:var(--muted); font-size:12px; line-height:1.5; }
-    .servicePanel { border-top:1px solid var(--line); margin-top:12px; padding-top:12px; }
+    .quotaProgress::-moz-progress-bar { border-radius:var(--radius-round); background:var(--ok); }
+    .quotaWindows { color:var(--muted); font-size:12px; line-height:1.45; }
+    .servicePanel { border-top:1px solid var(--apple-divider); margin-top:12px; padding-top:12px; }
     .serviceGrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin-top:8px; }
     .serviceItem { min-height:84px; }
     .serviceMeta { overflow-wrap:anywhere; }
     .formGrid { display:grid; grid-template-columns:repeat(2, minmax(240px, 1fr)); gap:12px; align-items:end; }
-    .formGrid label { display:grid; gap:6px; color:var(--muted); font-size:12px; font-weight:700; }
+    .formGrid label { display:grid; gap:6px; color:var(--muted); font-size:12px; font-weight:600; }
     .formGrid input, .formGrid select { width:100%; min-width:0; }
-    .tableWrap { width:100%; overflow:auto; border-radius:var(--radius-2); border:1px solid var(--line); }
+    .tableWrap { width:100%; overflow:auto; border-radius:var(--radius-3); border:1px solid var(--apple-hairline); }
     table { width:100%; min-width:min(760px, 100%); border-collapse:collapse; table-layout:fixed; font-size:12px; }
-    th, td { border-bottom:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; overflow-wrap:anywhere; word-break:break-word; }
-    th { color:var(--muted); background:#111827; font-weight:800; }
+    th, td { border-bottom:1px solid var(--apple-divider); padding:10px 12px; text-align:left; vertical-align:top; overflow-wrap:anywhere; word-break:break-word; }
+    th { color:var(--muted); background:var(--apple-pearl); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.02em; }
     tr:last-child td { border-bottom:0; }
     .nameCol { width:20%; }
     .smallCol { width:10%; }
@@ -8566,12 +8565,12 @@ INDEX_HTML = """<!doctype html>
     .providerNameCell { display:flex; gap:8px; align-items:flex-start; min-width:0; }
     .providerNameText { min-width:0; }
     details.card { padding:0; }
-    details.card > summary { padding:var(--size-px-3); list-style:none; cursor:pointer; font-weight:850; }
+    details.card > summary { padding:20px; list-style:none; cursor:pointer; font-weight:600; }
     details.card > summary::-webkit-details-marker { display:none; }
-    details.card > .detailsBody { padding:0 14px 14px; }
+    details.card > .detailsBody { padding:0 16px 16px; }
     .steps { margin:0; padding-left:18px; color:var(--soft); font-size:12px; line-height:1.65; }
     .guideTarget { color:var(--muted); font-size:12px; margin-bottom:10px; }
-    textarea { width:100%; min-height:220px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
+    textarea { width:100%; min-height:220px; font-family:"SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
     @media (max-width: 1180px) {
       .workspace { grid-template-columns:minmax(0, 1fr); }
       .topBar, .pageStack, .guideDock { grid-column:1; }
@@ -8606,11 +8605,10 @@ INDEX_HTML = """<!doctype html>
           <button class="navItem" data-page="quota">额度与自动切换 <span class="navHint">OpenAI</span></button>
           <button class="navItem" data-page="claude">Claude Code <span class="navHint">桥接</span></button>
           <button class="navItem" data-page="codex">Codex CLI <span class="navHint">启动器</span></button>
-          <button class="navItem" data-page="api">通用 API <span class="navHint">复制</span></button>
+          <button class="navItem" data-page="api">API 接入 <span class="navHint">地址+Key</span></button>
           <button class="navItem" data-page="services">本地服务 <span class="navHint">8876</span></button>
           <button class="navItem" data-page="diagnostics">诊断日志 <span class="navHint">排查</span></button>
           <button class="navItem" data-page="account-pool">账户池 <span class="navHint">轮换</span></button>
-          <button class="navItem" data-page="api-keys">API Keys <span class="navHint">统一入口</span></button>
           <button class="navItem" data-page="service-control">服务控制 <span class="navHint">launchd</span></button>
         </nav>
         <div class="sidePanel">
@@ -8929,28 +8927,44 @@ INDEX_HTML = """<!doctype html>
             </div>
             <div class="card guideSection" id="aimamiSyncPanel" data-guide="aimamiSync">
               <h2>AiMaMi 同步</h2>
-              <div class="sectionHint">只读取 AiMaMi 本机账号快照，导入到 BridgeDeck 自己的 OAuth 存储；不写 AiMaMi 文件。</div>
-              <div class="row">
-                <button class="miniBtn" data-action="preview-aimami-import">预览 AiMaMi 导入</button>
-                <button class="primary" data-action="import-aimami-accounts">导入账号</button>
-                <button class="miniBtn" data-action="import-aimami-and-bridges">导入并创建 Local Bridge</button>
+
+              <div class="compactPanel">
+                <div class="compactTitle">第一步：从 AiMaMi 导入账号</div>
+                <div class="sectionHint">读取 AiMaMi 本机账号快照，导入到 BridgeDeck。不修改 AiMaMi 文件。</div>
+                <div class="row">
+                  <button class="miniBtn" data-action="preview-aimami-import">查看可导入的账号</button>
+                  <button class="primary" data-action="import-aimami-accounts">导入到 BridgeDeck</button>
+                  <button class="miniBtn" data-action="import-aimami-and-bridges">导入 + 自动创建 Local Bridge</button>
+                </div>
+                <div id="aimamiSyncStatus" class="muted mt10">AiMaMi 账号检测中...</div>
               </div>
-              <div id="aimamiSyncStatus" class="muted mt10">AiMaMi 账号检测中...</div>
-              <div class="toggleLine mt10">
-                <label><input type="checkbox" id="aimamiFollowEnabled"> Follow AiMaMi active account</label>
+
+              <div class="compactPanel mt10">
+                <div class="compactTitle">第二步：自动跟随 AiMaMi 当前账号</div>
+                <div class="sectionHint">开启后 BridgeDeck 自动同步 AiMaMi 的活跃账号到自己的账号池。</div>
+                <div class="toggleLine">
+                  <label><input type="checkbox" id="aimamiFollowEnabled"> 跟随 AiMaMi 活跃账号</label>
+                </div>
+                <div class="row">
+                  <button class="miniBtn" data-action="save-aimami-follow">保存设置</button>
+                  <button class="miniBtn" data-action="run-aimami-follow">立即同步一次</button>
+                </div>
+                <div id="aimamiFollowStatus" class="muted mt10">Follow 未运行</div>
               </div>
-              <div class="row">
-                <button class="miniBtn" data-action="save-aimami-follow">保存 Follow 设置</button>
-                <button class="miniBtn" data-action="run-aimami-follow">立即同步 AiMaMi 当前账号</button>
+
+              <div class="compactPanel mt10">
+                <div class="compactTitle">第三步：从 BridgeDeck 导出到 AiMaMi</div>
+                <div class="sectionHint">将 BridgeDeck 管理的账号导出为 AiMaMi 格式或直接写入快照。</div>
+                <div class="row">
+                  <button class="miniBtn" data-action="preview-aimami-export">查看可导出的账号</button>
+                  <button class="miniBtn" data-action="export-aimami-accounts">导出 AiMaMi 格式文件</button>
+                </div>
+                <div class="row mt10">
+                  <button class="miniBtn warn" data-action="preview-aimami-inject">预览直接写入</button>
+                  <button class="miniBtn warn" data-action="inject-aimami-accounts">写入 AiMaMi 快照</button>
+                </div>
+                <div id="aimamiExportStatus" class="muted mt10">导出未运行</div>
               </div>
-              <div id="aimamiFollowStatus" class="muted mt10">Follow 未运行</div>
-              <div class="row mt10">
-                <button class="miniBtn" data-action="preview-aimami-export">预览 BridgeDeck 导出</button>
-                <button class="miniBtn" data-action="export-aimami-accounts">导出选中账号给 AiMaMi</button>
-                <button class="miniBtn warn" data-action="preview-aimami-inject">预览 Snapshot Injection</button>
-                <button class="miniBtn warn" data-action="inject-aimami-accounts">写入 AiMaMi Snapshots</button>
-              </div>
-              <div id="aimamiExportStatus" class="muted mt10">导出未运行</div>
             </div>
           </section>
 
@@ -9065,8 +9079,8 @@ INDEX_HTML = """<!doctype html>
           <section class="deckPage" id="page-api">
             <div class="pageHeader">
               <div>
-                <h2 class="pageTitle">通用 API 接入</h2>
-                <p class="pageDesc">复制 OpenAI Base URL 或 Claude/Anthropic 环境变量；API key 是占位符，不显示真实 OAuth token。</p>
+                <h2 class="pageTitle">API 接入</h2>
+                <p class="pageDesc">配置工具连接地址、复制 env 变量、管理 API Key。</p>
               </div>
             </div>
             <div class="card guideSection" id="apiAccessCard" data-guide="apiAccess">
@@ -9151,6 +9165,28 @@ INDEX_HTML = """<!doctype html>
                 </div>
               </div>
               <div class="muted mt10">gpt-5.5 thinking levels: low / medium / high / xhigh。minimal 不作为可选级别展示。</div>
+            </div>
+            <div class="card guideSection mt10" data-guide="apiKeys">
+              <h2>API Keys 管理</h2>
+              <p class="sectionHint">为外部工具生成独立 Key，所有 Key 共享统一地址 <code>http://127.0.0.1:8876/v1</code>。</p>
+              <div class="row">
+                <input type="text" id="newKeyName" placeholder="Key 名称 (可选)" />
+                <button class="primary" data-action="create-api-key">创建 API Key</button>
+              </div>
+              <div id="newKeyResult" class="recommend hidden"></div>
+              <div class="tableWrap mt10">
+                <table id="apiKeysTable">
+                  <thead>
+                    <tr>
+                      <th class="nameCol">名称</th>
+                      <th class="urlCol">Key</th>
+                      <th class="smallCol">状态</th>
+                      <th class="smallCol">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
             </div>
           </section>
 
@@ -9314,38 +9350,6 @@ INDEX_HTML = """<!doctype html>
               <div id="rotationStatus" class="recommend mt10">未配置</div>
             </div>
           </section>
-            <div class="pageHeader">
-              <div>
-                <h2 class="pageTitle">API Keys</h2>
-                <p class="pageDesc">生成统一入口 API Key，所有工具使用同一地址 <code>http://127.0.0.1:8876/v1</code></p>
-              </div>
-              <button data-action="refresh">刷新</button>
-            </div>
-            <div class="card">
-              <h2>创建新 Key</h2>
-              <div class="row">
-                <input type="text" id="newKeyName" placeholder="Key 名称 (可选)" />
-                <button class="primary" data-action="create-api-key">创建 API Key</button>
-              </div>
-              <div id="newKeyResult" class="recommend hidden"></div>
-            </div>
-            <div class="card">
-              <h2>已创建的 Keys</h2>
-              <div class="tableWrap">
-                <table id="apiKeysTable">
-                  <thead>
-                    <tr>
-                      <th class="nameCol">名称</th>
-                      <th class="urlCol">Key</th>
-                      <th class="smallCol">状态</th>
-                      <th class="smallCol">操作</th>
-                    </tr>
-                  </thead>
-                  <tbody></tbody>
-                </table>
-              </div>
-            </div>
-          </section>
 
           <section class="deckPage" id="page-service-control">
             <div class="pageHeader">
@@ -9434,7 +9438,7 @@ INDEX_HTML = """<!doctype html>
         ]
       },
       apiAccess: {
-        title: '通用 API 接入',
+        title: 'API 接入',
         target: '上方板块：API endpoint 和 copy-safe 配置',
         steps: [
           '选择要暴露给工具的 ChatGPT 账号。',
@@ -10445,7 +10449,7 @@ INDEX_HTML = """<!doctype html>
           <td>${esc(key.name || '未命名')}</td>
           <td class="mono">${esc(key.key_prefix || '****')}...</td>
           <td><span class="ok">有效</span></td>
-          <td><button class="miniBtn warn" data-revoke-key="${esc(key.key_prefix)}">撤销</button></td>
+          <td><button class="miniBtn warn" data-action="revoke-key" data-key="${esc(key.key_prefix)}">撤销</button></td>
         `;
         tbody.appendChild(tr);
       });
@@ -11005,7 +11009,7 @@ INDEX_HTML = """<!doctype html>
       const openaiExample = document.getElementById('apiOpenAiExample');
       const claudeExample = document.getElementById('apiClaudeExample');
       if (guideBase) guideBase.textContent = apiAccessBaseUrl(item) ? `BASE_URL: ${apiAccessBaseUrl(item)}\nDesktop Gateway: ${claudeDesktopGatewayBaseUrl(item)}` : 'BASE_URL: 选择账号后生成';
-      if (guideAccount) guideAccount.textContent = item ? accountLabel(item) : '沿用上方通用 API 接入选择';
+      if (guideAccount) guideAccount.textContent = item ? accountLabel(item) : '沿用上方 API 接入选择';
       if (openaiExample) openaiExample.textContent = apiOpenAiEnv(item);
       if (claudeExample) claudeExample.textContent = apiClaudeEnv(item);
       if (actual) {
@@ -11340,7 +11344,7 @@ INDEX_HTML = """<!doctype html>
         const item = accounts[simpleApiSel.selectedIndex];
         if (!item) return;
         renderApiAccess();
-        setSimpleResult(`通用 API 接入已选择 ${accountLabel(item)}。可复制 OpenAI 或 Anthropic .env。`);
+        setSimpleResult(`API 接入已选择 ${accountLabel(item)}。可复制 OpenAI 或 Anthropic .env。`);
       };
       simpleDefaultSel.onchange = () => {
         const item = accounts[simpleDefaultSel.selectedIndex];
@@ -11905,6 +11909,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'set-default-account') return setDefaultAccount();
           if (action === 'save-rotation-strategy') return saveRotationStrategy();
           if (action === 'create-api-key') return createApiKey();
+          if (action === 'revoke-key') { const k = button.getAttribute('data-key'); if (k) return revokeApiKey(k); }
           if (action === 'service-start') return serviceControl('start');
           if (action === 'service-stop') return serviceControl('stop');
           if (action === 'service-restart') return serviceControl('restart');
@@ -12153,6 +12158,12 @@ def build_handler(
                 return
             if parsed.path == "/api/account-pool":
                 try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
                     accounts = manager._load_accounts()
                     quotas = manager.quotas().get("quotas", [])
                     quota_map = {str(q.get("account_id") or ""): q for q in quotas if isinstance(q, dict)}
@@ -12246,22 +12257,13 @@ def build_handler(
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
                 return
-            if parsed.path == "/api/account-pool":
+            if parsed.path == "/api/launchd-status":
                 try:
                     if not self._valid_fetch_metadata():
                         json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
                         return
                     if not self._valid_csrf():
                         json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
-                        return
-                    json_response(self, 200, manager.account_pool())
-                except Exception as exc:  # noqa: BLE001
-                    json_response(self, 500, {"ok": False, "error": str(exc)})
-                return
-            if parsed.path == "/api/launchd-status":
-                try:
-                    if not self._valid_fetch_metadata():
-                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
                         return
                     json_response(self, 200, manager.launchd_status())
                 except Exception as exc:  # noqa: BLE001
