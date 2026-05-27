@@ -8239,9 +8239,63 @@ INDEX_HTML = """<!doctype html>
   <title>BridgeDeck</title>
   <style nonce="__CSP_NONCE__">
     :root {
-      --bg:#0c0f14; --surface:#111722; --panel:#151c29; --panel2:#101621; --line:#263244;
-      --text:#edf2fb; --muted:#9aa7ba; --soft:#c6d0df; --ok:#2ec27e; --warn:#f5b642;
-      --bad:#ff6f6f; --brand:#59a7ff; --brand2:#8cc6ff; --focus:#213756;
+      /* Open Props inspired design tokens - BridgeDeck dark theme */
+      /* Grays - cool blue-tinted dark palette */
+      --gray-0: #f8f9fa;
+      --gray-1: #f1f3f5;
+      --gray-2: #e9ecef;
+      --gray-3: #dee2e6;
+      --gray-4: #ced4da;
+      --gray-5: #adb5bd;
+      --gray-6: #868e96;
+      --gray-7: #495057;
+      --gray-8: #343a40;
+      --gray-9: #212529;
+      --gray-10: #16191d;
+      --gray-11: #0d0f12;
+      --gray-12: #030507;
+
+      /* Brand colors - BridgeDeck signature blue */
+      --blue-0: #e7f5ff;
+      --blue-1: #d0ebff;
+      --blue-2: #a5d8ff;
+      --blue-3: #74c0fc;
+      --blue-4: #4dabf7;
+      --blue-5: #339af0;
+      --blue-6: #228be6;
+      --blue-7: #1c7ed6;
+      --blue-8: #1971c2;
+      --blue-9: #1864ab;
+      --blue-10: #145591;
+      --blue-11: #114678;
+      --blue-12: #0d375e;
+
+      /* Status colors */
+      --green-5: #51cf66;
+      --green-6: #40c057;
+      --green-7: #37b24d;
+      --yellow-5: #fcc419;
+      --yellow-6: #fab005;
+      --yellow-7: #f59f00;
+      --red-5: #ff6b6b;
+      --red-6: #fa5252;
+      --red-7: #f03e3e;
+
+      /* Semantic tokens */
+      --bg: var(--gray-12);
+      --surface: #111722;
+      --panel: #151c29;
+      --panel2: #101621;
+      --line: #263244;
+      --text: var(--gray-0);
+      --muted: var(--gray-5);
+      --soft: var(--gray-3);
+      --ok: var(--green-6);
+      --warn: var(--yellow-6);
+      --bad: var(--red-6);
+      --brand: var(--blue-5);
+      --brand2: var(--blue-3);
+      --focus: var(--blue-9);
     }
     * { box-sizing:border-box; }
     body { margin:0; font-family:ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
