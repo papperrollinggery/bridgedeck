@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import threading
 import time
+import fcntl
 import urllib.parse
 import uuid
 import zlib
@@ -1644,35 +1645,54 @@ class AuthStore:
             },
             "default_account_id": default_account_id,
         }
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(f".{self.path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+        try:
+            with tmp.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
 
     def get_access_token(self, requested_account_id: str | None) -> tuple[str, str]:
-        with self._lock:
-            accounts, default_account_id = self.load()
-            account_id = requested_account_id or default_account_id
-            if not account_id or account_id not in accounts:
-                raise RuntimeError(f"account not found: {requested_account_id or 'default'}")
+        lock_path = self.path.with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = lock_path.open("w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            with self._lock:
+                accounts, default_account_id = self.load()
+                account_id = requested_account_id or default_account_id
+                if not account_id or account_id not in accounts:
+                    raise RuntimeError(f"account not found: {requested_account_id or 'default'}")
 
-            cached = self._token_cache.get(account_id)
-            if cached and not cached.is_expiring_soon():
-                return account_id, cached.token
+                cached = self._token_cache.get(account_id)
+                if cached and not cached.is_expiring_soon():
+                    return account_id, cached.token
 
-            record = accounts[account_id]
-            token_data = self._refresh_token(record.refresh_token)
+                record = accounts[account_id]
+                token_data = self._refresh_token(record.refresh_token)
 
-            new_refresh = token_data.get("refresh_token")
-            if new_refresh and new_refresh != record.refresh_token:
-                record.refresh_token = new_refresh
-                accounts[account_id] = record
-                self.save(accounts, default_account_id)
+                new_refresh = token_data.get("refresh_token")
+                if new_refresh and new_refresh != record.refresh_token:
+                    record.refresh_token = new_refresh
+                    accounts[account_id] = record
+                    self.save(accounts, default_account_id)
 
-            access_token = token_data["access_token"]
-            expires_in = int(token_data.get("expires_in", 3600))
-            self._token_cache[account_id] = CachedToken(
-                token=access_token,
-                expires_at=time.time() + expires_in,
-            )
-            return account_id, access_token
+                access_token = token_data["access_token"]
+                expires_in = int(token_data.get("expires_in", 3600))
+                self._token_cache[account_id] = CachedToken(
+                    token=access_token,
+                    expires_at=time.time() + expires_in,
+                )
+                return account_id, access_token
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
 
     def account_candidates(self, requested_account_id: str | None, session_key: str | None = None) -> list[str]:
         with self._lock:
