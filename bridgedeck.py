@@ -1233,6 +1233,7 @@ def probe_remote_url(
         sample = exc.read(max_bytes).decode("utf-8", "replace")
         return {
             "ok": False,
+            "error": f"HTTP {exc.code}",
             "reached": True,
             "status_code": int(exc.code or 0),
             "content_type": exc.headers.get("Content-Type", ""),
@@ -1613,6 +1614,7 @@ def claude_hook_risk_status(path: Path = DEFAULT_CLAUDE_SETTINGS_PATH) -> dict[s
     if path.is_symlink():
         return {
             "ok": False,
+            "error": "Claude settings 是符号链接，未读取 hooks。",
             "status": "unknown",
             "message": "Claude settings 是符号链接，未读取 hooks。",
             "settings_path": str(path),
@@ -1633,6 +1635,7 @@ def claude_hook_risk_status(path: Path = DEFAULT_CLAUDE_SETTINGS_PATH) -> dict[s
     except (OSError, json.JSONDecodeError) as exc:
         return {
             "ok": False,
+            "error": f"Claude settings.json 不可读: {type(exc).__name__}",
             "status": "unknown",
             "message": f"Claude settings.json 不可读: {type(exc).__name__}",
             "settings_path": str(path),
@@ -2217,6 +2220,7 @@ def codex_desktop_app_state(
         return {
             **base,
             "ok": False,
+            "error": "Codex Desktop Sentry app-state 文件是符号链接，已跳过。",
             "status": "unreadable",
             "message": "Codex Desktop Sentry app-state 文件是符号链接，已跳过。",
         }
@@ -2231,6 +2235,7 @@ def codex_desktop_app_state(
         return {
             **base,
             "ok": False,
+            "error": f"Codex Desktop Sentry app-state 读取失败：{exc}",
             "status": "unreadable",
             "message": f"Codex Desktop Sentry app-state 读取失败：{exc}",
         }
@@ -2351,6 +2356,7 @@ def codex_app_dynamic_tools_state(
         return {
             **base,
             "ok": False,
+            "error": "Codex state_5.sqlite 是符号链接，已跳过。",
             "status": "unreadable",
             "message": "Codex state_5.sqlite 是符号链接，已跳过。",
         }
@@ -2426,6 +2432,7 @@ def codex_app_dynamic_tools_state(
         return {
             **base,
             "ok": False,
+            "error": f"Codex state_5.sqlite 读取失败：{exc}",
             "status": "unreadable",
             "message": f"Codex state_5.sqlite 读取失败：{exc}",
         }
@@ -2444,6 +2451,7 @@ def codex_app_dynamic_tools_state(
         return {
             **base,
             "ok": False,
+            "error": f"Codex state_5.sqlite 未找到线程 {thread_id}。",
             "status": "thread_missing",
             "message": f"Codex state_5.sqlite 未找到线程 {thread_id}。",
         }
@@ -2455,6 +2463,7 @@ def codex_app_dynamic_tools_state(
         return {
             **base,
             "ok": False,
+            "error": f"Codex 线程由 {client} 创建{count_part}；重启本机 Codex 不会补回 dynamic tools。",
             "status": "remote_dynamic_tools_missing",
             "message": f"Codex 线程由 {client} 创建{count_part}；重启本机 Codex 不会补回 dynamic tools。",
             "latest": latest,
@@ -2464,6 +2473,7 @@ def codex_app_dynamic_tools_state(
         return {
             **base,
             "ok": False,
+            "error": "Codex 线程启动时未注入 codex_app dynamic tools。",
             "status": "missing_dynamic_tools",
             "message": "Codex 线程启动时未注入 codex_app dynamic tools。",
             "latest": latest,
@@ -2473,6 +2483,7 @@ def codex_app_dynamic_tools_state(
         return {
             **base,
             "ok": False,
+            "error": "Codex 线程 thread_source 不是 user，可能走了非标准启动路径。",
             "status": "non_user_thread_source",
             "message": "Codex 线程 thread_source 不是 user，可能走了非标准启动路径。",
             "latest": latest,
@@ -2482,6 +2493,7 @@ def codex_app_dynamic_tools_state(
         return {
             **base,
             "ok": False,
+            "error": "近期 Codex 线程曾缺失 codex_app dynamic tools。",
             "status": "recent_missing_dynamic_tools",
             "message": "近期 Codex 线程曾缺失 codex_app dynamic tools。",
             "latest": latest,
@@ -3820,6 +3832,7 @@ class BridgeManager:
         if not active_account_id:
             result = {
                 "ok": False,
+                "error": "missing_active_account",
                 "enabled": config["enabled"],
                 "action": "noop",
                 "reason": "missing_active_account",
@@ -3835,6 +3848,7 @@ class BridgeManager:
             if status not in {"new", "updated", "unchanged"}:
                 result = {
                     "ok": False,
+                    "error": str(candidate.get("reason") or "active_account_not_importable"),
                     "enabled": config["enabled"],
                     "action": "noop",
                     "reason": str(candidate.get("reason") or "active_account_not_importable"),
@@ -3847,6 +3861,7 @@ class BridgeManager:
             if active_account_id not in self._account_map():
                 result = {
                     "ok": False,
+                    "error": "active_account_missing_after_import",
                     "enabled": config["enabled"],
                     "action": "import_failed",
                     "reason": "active_account_missing_after_import",
@@ -3900,6 +3915,7 @@ class BridgeManager:
         if not target_provider:
             result = {
                 "ok": False,
+                "error": "missing_provider_after_create",
                 "enabled": config["enabled"],
                 "action": "noop",
                 "reason": "missing_provider_after_create",
@@ -4079,6 +4095,7 @@ class BridgeManager:
         if not exported_accounts:
             return {
                 "ok": False,
+                "error": "export_failed",
                 "mode": "export_file",
                 "reason": "export_failed",
                 "errors": errors,
@@ -4352,6 +4369,7 @@ class BridgeManager:
         if not verification.get("verified"):
             return {
                 "ok": False,
+                "error": "Manual AiMaMi reload verification is required before writing AiMaMi files.",
                 "mode": mode,
                 "reason": "injection_verification_required",
                 "verification": verification,
@@ -4365,6 +4383,7 @@ class BridgeManager:
         if conflicts and not overwrite:
             return {
                 "ok": False,
+                "error": "conflict_requires_overwrite",
                 "mode": mode,
                 "reason": "conflict_requires_overwrite",
                 "conflicts": [{"account_id": account_id} for account_id in conflicts],
@@ -5272,6 +5291,7 @@ class BridgeManager:
         if env_path.is_symlink():
             return {
                 "ok": False,
+                "error": "~/.codex/.env 是符号链接，BridgeDeck 不会修改",
                 "status": "blocked",
                 "message": "~/.codex/.env 是符号链接，BridgeDeck 不会修改",
                 "env_path": str(env_path),
@@ -5980,7 +6000,7 @@ class BridgeManager:
         best = self._best_quota_account(snapshot, quota_rows)
         actions: list[dict[str, Any]] = []
         if not best:
-            result = {"ok": False, "enabled": config["enabled"], "message": "没有可用 OpenAI 账号", "actions": []}
+            result = {"ok": False, "error": "没有可用 OpenAI 账号", "enabled": config["enabled"], "message": "没有可用 OpenAI 账号", "actions": []}
             self._save_auto_switch_config({**config, "last_result": result})
             return result
 
@@ -7560,6 +7580,7 @@ class BridgeManager:
             raise ValueError("account_id 不能为空")
         return {
             "ok": False,
+            "error": CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE,
             "changed": False,
             "message": CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE,
             "blocked_reason": CODEX_DESKTOP_BRIDGE_DISABLED_REASON,
