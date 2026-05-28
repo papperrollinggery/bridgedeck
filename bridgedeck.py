@@ -10180,7 +10180,7 @@ INDEX_HTML = """<!doctype html>
         ? '已开启：只在当前是 Local Codex Bridge 时自动切换。'
         : '已关闭自动切换。';
       if (res.auto_switch?.enabled) await runAutoSwitch(false, false);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     async function runAutoSwitch(force=true, refresh=true) {
       const res = await api('/api/auto-switch-run', 'POST', { force });
@@ -10189,7 +10189,7 @@ INDEX_HTML = """<!doctype html>
         ? `当前优先账号：${accountDisplay(res.selected_account_id)}，${quotaStatusText(res.selected_quota_status)}。${actions}`
         : (res.message || '未切换');
       log(`自动切换检查: ${document.getElementById('autoSwitchStatus').textContent}`);
-      if (refresh) await refreshData();
+      if (refresh) await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       return res;
     }
     async function createMissingBridges() {
@@ -10203,7 +10203,7 @@ INDEX_HTML = """<!doctype html>
         document.getElementById('missingBridgeStatus').innerHTML += ` <span class="warnText">跳过 ${skipped.length} 个异常账号。</span>`;
       }
       log(`新账号桥接创建: created=${created.length}, skipped=${skipped.length}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       return res;
     }
     async function previewAimamiImport() {
@@ -10218,7 +10218,7 @@ INDEX_HTML = """<!doctype html>
       renderAimamiSync({ detected: true, candidates: [...(res.imported || []), ...(res.skipped || [])], summary: res.summary || {} });
       const created = res.bridge_providers ? (res.bridge_providers.created || []).length : 0;
       log(`AiMaMi 导入完成: imported=${(res.imported || []).length}, skipped=${(res.skipped || []).length}, bridges=${created}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       return res;
     }
     async function saveAimamiFollow() {
@@ -10233,7 +10233,7 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/aimami-follow-run', 'POST', { force });
       renderAimamiFollow({ enabled: res.enabled, last_result: res });
       log(`AiMaMi follow: ${res.action || 'noop'} / ${res.reason || '-'} / ${res.selected_account_id ? maskId(res.selected_account_id) : '-'}`);
-      if (refresh) await refreshData();
+      if (refresh) await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       return res;
     }
     async function previewAimamiExport() {
@@ -10676,7 +10676,7 @@ INDEX_HTML = """<!doctype html>
       const okCount = (res.quotas || []).filter((q) => ['ok', 'near_limit', 'limit_reached'].includes(q.quota_status)).length;
       document.getElementById('serviceMessage').textContent = actions || `额度查询已刷新，正常账号 ${okCount} 个`;
       log(`额度修复: ${document.getElementById('serviceMessage').textContent}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       return res;
     }
     async function repairCodexEnvConflicts() {
@@ -10696,7 +10696,7 @@ INDEX_HTML = """<!doctype html>
       const box = document.getElementById('attributionHeaderStatus');
       if (box) box.innerHTML = `<span class="ok">${esc(message)}</span>`;
       log(`Attribution Header 修复: ${message}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       return res;
     }
     function showAttributionHeaderPaths() {
@@ -10788,7 +10788,7 @@ INDEX_HTML = """<!doctype html>
         stopOAuthPolling();
         stopOAuthExpiryTimer();
         setOAuthResult(`授权完成：${result.email || result.account_id || '新账号'}`, 'ok');
-        await refreshData();
+        await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       } else if (result.status === 'error') {
         stopOAuthPolling();
         stopOAuthExpiryTimer();
@@ -10854,7 +10854,7 @@ INDEX_HTML = """<!doctype html>
       setOAuthResult(result.message || 'CC Switch 已更新。', 'ok');
       const button = document.getElementById('oauthApplyBridgeBtn');
       if (button) button.textContent = '更新 CC Switch';
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       return result;
     }
     async function finishCodexOAuth() {
@@ -10868,7 +10868,7 @@ INDEX_HTML = """<!doctype html>
       if (result.status === 'completed') {
         stopOAuthPolling();
         setOAuthResult(`授权完成：${result.email || result.account_id || '新账号'}`, 'ok');
-        await refreshData();
+        await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       } else {
         setOAuthResult(result.error || result.message || '授权未完成', result.ok === false ? 'bad' : '');
       }
@@ -10990,7 +10990,7 @@ INDEX_HTML = """<!doctype html>
     async function toggleTokens() {
       tokenVisible = !tokenVisible;
       document.getElementById('tokenToggle').textContent = tokenVisible ? '隐藏 token' : '显示 token';
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     function applyCliAccountDefaults(item) {
       if (!item) return;
@@ -11712,7 +11712,7 @@ INDEX_HTML = """<!doctype html>
         compact_config: compactConfigPayload()
       });
       log(`${res.message}: ${res.provider_name} (${res.provider_id})`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       return res;
     }
     async function createCliHome() {
@@ -11723,7 +11723,7 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/create-cli-launcher', 'POST', { account_id: accountId, target_dir: targetDir, profile_name: profileName });
       document.getElementById('cliCommand').textContent = `启动命令: ${humanPath(res.run_command)}\\n启动脚本: ${humanPath(res.launcher)}`;
       log(`${res.message}: ${res.target_dir}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       return res;
     }
     async function simpleClaude() {
@@ -11752,7 +11752,7 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('simpleResult').dataset.touched = '1';
       setSimpleResult(`正在把全局 Codex CLI 固定入口设为 ${accountLabel(item)}...`);
       const res = await api('/api/set-default-codex', 'POST', { account_id: item.account_id });
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       const currentLauncher = res.current_launcher ? `；固定入口：${humanPath(res.current_launcher)}` : '';
       const omcText = (res.omc_codex_shims || []).length ? '；OMC/tmux 已接管 codex' : '';
       setSimpleResult(`完成：全局 Codex CLI 固定入口已设为 ${accountLabel(item)}${currentLauncher}${omcText}；Codex Desktop 未改动。`, 'ok');
@@ -11763,7 +11763,7 @@ INDEX_HTML = """<!doctype html>
     }
     async function restoreDesktopNativeMode() {
       const res = await api('/api/codex-desktop-native-mode', 'POST', {});
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       const backup = res.backup ? `；备份：${humanPath(res.backup)}` : '';
       setSimpleResult(`${res.message}${backup}。重启 Codex Desktop 后生效。`, res.changed ? 'ok' : '');
       log(`${res.message}: ${humanPath(res.config_path)}；removed=${(res.removed || []).join(', ') || '-'}`);
@@ -11776,7 +11776,7 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/migrate-cli-launcher', 'POST', { account_id: accountId, target_dir: targetDir, profile_name: profileName });
       document.getElementById('cliCommand').textContent = `启动命令: ${humanPath(res.run_command)}\\n启动脚本: ${humanPath(res.launcher)}`;
       log(`${res.message}: ${res.target_dir}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
       return res;
     }
     async function setCurrentFromSelected() {
@@ -11784,21 +11784,21 @@ INDEX_HTML = """<!doctype html>
       if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/set-current', 'POST', { provider_id: id });
       log(`${res.message}: ${id}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     async function patchSelected() {
       const id = selectedProviderActionId();
       if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/patch-provider', 'POST', { provider_id: id });
       log(`${res.message}: ${id}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     async function saveCompactSelected() {
       const id = selectedProviderActionId();
       if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/provider-compact', 'POST', { provider_id: id, context_config: bridgeModelConfigPayload(), compact_config: compactConfigPayload() });
       log(`${res.message}: ${providerCompactText({ compact_enabled: res.compact_config.enabled, compact_window_tokens: res.compact_config.window_tokens, compact_threshold_percent: res.compact_config.threshold_percent })}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     async function saveForcedModelSelected() {
       const id = selectedProviderActionId();
@@ -11806,7 +11806,7 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/provider-model', 'POST', { provider_id: id, model_config: bridgeModelConfigPayload() });
       setRoutingMode('forced');
       log(`${res.message}: ${res.model_config.model}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     async function clearForcedModelSelected() {
       const id = selectedProviderActionId();
@@ -11824,14 +11824,14 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/provider-routing', 'POST', { provider_id: id, mode: 'auto', apply: true });
       setRoutingMode('auto');
       log(`${res.message}: 已移除 ${res.removed_model || '-'}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     async function syncCommonEnvSelected() {
       const id = selectedProviderActionId();
       if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/sync-common-env', 'POST', { provider_id: id });
       log(`${res.message}: 更新 ${res.updated.length} 个，跳过 ${res.skipped.length} 个；keys: ${res.env_keys.join(', ')}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     async function copyApiBaseUrl() {
       return copyText(apiAccessBaseUrl(selectedAccount('simpleApiAccount')), 'BASE_URL');
@@ -11846,13 +11846,13 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/sync-claude-plugins', 'POST', {});
       const added = res.added && res.added.length ? `新增：${res.added.join(', ')}` : '没有新增';
       log(`插件启用态已同步：${added}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     async function extractSafeCommonConfig() {
       const res = await api('/api/extract-safe-common-config', 'POST', {});
       const keys = [...(res.keys || []), ...(res.env_keys || []).map((key) => `env.${key}`)];
       log(`${res.message}: ${keys.length ? keys.join(', ') : '没有可提取项'}；移除 env ${res.removed_env_keys.length} 项`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     function dedupePlanText(plan) {
       if (!plan || !plan.length) return '没有重复 Local Bridge provider';
@@ -11866,12 +11866,12 @@ INDEX_HTML = """<!doctype html>
       if (apply && !confirm('只会删除同账号重复的 Local Bridge provider，并先备份。继续？')) return;
       const res = await api('/api/dedupe-bridge-providers', 'POST', { apply });
       log(apply ? `${res.message}: 删除 ${res.deleted.length} 个；${dedupePlanText(res.plan)}` : dedupePlanText(res.plan));
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     async function repairPlusPro() {
       const res = await api('/api/repair-plus-pro', 'POST', {});
       log(`${res.message}: ${JSON.stringify(res.patched)}`);
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     function desktopRoutePlanText(plan) {
       if (!plan || !plan.length) return '没有需要修复的 Claude Desktop Local Bridge provider';
@@ -11884,7 +11884,7 @@ INDEX_HTML = """<!doctype html>
       if (apply && !confirm('只会修复 Claude Desktop Local Bridge provider 的 3.15 路由字段，并先备份。继续？')) return;
       const res = await api('/api/ccswitch-315-desktop-routes', 'POST', { apply });
       log(apply ? `${res.message}: 更新 ${res.updated.length} 个；${desktopRoutePlanText(res.plan)}` : desktopRoutePlanText(res.plan));
-      await refreshData();
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
     function bindActions() {
       document.addEventListener('click', (event) => {
