@@ -294,7 +294,7 @@ def load_json(path: Path, fallback: Any) -> Any:
         return fallback
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
+    except (OSError, json.JSONDecodeError) as exc:
         logger.error("Failed to parse JSON file: %s - %s", path, exc)
         raise RuntimeError(f"Failed to parse JSON file: {path}") from exc
 
@@ -798,7 +798,7 @@ def decode_jwt_payload(token: str | None) -> dict[str, Any]:
         payload += "=" * (-len(payload) % 4)
         parsed = json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")))
         return parsed if isinstance(parsed, dict) else {}
-    except Exception:
+    except (ValueError, KeyError, IndexError):
         return {}
 
 
@@ -867,7 +867,7 @@ def parse_oauth_code_input(value: str) -> dict[str, str]:
                 "code": (params.get("code") or [""])[0],
                 "state": (params.get("state") or [""])[0],
             }
-    except Exception:
+    except (ValueError, TypeError):
         pass
     if "#" in text and "code=" not in text:
         code, state = text.split("#", 1)
@@ -911,7 +911,7 @@ def _post_json_url(url: str, payload: dict[str, Any], *, user_agent: str) -> dic
         try:
             parsed_detail = json.loads(detail)
             code = str(((parsed_detail.get("error") or {}) if isinstance(parsed_detail, dict) else {}).get("code") or "")
-        except Exception:
+        except (json.JSONDecodeError, KeyError, TypeError):
             code = ""
         if code in ("deviceauth_authorization_unknown", "deviceauth_authorization_pending"):
             raise CodexDeviceAuthorizationPending("等待用户完成设备授权") from exc
@@ -1086,7 +1086,7 @@ def load_env_file(path: Path) -> dict[str, str]:
             value = value.strip().strip("'").strip('"')
             if key:
                 values[key] = value
-    except Exception:
+    except (OSError, ValueError):
         return {}
     return values
 
@@ -1178,7 +1178,7 @@ def parse_proxy_target(proxy_url: str) -> tuple[str, int]:
         return "", 0
     try:
         parsed = urllib.parse.urlsplit(proxy_url)
-    except Exception:
+    except ValueError:
         return "", 0
     host = parsed.hostname or ""
     port = int(parsed.port or (443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else 0))
@@ -1304,7 +1304,7 @@ def read_local_bridge_state(path: Path = DEFAULT_LOCAL_BRIDGE_STATE_PATH) -> dic
         return {}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         return {}
     if not isinstance(payload, dict):
         return {}
@@ -1424,7 +1424,7 @@ def read_tail_text(path: Path, *, max_bytes: int = 512 * 1024) -> str:
                 handle.seek(-max_bytes, os.SEEK_END)
                 handle.readline()
             return handle.read(max_bytes).decode("utf-8", "replace")
-    except Exception:
+    except (OSError, ValueError):
         return ""
 
 
@@ -1448,7 +1448,7 @@ def parse_bridge_stream_log(path: Path, *, max_events: int = 80) -> list[dict[st
             continue
         try:
             body = json.loads(match.group("body"))
-        except Exception:
+        except (json.JSONDecodeError, ValueError, TypeError):
             continue
         if not isinstance(body, dict):
             continue
@@ -1630,7 +1630,7 @@ def claude_hook_risk_status(path: Path = DEFAULT_CLAUDE_SETTINGS_PATH) -> dict[s
         }
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
+    except (OSError, json.JSONDecodeError) as exc:
         return {
             "ok": False,
             "status": "unknown",
@@ -1697,7 +1697,7 @@ def claude_hook_risk_status(path: Path = DEFAULT_CLAUDE_SETTINGS_PATH) -> dict[s
 def mask_url_credentials(value: str) -> str:
     try:
         parsed = urllib.parse.urlsplit(value)
-    except Exception:
+    except ValueError:
         return value
     if not parsed.scheme or not parsed.netloc or ("@" not in parsed.netloc):
         return value
@@ -1709,7 +1709,7 @@ def mask_url_credentials(value: str) -> str:
 def run_quiet(args: list[str], *, timeout: float = 3) -> subprocess.CompletedProcess[str] | None:
     try:
         return subprocess.run(args, check=False, capture_output=True, text=True, timeout=timeout)
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         return None
 
 
@@ -1966,7 +1966,7 @@ def codex_config_feature_state(config_path: Path | None = None) -> dict[str, Any
         return data
     try:
         text = config_path.read_text(encoding="utf-8")
-    except Exception as exc:  # noqa: BLE001
+    except OSError as exc:  # noqa: BLE001
         data.update({"ok": False, "error": str(exc)})
         return data
     features = toml_section_bool_keys(text, "features")
@@ -1984,7 +1984,7 @@ def codex_config_feature_state(config_path: Path | None = None) -> dict[str, Any
                 continue
             try:
                 body = path.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
+            except OSError:
                 continue
             if re.search(r"(?m)^\s*codex_hooks\s*=", body):
                 refs.append(str(path))
@@ -2002,7 +2002,7 @@ def codex_recent_desktop_logs(*, limit: int = 5) -> list[Path]:
     paths: list[Path] = []
     try:
         paths = [path for path in CODEX_DESKTOP_LOG_ROOT.rglob("*.log") if path.is_file()]
-    except Exception:
+    except OSError:
         return []
     return sorted(paths, key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)[:limit]
 
@@ -2032,7 +2032,7 @@ def codex_desktop_log_state(*, limit: int = 5, max_bytes_per_log: int = 1_500_00
         try:
             raw = path.read_bytes()
             body = raw[-max_bytes_per_log:].decode("utf-8", "replace")
-        except Exception:
+        except (OSError, ValueError):
             continue
         for line in body.splitlines():
             ts_match = timestamp_pattern.match(line)
@@ -2800,7 +2800,7 @@ class BridgeManager:
     def _load_oauth_flows(self) -> None:
         try:
             raw = load_json(self._oauth_flow_state_path(), {})
-        except Exception:
+        except (OSError, json.JSONDecodeError, ValueError):
             return
         entries = raw.get("flows") if isinstance(raw, dict) else []
         if not isinstance(entries, list):
@@ -3533,7 +3533,7 @@ class BridgeManager:
                         if len(parts) >= 3:
                             pid = parts[2]
             return {"ok": True, "loaded": loaded, "pid": pid}
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError) as e:
             return {"ok": True, "loaded": False, "error": str(e)}
 
     def service_control(self, action: str) -> dict[str, Any]:
@@ -3547,7 +3547,7 @@ class BridgeManager:
             elif action == "restart":
                 subprocess.run(["pkill", "-f", "bridgedeck"], capture_output=True, timeout=5)
                 return {"ok": True, "message": "重启信号已发送"}
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError) as e:
             return {"ok": False, "error": str(e)}
         return {"ok": False, "error": "Unknown action"}
 
@@ -4449,7 +4449,7 @@ class BridgeManager:
                 continue
             try:
                 body = item.read_text(encoding="utf-8")
-            except Exception:
+            except OSError:
                 body = ""
             account_match = re.search(r"/accounts/([^/'\" ]+)/v1", body)
             home_match = re.search(r"CODEX_HOME=(?:'([^']+)'|\"([^\"]+)\"|([^ \n]+))", body)
@@ -4486,7 +4486,7 @@ class BridgeManager:
             return data
         try:
             body = launcher_path.read_text(encoding="utf-8")
-        except Exception as exc:
+        except OSError as exc:
             data["risk_flags"].append(f"current_launcher_read_error:{exc}")
             return data
         base_match = re.search(r'base_url="([^"]+)"', body)
@@ -4516,7 +4516,7 @@ class BridgeManager:
             if exists and not path.is_symlink():
                 try:
                     body = path.read_text(encoding="utf-8")
-                except Exception:
+                except OSError:
                     body = ""
                 managed = MANAGED_CODEX_SHIM_MARKER in body
                 target_current = str(current_codex_launcher_path()) in body
@@ -4557,7 +4557,7 @@ class BridgeManager:
             return data
         try:
             text = config_path.read_text(encoding="utf-8")
-        except Exception as exc:
+        except OSError as exc:
             data["risk_flags"].append(f"config_read_error:{exc}")
             return data
         match = re.search(r'^\s*base_url\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
@@ -6064,7 +6064,7 @@ class BridgeManager:
         try:
             parsed = json.loads(text)
             return parsed if isinstance(parsed, dict) else {}
-        except Exception:
+        except (ValueError, json.JSONDecodeError):
             return {}
 
     def _build_usage_script(self, account_id: str) -> dict[str, Any]:
@@ -7483,7 +7483,7 @@ class BridgeManager:
             if shim_path.exists() or shim_path.is_symlink():
                 try:
                     existing = shim_path.read_text(encoding="utf-8") if shim_path.is_file() and not shim_path.is_symlink() else ""
-                except Exception:
+                except OSError:
                     existing = ""
                 if MANAGED_CODEX_SHIM_MARKER not in existing:
                     raise ValueError(f"OMC/tmux codex 包装器已存在且不是 BridgeDeck 管理: {shim_path}")
