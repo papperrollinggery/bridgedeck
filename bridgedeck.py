@@ -7,9 +7,9 @@ import copy
 import datetime as dt
 import hashlib
 import html
+import ipaddress
 import logging
 import logging.handlers
-import ipaddress
 import json
 import math
 import os
@@ -248,6 +248,7 @@ CODEX_DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
 CODEX_DEVICE_CODE_VERIFIER = "cc-switch-codex-oauth"
 CODEX_DEVICE_USER_AGENT = "cc-switch-codex-oauth"
 CODEX_OAUTH_FLOW_TTL_SECS = 10 * 60
+
 
 
 # ---------------------------------------------------------------------------
@@ -1635,7 +1636,6 @@ def claude_hook_risk_status(path: Path = DEFAULT_CLAUDE_SETTINGS_PATH) -> dict[s
     except (OSError, json.JSONDecodeError) as exc:
         return {
             "ok": False,
-            "error": f"Claude settings.json 不可读: {type(exc).__name__}",
             "status": "unknown",
             "message": f"Claude settings.json 不可读: {type(exc).__name__}",
             "settings_path": str(path),
@@ -3552,12 +3552,16 @@ class BridgeManager:
         import subprocess
         try:
             if action == "stop":
-                subprocess.run(["pkill", "-f", "bridgedeck"], capture_output=True, timeout=5)
+                result = subprocess.run(["pkill", "-f", "(python|Python).*bridgedeck"], capture_output=True, timeout=5)
+                if result.returncode == 1:
+                    return {"ok": True, "message": "服务未运行"}
                 return {"ok": True, "message": "服务停止信号已发送"}
             elif action == "start":
-                return {"ok": False, "message": "请通过 launchd 或手动启动服务"}
+                return {"ok": False, "error": "请通过 launchd 或手动启动服务", "message": "请通过 launchd 或手动启动服务"}
             elif action == "restart":
-                subprocess.run(["pkill", "-f", "bridgedeck"], capture_output=True, timeout=5)
+                result = subprocess.run(["pkill", "-f", "(python|Python).*bridgedeck"], capture_output=True, timeout=5)
+                if result.returncode == 1:
+                    return {"ok": True, "message": "服务未运行，无需重启"}
                 return {"ok": True, "message": "重启信号已发送"}
         except (subprocess.SubprocessError, OSError) as e:
             return {"ok": False, "error": str(e)}
