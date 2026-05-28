@@ -5,6 +5,7 @@ import copy
 import errno
 import gzip
 import hashlib
+import io
 import json
 import os
 import queue
@@ -70,6 +71,8 @@ CLAUDE_ATTRIBUTION_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 RETRYABLE_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+MAX_REQUEST_BODY_BYTES = 50 * 1024 * 1024  # 50 MB – refuse before reading
+MAX_DECOMPRESSED_BODY_BYTES = 10 * 1024 * 1024  # 10 MB – refuse after decompression
 SENSITIVE_QUERY_KEYS = {
     "access_token",
     "api_key",
@@ -90,6 +93,7 @@ BRIDGE_STATE_PATH = Path(
     )
 )
 MAX_USAGE_EVENTS = 200
+_bridge_state_lock = threading.RLock()
 
 
 @dataclass
@@ -260,6 +264,43 @@ def bind_failure_sleep_seconds(exc: OSError) -> int:
     return parse_non_negative_int_env(os.environ.get(BIND_FAILURE_SLEEP_SECS_ENV), default)
 
 
+class _DecompressionBombReader:
+    """Wraps a decompressor to read in chunks, aborting if the output exceeds a byte limit.
+
+    This prevents decompression bombs from allocating excessive memory before
+    the size check can execute.
+    """
+
+    def __init__(self, decompressor: Any, max_bytes: int) -> None:
+        self._decompressor = decompressor
+        self._max_bytes = max_bytes
+        self._total = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size == -1 or size is None:
+            # Read everything in bounded chunks
+            chunks: list[bytes] = []
+            while True:
+                chunk = self._decompressor.read(65536)
+                if not chunk:
+                    break
+                self._total += len(chunk)
+                if self._total > self._max_bytes:
+                    raise ValueError(
+                        f"decompressed body too large: exceeds {self._max_bytes} bytes"
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks)
+        chunk = self._decompressor.read(size)
+        if chunk:
+            self._total += len(chunk)
+            if self._total > self._max_bytes:
+                raise ValueError(
+                    f"decompressed body too large: exceeds {self._max_bytes} bytes"
+                )
+        return chunk
+
+
 def decode_request_body(raw_body: bytes, content_encoding: str | None) -> bytes:
     encoding = str(content_encoding or "").strip().lower()
     if not raw_body:
@@ -268,15 +309,55 @@ def decode_request_body(raw_body: bytes, content_encoding: str | None) -> bytes:
         encoding = "zstd"
     if encoding in {"", "identity"}:
         return raw_body
+    max_bytes = MAX_DECOMPRESSED_BODY_BYTES
     if encoding == "gzip":
-        return gzip.decompress(raw_body)
-    if encoding == "deflate":
-        return zlib.decompress(raw_body)
-    if encoding in {"zstd", "zstandard"}:
+        with gzip.GzipFile(fileobj=io.BytesIO(raw_body)) as gz:
+            guard = _DecompressionBombReader(gz, max_bytes)
+            return guard.read()
+    elif encoding == "deflate":
+        decompressor = zlib.decompressobj()
+        # Feed compressed input in small chunks so decompressor output is
+        # produced incrementally rather than all at once.
+        out_chunks: list[bytes] = []
+        total = 0
+        chunk_size = 65536
+        for offset in range(0, len(raw_body), chunk_size):
+            out = decompressor.decompress(raw_body[offset : offset + chunk_size])
+            if out:
+                total += len(out)
+                if total > max_bytes:
+                    raise ValueError(
+                        f"decompressed body too large: exceeds {max_bytes} bytes"
+                    )
+                out_chunks.append(out)
+        out = decompressor.flush()
+        if out:
+            total += len(out)
+            if total > max_bytes:
+                raise ValueError(
+                    f"decompressed body too large: exceeds {max_bytes} bytes"
+                )
+            out_chunks.append(out)
+        return b"".join(out_chunks)
+    elif encoding in {"zstd", "zstandard"}:
         if zstd is None:
             raise ValueError("zstd request body is not supported by this Python runtime")
-        return zstd.decompress(raw_body)  # type: ignore[union-attr]
-    raise ValueError(f"unsupported request content-encoding: {encoding}")
+        decompressor = zstd.ZstdDecompressor()  # type: ignore[union-attr]
+        out_chunks: list[bytes] = []
+        total = 0
+        chunk_size = 65536
+        for offset in range(0, len(raw_body), chunk_size):
+            out = decompressor.decompress(raw_body[offset : offset + chunk_size])
+            if out:
+                total += len(out)
+                if total > max_bytes:
+                    raise ValueError(
+                        f"decompressed body too large: exceeds {max_bytes} bytes"
+                    )
+                out_chunks.append(out)
+        return b"".join(out_chunks)
+    else:
+        raise ValueError(f"unsupported request content-encoding: {encoding}")
 
 
 def strip_claude_attribution_mode() -> str:
@@ -1493,72 +1574,73 @@ def record_bridge_usage(
     prompt_cache_key_present: bool = False,
     cache_key_source: str = "",
 ) -> None:
-    counts = _extract_usage_counts(usage)
-    if not counts or not any(counts.values()):
-        return
-    cache_miss_tokens = max(0, counts["input_tokens"] - counts["cached_tokens"])
-    cache_eligible_tokens = counts["input_tokens"]
-    cache_hit_rate = (counts["cached_tokens"] / cache_eligible_tokens) if cache_eligible_tokens else 0.0
-    cache_miss_rate = (cache_miss_tokens / cache_eligible_tokens) if cache_eligible_tokens else 0.0
-    state = _read_bridge_state()
-    metrics = state.get("usage_metrics") if isinstance(state.get("usage_metrics"), dict) else {}
-    for key in ("input_tokens", "output_tokens", "total_tokens", "cached_tokens", "cache_creation_tokens"):
-        metrics[key] = _usage_int(metrics.get(key)) + counts[key]
-    aggregate_cache_eligible = _usage_int(metrics.get("input_tokens"))
-    aggregate_cached = _usage_int(metrics.get("cached_tokens"))
-    aggregate_missed = max(0, aggregate_cache_eligible - aggregate_cached)
-    metrics["cache_miss_tokens"] = aggregate_missed
-    metrics["cache_hit_rate"] = (aggregate_cached / aggregate_cache_eligible) if aggregate_cache_eligible else 0.0
-    metrics["cache_miss_rate"] = (aggregate_missed / aggregate_cache_eligible) if aggregate_cache_eligible else 0.0
-    metrics["request_count"] = _usage_int(metrics.get("request_count")) + 1
-    metrics["last_account_id"] = account_id
-    metrics["last_model"] = model or ""
-    metrics["last_requested_model"] = requested_model or model or ""
-    metrics["last_request_type"] = request_type
-    metrics["last_request_id"] = request_id
-    metrics["last_duration_ms"] = _usage_int(duration_ms)
-    metrics["last_status_code"] = _usage_int(status_code)
-    metrics["last_bridge_port"] = _usage_int(bridge_port)
-    metrics["last_client_label"] = client_label or ""
-    metrics["last_session_id"] = session_id or ""
-    metrics["last_prompt_cache_key_present"] = bool(prompt_cache_key_present)
-    metrics["last_cache_key_source"] = cache_key_source or ""
-    metrics["last_updated_at"] = int(time.time())
-    state["usage_metrics"] = metrics
-    event = {
-        "at": int(time.time()),
-        "account_id": account_id,
-        "model": model or "",
-        "actual_model": model or "",
-        "requested_model": requested_model or model or "",
-        "request_type": request_type,
-        "request_id": request_id,
-        "status_code": _usage_int(status_code),
-        "source": source,
-        "route_path": route_path,
-        "bridge_port": _usage_int(bridge_port),
-        "client_port": _usage_int(client_port),
-        "client_label": client_label or "",
-        "desktop_route": bool(desktop_route),
-        "session_id": session_id or "",
-        "prompt_cache_key_present": bool(prompt_cache_key_present),
-        "cache_key_source": cache_key_source or "",
-        "duration_ms": _usage_int(duration_ms),
-        "input_tokens": counts["input_tokens"],
-        "output_tokens": counts["output_tokens"],
-        "total_tokens": counts["total_tokens"],
-        "cached_tokens": counts["cached_tokens"],
-        "cache_creation_tokens": counts["cache_creation_tokens"],
-        "cache_miss_tokens": cache_miss_tokens,
-        "cache_hit_rate": cache_hit_rate,
-        "cache_miss_rate": cache_miss_rate,
-        "cost_usd": 0.0,
-    }
-    events = state.get("usage_events") if isinstance(state.get("usage_events"), list) else []
-    events.append(event)
-    state["usage_events"] = events[-MAX_USAGE_EVENTS:]
-    state.pop("last_stream_error", None)
-    _write_bridge_state(state)
+    with _bridge_state_lock:
+        counts = _extract_usage_counts(usage)
+        if not counts or not any(counts.values()):
+            return
+        cache_miss_tokens = max(0, counts["input_tokens"] - counts["cached_tokens"])
+        cache_eligible_tokens = counts["input_tokens"]
+        cache_hit_rate = (counts["cached_tokens"] / cache_eligible_tokens) if cache_eligible_tokens else 0.0
+        cache_miss_rate = (cache_miss_tokens / cache_eligible_tokens) if cache_eligible_tokens else 0.0
+        state = _read_bridge_state()
+        metrics = state.get("usage_metrics") if isinstance(state.get("usage_metrics"), dict) else {}
+        for key in ("input_tokens", "output_tokens", "total_tokens", "cached_tokens", "cache_creation_tokens"):
+            metrics[key] = _usage_int(metrics.get(key)) + counts[key]
+        aggregate_cache_eligible = _usage_int(metrics.get("input_tokens"))
+        aggregate_cached = _usage_int(metrics.get("cached_tokens"))
+        aggregate_missed = max(0, aggregate_cache_eligible - aggregate_cached)
+        metrics["cache_miss_tokens"] = aggregate_missed
+        metrics["cache_hit_rate"] = (aggregate_cached / aggregate_cache_eligible) if aggregate_cache_eligible else 0.0
+        metrics["cache_miss_rate"] = (aggregate_missed / aggregate_cache_eligible) if aggregate_cache_eligible else 0.0
+        metrics["request_count"] = _usage_int(metrics.get("request_count")) + 1
+        metrics["last_account_id"] = account_id
+        metrics["last_model"] = model or ""
+        metrics["last_requested_model"] = requested_model or model or ""
+        metrics["last_request_type"] = request_type
+        metrics["last_request_id"] = request_id
+        metrics["last_duration_ms"] = _usage_int(duration_ms)
+        metrics["last_status_code"] = _usage_int(status_code)
+        metrics["last_bridge_port"] = _usage_int(bridge_port)
+        metrics["last_client_label"] = client_label or ""
+        metrics["last_session_id"] = session_id or ""
+        metrics["last_prompt_cache_key_present"] = bool(prompt_cache_key_present)
+        metrics["last_cache_key_source"] = cache_key_source or ""
+        metrics["last_updated_at"] = int(time.time())
+        state["usage_metrics"] = metrics
+        event = {
+            "at": int(time.time()),
+            "account_id": account_id,
+            "model": model or "",
+            "actual_model": model or "",
+            "requested_model": requested_model or model or "",
+            "request_type": request_type,
+            "request_id": request_id,
+            "status_code": _usage_int(status_code),
+            "source": source,
+            "route_path": route_path,
+            "bridge_port": _usage_int(bridge_port),
+            "client_port": _usage_int(client_port),
+            "client_label": client_label or "",
+            "desktop_route": bool(desktop_route),
+            "session_id": session_id or "",
+            "prompt_cache_key_present": bool(prompt_cache_key_present),
+            "cache_key_source": cache_key_source or "",
+            "duration_ms": _usage_int(duration_ms),
+            "input_tokens": counts["input_tokens"],
+            "output_tokens": counts["output_tokens"],
+            "total_tokens": counts["total_tokens"],
+            "cached_tokens": counts["cached_tokens"],
+            "cache_creation_tokens": counts["cache_creation_tokens"],
+            "cache_miss_tokens": cache_miss_tokens,
+            "cache_hit_rate": cache_hit_rate,
+            "cache_miss_rate": cache_miss_rate,
+            "cost_usd": 0.0,
+        }
+        events = state.get("usage_events") if isinstance(state.get("usage_events"), list) else []
+        events.append(event)
+        state["usage_events"] = events[-MAX_USAGE_EVENTS:]
+        state.pop("last_stream_error", None)
+        _write_bridge_state(state)
 
 
 def log_bridge_stream_error(
@@ -1619,7 +1701,16 @@ class AuthStore:
         self._session_affinity: dict[str, str] = {}
 
     def load(self) -> tuple[dict[str, AccountRecord], str | None]:
-        raw = json.loads(self.path.read_text())
+        try:
+            raw = json.loads(self.path.read_text())
+        except FileNotFoundError:
+            return {}, None
+        except (json.JSONDecodeError, OSError) as exc:
+            print(
+                f"{log_timestamp()} [auth-store-corrupt] detail={exc}",
+                file=sys.stderr,
+            )
+            return {}, None
         accounts = {
             account_id: AccountRecord(
                 account_id=account_id,
@@ -2549,13 +2640,6 @@ def iter_chat_completions_sse(chunks: Any, *, completion_id: str, model: str) ->
                 )
                 yield b"data: [DONE]\n\n"
             elif event_name in {"response.failed", "error"}:
-                closing = close_text_block()
-                if closing:
-                    yield closing
-                for item_id in list(active_tool_blocks):
-                    stopped_tool = close_tool_block(item_id)
-                    if stopped_tool:
-                        yield stopped_tool
                 error = payload.get("error")
                 response_obj = payload.get("response")
                 if not isinstance(error, dict) and isinstance(response_obj, dict):
@@ -3145,6 +3229,10 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
 
     def _read_json_body(self) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length > MAX_REQUEST_BODY_BYTES:
+            raise ValueError(
+                f"request body too large: {content_length} bytes exceeds {MAX_REQUEST_BODY_BYTES}"
+            )
         raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
         decoded_body = decode_request_body(raw_body, self.headers.get("Content-Encoding"))
         decoded = json.loads(decoded_body.decode("utf-8"))

@@ -23,6 +23,8 @@ import urllib.parse
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -2716,6 +2718,14 @@ class BridgeManager:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @contextmanager
+    def _managed_connect(self) -> Generator[sqlite3.Connection, None, None]:
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
     def _cleanup_oauth_flows(self) -> None:
         cutoff = time.time() - CODEX_OAUTH_FLOW_TTL_SECS
         expired = [
@@ -2950,7 +2960,7 @@ class BridgeManager:
     def _bridge_provider_for_account(self, account_id: str) -> dict[str, Any] | None:
         if not account_id:
             return None
-        with self._connect() as conn:
+        with self._managed_connect() as conn:
             row = self._select_existing_bridge_provider_for_account(conn, account_id)
             if not row:
                 return None
@@ -3007,6 +3017,7 @@ class BridgeManager:
             flow.error = ""
             self._persist_oauth_flows_locked()
         try:
+            # NOTE: save/jwt/lock block mirrors _complete_codex_oauth_flow (lines 3060-3073)
             token_data = exchange_codex_device_auth(flow.device_auth_id, flow.user_code)
             account_id = self._save_codex_oauth_account(token_data, set_default=flow.set_default)
             identity = jwt_identity(str(token_data.get("access_token") or ""))
@@ -3045,6 +3056,7 @@ class BridgeManager:
             flow.error = ""
             self._persist_oauth_flows_locked()
         try:
+            # NOTE: save/jwt/lock block mirrors _complete_codex_device_flow (lines 3021-3034)
             token_data = exchange_codex_oauth_code(code, flow.verifier)
             account_id = self._save_codex_oauth_account(token_data, set_default=flow.set_default)
             identity = jwt_identity(str(token_data.get("access_token") or ""))
@@ -3222,25 +3234,24 @@ class BridgeManager:
                 next_common.pop("env", None)
             return next_common, removed_keys, unsafe_removed
 
-        common = load_json(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, {})
-        common = common if isinstance(common, dict) else {}
-        next_common, removed_keys, unsafe_removed = build_next_common(common)
+        with self._lock:
+            common = load_json(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, {})
+            common = common if isinstance(common, dict) else {}
+            next_common, removed_keys, unsafe_removed = build_next_common(common)
 
-        before = json.dumps(common, ensure_ascii=False, sort_keys=True)
-        after = json.dumps(next_common, ensure_ascii=False, sort_keys=True)
-        backups: list[str] = []
-        changed = before != after
-        if changed:
-            backup = self._backup_file(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, "safe-common-extract")
-            if backup:
-                backups.append(backup)
-            dump_json(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, next_common)
+            before = json.dumps(common, ensure_ascii=False, sort_keys=True)
+            after = json.dumps(next_common, ensure_ascii=False, sort_keys=True)
+            backups: list[str] = []
+            changed = before != after
+            if changed:
+                backup = self._backup_file(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, "safe-common-extract")
+                if backup:
+                    backups.append(backup)
+                dump_json(DEFAULT_CCSWITCH_COMMON_CONFIG_PATH, next_common)
 
-        db_changed = False
-        if self.paths.db.exists():
-            with self._lock:
-                conn = self._connect()
-                try:
+            db_changed = False
+            if self.paths.db.exists():
+                with self._managed_connect() as conn:
                     has_settings = conn.execute(
                         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
                     ).fetchone()
@@ -3268,8 +3279,6 @@ class BridgeManager:
                             )
                             conn.commit()
                             db_changed = True
-                finally:
-                    conn.close()
 
         return {
             "ok": True,
@@ -3540,8 +3549,7 @@ class BridgeManager:
             return {"ok": False, "error": "Invalid strategy"}
         path = self._rotation_config_path()
         config = {"strategy": strategy, "auto_failover": auto_failover}
-        path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.chmod(path, 0o600)
+        dump_json(path, config)
         return {"ok": True, "strategy": strategy, "auto_failover": auto_failover}
 
     def _load_accounts(self) -> list[dict[str, Any]]:
@@ -3905,6 +3913,18 @@ class BridgeManager:
     def _load_auth_store_raw(self) -> dict[str, Any]:
         store = load_json(self.paths.auth_store, {})
         return store if isinstance(store, dict) else {}
+
+    def set_default_account(self, account_id: str) -> dict[str, Any]:
+        """Set the default account. Raises ValueError if not found, RuntimeError if store corrupt."""
+        with self._lock:
+            raw = load_json(self.paths.auth_store, {})
+            store = raw if isinstance(raw, dict) else {}
+            accounts = store.get("accounts") if isinstance(store.get("accounts"), dict) else {}
+            if account_id not in accounts:
+                raise ValueError(f"Account {account_id} not found")
+            store["default_account_id"] = account_id
+            dump_json(self.paths.auth_store, store)
+        return {"ok": True, "default_account_id": account_id}
 
     def aimami_export_preview(self) -> dict[str, Any]:
         aimami = self.aimami_import_preview()
@@ -6263,7 +6283,7 @@ class BridgeManager:
 
         if self.paths.db.exists():
             try:
-                with self._connect() as conn:
+                with self._managed_connect() as conn:
                     has_settings = conn.execute(
                         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
                     ).fetchone()
@@ -6456,7 +6476,7 @@ class BridgeManager:
             )
             return data
 
-        with self._connect() as conn:
+        with self._managed_connect() as conn:
             data["providers"] = self._list_surface_providers(conn, "claude_code", include_secrets=include_secrets)
             data["claude_desktop_providers"] = self._list_surface_providers(
                 conn,
@@ -6487,7 +6507,7 @@ class BridgeManager:
         with self._lock:
             db_bak = self._backup_file(self.paths.db, "set-current")
             settings_bak = self._backup_file(self.paths.settings, "set-current")
-            with self._connect() as conn:
+            with self._managed_connect() as conn:
                 hit = conn.execute(
                     "SELECT id FROM providers WHERE app_type = 'claude' AND id = ? LIMIT 1",
                     (provider_id,),
@@ -6530,7 +6550,7 @@ class BridgeManager:
             db_bak = self._backup_file(self.paths.db, "create-provider")
             settings_bak = self._backup_file(self.paths.settings, "create-provider")
 
-            with self._connect() as conn:
+            with self._managed_connect() as conn:
                 columns = self._provider_columns(conn)
                 existing = self._select_existing_bridge_provider_for_account(conn, account_id)
                 if not existing:
@@ -6643,7 +6663,7 @@ class BridgeManager:
 
         with self._lock:
             db_bak = self._backup_file(self.paths.db, "create-desktop-provider")
-            with self._connect() as conn:
+            with self._managed_connect() as conn:
                 columns = self._provider_columns(conn)
                 existing = self._select_existing_bridge_provider_for_account(
                     conn,
@@ -6741,8 +6761,7 @@ class BridgeManager:
             db_bak = self._backup_file(self.paths.db, "ccswitch-315-desktop-routes") if apply else None
             updated: list[dict[str, Any]] = []
             skipped: list[dict[str, Any]] = []
-            conn = self._connect()
-            try:
+            with self._managed_connect() as conn:
                 columns = self._provider_columns(conn)
                 if "settings_config" not in columns or "meta" not in columns:
                     raise RuntimeError("providers 表缺少 settings_config/meta 字段")
@@ -6797,8 +6816,6 @@ class BridgeManager:
                         updated.append({"id": row["id"], "name": row["name"]})
                 if apply and updated:
                     conn.commit()
-            finally:
-                conn.close()
 
             return {
                 "ok": True,
@@ -6816,7 +6833,7 @@ class BridgeManager:
 
         with self._lock:
             db_bak = self._backup_file(self.paths.db, "patch-provider")
-            with self._connect() as conn:
+            with self._managed_connect() as conn:
                 columns = self._provider_columns(conn)
                 row = conn.execute(
                     "SELECT id, name, settings_config, meta FROM providers WHERE app_type = 'claude' AND id = ? LIMIT 1",
@@ -6878,7 +6895,7 @@ class BridgeManager:
 
         with self._lock:
             db_bak = self._backup_file(self.paths.db, "provider-compact")
-            with self._connect() as conn:
+            with self._managed_connect() as conn:
                 columns = self._provider_columns(conn)
                 row = conn.execute(
                     "SELECT id, settings_config FROM providers WHERE app_type = 'claude' AND id = ? LIMIT 1",
@@ -6928,7 +6945,7 @@ class BridgeManager:
 
         with self._lock:
             db_bak = self._backup_file(self.paths.db, "provider-model")
-            with self._connect() as conn:
+            with self._managed_connect() as conn:
                 columns = self._provider_columns(conn)
                 row = conn.execute(
                     "SELECT id, settings_config FROM providers WHERE app_type = 'claude' AND id = ? LIMIT 1",
@@ -6968,7 +6985,7 @@ class BridgeManager:
 
         with self._lock:
             db_bak = self._backup_file(self.paths.db, "provider-routing") if apply else None
-            with self._connect() as conn:
+            with self._managed_connect() as conn:
                 columns = self._provider_columns(conn)
                 row = conn.execute(
                     "SELECT id, settings_config FROM providers WHERE app_type = 'claude' AND id = ? LIMIT 1",
@@ -7013,8 +7030,7 @@ class BridgeManager:
 
         with self._lock:
             db_bak = self._backup_file(self.paths.db, "sync-common-env")
-            conn = self._connect()
-            try:
+            with self._managed_connect() as conn:
                 columns = self._provider_columns(conn)
                 if "settings_config" not in columns:
                     raise RuntimeError("providers 表缺少 settings_config 字段")
@@ -7081,8 +7097,6 @@ class BridgeManager:
                     updated.append({"id": row["id"], "name": row["name"]})
 
                 conn.commit()
-            finally:
-                conn.close()
 
             return {
                 "ok": True,
@@ -7166,8 +7180,7 @@ class BridgeManager:
             switch_current_to = ""
             deleted: list[dict[str, Any]] = []
             updated: list[dict[str, Any]] = []
-            conn = self._connect()
-            try:
+            with self._managed_connect() as conn:
                 columns = self._provider_columns(conn)
                 if "settings_config" not in columns:
                     raise RuntimeError("providers 表缺少 settings_config 字段")
@@ -7238,8 +7251,6 @@ class BridgeManager:
                         (switch_current_to,),
                     )
                 conn.commit()
-            finally:
-                conn.close()
 
             if switch_current_to:
                 self._set_current_provider_in_settings(switch_current_to)
@@ -7260,7 +7271,7 @@ class BridgeManager:
         with self._lock:
             db_bak = self._backup_file(self.paths.db, "repair-plus-pro")
             patched: list[str] = []
-            with self._connect() as conn:
+            with self._managed_connect() as conn:
                 columns = self._provider_columns(conn)
                 rows = conn.execute(
                     """
@@ -7609,8 +7620,7 @@ class BridgeManager:
 
             if self.paths.db.exists():
                 try:
-                    conn = self._connect()
-                    try:
+                    with self._managed_connect() as conn:
                         has_settings = conn.execute(
                             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
                         ).fetchone()
@@ -7692,8 +7702,6 @@ class BridgeManager:
                                     db_changed = True
                         if db_changed:
                             conn.commit()
-                    finally:
-                        conn.close()
                 except Exception as exc:  # noqa: BLE001
                     db_errors.append(f"{type(exc).__name__}: {truncate_log_text(str(exc))}")
 
@@ -12516,25 +12524,37 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/keys/revoke":
-                    key = str(payload.get("key") or "")
-                    result = manager.revoke_api_key(key)
-                    json_response(self, 200, result)
+                    key = str(payload.get("key") or payload.get("key_prefix") or "")
+                    try:
+                        # Support prefix matching: "xxx..." -> find full key
+                        if "..." in key:
+                            prefix = key.split("...")[0]
+                            keys = manager._load_api_keys()
+                            matches = [k for k in keys if k.startswith(prefix) and not keys[k].get("revoked")]
+                            if len(matches) == 0:
+                                json_response(self, 404, {"ok": False, "error": "API key not found"})
+                                return
+                            if len(matches) > 1:
+                                json_response(self, 400, {"ok": False, "error": "Multiple keys match this prefix, please provide a more precise identifier"})
+                                return
+                            key = matches[0]
+                        result = manager.revoke_api_key(key)
+                        json_response(self, 200, result)
+                    except ValueError:
+                        json_response(self, 404, {"ok": False, "error": "API key not found"})
                     return
                 if self.path == "/api/set-default-account":
                     account_id = str(payload.get("account_id") or "")
                     if not account_id:
                         json_response(self, 400, {"ok": False, "error": "Missing account_id"})
                         return
-                    auth_raw = manager._load_auth_store_raw()
-                    if not isinstance(auth_raw, dict):
-                        auth_raw = {}
-                    accounts = auth_raw.get("accounts") if isinstance(auth_raw.get("accounts"), dict) else {}
-                    if account_id not in accounts:
-                        json_response(self, 400, {"ok": False, "error": f"Account {account_id} not found"})
-                        return
-                    auth_raw["default_account_id"] = account_id
-                    manager.paths.auth_store.write_text(json.dumps(auth_raw, ensure_ascii=False, indent=2), encoding="utf-8")
-                    json_response(self, 200, {"ok": True, "default_account_id": account_id})
+                    try:
+                        result = manager.set_default_account(account_id)
+                        json_response(self, 200, result)
+                    except ValueError as exc:
+                        json_response(self, 400, {"ok": False, "error": str(exc)})
+                    except RuntimeError as exc:
+                        json_response(self, 500, {"ok": False, "error": "Auth store file is corrupted", "detail": str(exc)})
                     return
                 if self.path == "/api/service-control":
                     action = str(payload.get("action") or "")
