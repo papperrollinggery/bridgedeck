@@ -7,6 +7,8 @@ import copy
 import datetime as dt
 import hashlib
 import html
+import logging
+import logging.handlers
 import ipaddress
 import json
 import math
@@ -248,6 +250,37 @@ CODEX_DEVICE_USER_AGENT = "cc-switch-codex-oauth"
 CODEX_OAUTH_FLOW_TTL_SECS = 10 * 60
 
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+_DEFAULT_LOG_PATH = Path.home() / ".cc-switch" / "bridgedeck.log"
+logger = logging.getLogger("bridgedeck")
+logger.setLevel(logging.INFO)
+
+
+def _setup_logging() -> None:
+    if logger.handlers:
+        return
+    _DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        _DEFAULT_LOG_PATH,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+
+# Ensure file handler is attached even when module is imported without main()
+_setup_logging()
+
+
 def now_ts() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
@@ -262,6 +295,7 @@ def load_json(path: Path, fallback: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
+        logger.error("Failed to parse JSON file: %s - %s", path, exc)
         raise RuntimeError(f"Failed to parse JSON file: {path}") from exc
 
 
@@ -945,6 +979,7 @@ def exchange_codex_oauth_code(
     *,
     redirect_uri: str = CODEX_OAUTH_REDIRECT_URI,
 ) -> dict[str, Any]:
+    logger.info("OAuth token exchange starting, redirect_uri=%s", redirect_uri)
     body = urllib.parse.urlencode(
         {
             "grant_type": "authorization_code",
@@ -6537,6 +6572,7 @@ class BridgeManager:
         context_config: dict[str, Any] | None = None,
         model_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        logger.info("Provider switch: account=%s provider=%s set_current=%s", account_id, provider_name, set_current)
         if not account_id.strip():
             raise ValueError("account_id 不能为空")
         if not provider_name.strip():
@@ -6652,6 +6688,7 @@ class BridgeManager:
         provider_name: str,
         set_current: bool = False,
     ) -> dict[str, Any]:
+        logger.info("Provider switch: account=%s provider=%s set_current=%s", account_id, provider_name, set_current)
         if not account_id.strip():
             raise ValueError("account_id 不能为空")
         if not provider_name.strip():
@@ -11996,6 +12033,7 @@ def build_handler(
             threading.Thread(target=stop, daemon=True).start()
 
         def do_GET(self) -> None:
+            logger.debug("GET %s", self.path)
             if not self._valid_host():
                 json_response(self, 403, {"ok": False, "error": "Invalid Host header"})
                 return
@@ -12285,6 +12323,7 @@ def build_handler(
             json_response(self, 404, {"ok": False, "error": "Not Found"})
 
         def do_POST(self) -> None:
+            logger.debug("POST %s", self.path)
             if not self._valid_host():
                 json_response(self, 403, {"ok": False, "error": "Invalid Host header"})
                 return
@@ -12634,6 +12673,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    _setup_logging()
+    logger.info("BridgeDeck starting, version=%s", APP_VERSION)
     args = parse_args()
     if args.install_scan:
         scan = bridge_install_scan(include_tests=bool(args.install_scan_tests))
@@ -12671,6 +12712,7 @@ def main() -> int:
     )
     server = ThreadingHTTPServer((args.host, args.port), handler)
     print(f"BridgeDeck running at http://{args.host}:{args.port}")
+    logger.info("BridgeDeck listening at http://%s:%s", args.host, args.port)
     print(f"db={args.db}")
     print(f"settings={args.settings}")
     print(f"auth_store={args.auth_store}")
