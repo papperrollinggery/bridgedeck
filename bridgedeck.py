@@ -9990,7 +9990,7 @@ INDEX_HTML = """<!doctype html>
       return `${text.slice(0, 8)}...${text.slice(-4)}`;
     }
     function humanPath(value) {
-      return String(value || '').replace(/^\\/Users\\/[^/]+/, '~');
+      return String(value || '').replace(/^\\\/Users\\\/[^\\\/]+/, '~');
     }
     function log(msg) {
       const box = document.getElementById('log');
