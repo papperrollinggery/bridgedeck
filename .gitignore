@@ -18,3 +18,5 @@ ccswitch-*-handoff-*.md
 private-notes/
 .gstack/
 .omc/
+.claude/
+.gitnexus/
