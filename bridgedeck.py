@@ -5,6 +5,7 @@ import argparse
 import base64
 import copy
 import datetime as dt
+import fcntl
 import hashlib
 import html
 import ipaddress
@@ -36,7 +37,7 @@ from typing import Any
 
 DEFAULT_DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
 DEFAULT_SETTINGS_PATH = Path.home() / ".cc-switch" / "settings.json"
-DEFAULT_AUTH_PATH = Path.home() / ".cc-switch" / "codex_oauth_auth.json"
+DEFAULT_AUTH_PATH = Path.home() / ".cc-switch" / "bridgedeck-auth.json"
 DEFAULT_CCSWITCH_COMMON_CONFIG_PATH = Path.home() / ".ccswitch-common-config.json"
 DEFAULT_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 DEFAULT_CLAUDE_INSTALLED_PLUGINS_PATH = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
@@ -3281,41 +3282,48 @@ class BridgeManager:
             raise ValueError("account_id 不能为空")
         if not refresh_token:
             raise ValueError("refresh_token 不能为空")
-        with self._lock:
-            raw = load_json(self.paths.auth_store, {})
-            store = raw if isinstance(raw, dict) else {}
-            accounts = store.get("accounts") if isinstance(store.get("accounts"), dict) else {}
-            next_accounts = copy.deepcopy(accounts)
-            existing = next_accounts.get(account_id) if isinstance(next_accounts.get(account_id), dict) else {}
-            existing_refresh = str(existing.get("refresh_token") or "")
-            existing_email = str(existing.get("email") or "")
-            action = "created" if not existing else ("updated" if existing_refresh != refresh_token or (email and email != existing_email) else "unchanged")
-            authenticated_at = existing.get("authenticated_at") if existing else None
-            if action != "unchanged":
-                authenticated_at = int(time.time())
-            merged = dict(existing)
-            if source:
-                merged["source"] = source
-            next_accounts[account_id] = {
-                **merged,
-                "account_id": account_id,
-                "email": email or existing_email,
-                "refresh_token": refresh_token,
-                "authenticated_at": authenticated_at,
-            }
-            default_account_id = str(store.get("default_account_id") or "")
-            if set_default or not default_account_id:
-                default_account_id = account_id
-            next_store = {
-                "version": 1,
-                "accounts": next_accounts,
-                "default_account_id": default_account_id,
-            }
-            before = json.dumps(store, ensure_ascii=False, sort_keys=True)
-            after = json.dumps(next_store, ensure_ascii=False, sort_keys=True)
-            if before != after:
-                self._backup_file(self.paths.auth_store, f"{source}-oauth")
-                dump_json(self.paths.auth_store, next_store)
+        _auth_lock_path = self.paths.auth_store.with_suffix('.lock')
+        _auth_lock_fd = _auth_lock_path.open('w')
+        try:
+            fcntl.flock(_auth_lock_fd, fcntl.LOCK_EX)
+            with self._lock:
+                raw = load_json(self.paths.auth_store, {})
+                store = raw if isinstance(raw, dict) else {}
+                accounts = store.get("accounts") if isinstance(store.get("accounts"), dict) else {}
+                next_accounts = copy.deepcopy(accounts)
+                existing = next_accounts.get(account_id) if isinstance(next_accounts.get(account_id), dict) else {}
+                existing_refresh = str(existing.get("refresh_token") or "")
+                existing_email = str(existing.get("email") or "")
+                action = "created" if not existing else ("updated" if existing_refresh != refresh_token or (email and email != existing_email) else "unchanged")
+                authenticated_at = existing.get("authenticated_at") if existing else None
+                if action != "unchanged":
+                    authenticated_at = int(time.time())
+                merged = dict(existing)
+                if source:
+                    merged["source"] = source
+                next_accounts[account_id] = {
+                    **merged,
+                    "account_id": account_id,
+                    "email": email or existing_email,
+                    "refresh_token": refresh_token,
+                    "authenticated_at": authenticated_at,
+                }
+                default_account_id = str(store.get("default_account_id") or "")
+                if set_default or not default_account_id:
+                    default_account_id = account_id
+                next_store = {
+                    "version": 1,
+                    "accounts": next_accounts,
+                    "default_account_id": default_account_id,
+                }
+                before = json.dumps(store, ensure_ascii=False, sort_keys=True)
+                after = json.dumps(next_store, ensure_ascii=False, sort_keys=True)
+                if before != after:
+                    self._backup_file(self.paths.auth_store, f"{source}-oauth")
+                    dump_json(self.paths.auth_store, next_store)
+        finally:
+            fcntl.flock(_auth_lock_fd, fcntl.LOCK_UN)
+            _auth_lock_fd.close()
         return {
             "account_id": account_id,
             "email": email or existing_email,
@@ -4092,14 +4100,21 @@ class BridgeManager:
 
     def set_default_account(self, account_id: str) -> dict[str, Any]:
         """Set the default account. Raises ValueError if not found, RuntimeError if store corrupt."""
-        with self._lock:
-            raw = load_json(self.paths.auth_store, {})
-            store = raw if isinstance(raw, dict) else {}
-            accounts = store.get("accounts") if isinstance(store.get("accounts"), dict) else {}
-            if account_id not in accounts:
-                raise ValueError(f"Account {account_id} not found")
-            store["default_account_id"] = account_id
-            dump_json(self.paths.auth_store, store)
+        _auth_lock_path = self.paths.auth_store.with_suffix('.lock')
+        _auth_lock_fd = _auth_lock_path.open('w')
+        try:
+            fcntl.flock(_auth_lock_fd, fcntl.LOCK_EX)
+            with self._lock:
+                raw = load_json(self.paths.auth_store, {})
+                store = raw if isinstance(raw, dict) else {}
+                accounts = store.get("accounts") if isinstance(store.get("accounts"), dict) else {}
+                if account_id not in accounts:
+                    raise ValueError(f"Account {account_id} not found")
+                store["default_account_id"] = account_id
+                dump_json(self.paths.auth_store, store)
+        finally:
+            fcntl.flock(_auth_lock_fd, fcntl.LOCK_UN)
+            _auth_lock_fd.close()
         return {"ok": True, "default_account_id": account_id}
 
     def aimami_export_preview(self) -> dict[str, Any]:

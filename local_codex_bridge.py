@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
 import copy
 import errno
 import gzip
@@ -32,7 +33,11 @@ except Exception:  # noqa: BLE001
     zstd = None  # type: ignore[assignment]
 
 
-AUTH_STORE_PATH = Path.home() / ".cc-switch" / "codex_oauth_auth.json"
+AUTH_STORE_PATH = Path.home() / ".cc-switch" / "bridgedeck-auth.json"
+# BridgeDeck reads AiMaMi/Codex token snapshots before doing its own refresh.
+# This prevents refresh_token_reused errors caused by multiple apps refreshing
+# the same OpenAI account simultaneously. See CLAUDE.md "Token Management Architecture".
+CODEX_SNAPSHOT_DIR = Path.home() / ".codex" / "accounts" / "snapshots"
 CC_SWITCH_DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
 DEFAULT_API_KEYS_PATH = Path.home() / ".cc-switch" / "bridgedeck-keys.json"
 OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -1701,6 +1706,10 @@ class AuthStore:
         self._token_cache: dict[str, CachedToken] = {}
         self._session_affinity: dict[str, str] = {}
 
+    def invalidate_cache(self, account_id: str) -> None:
+        """Drop a cached token so the next request fetches a fresh one."""
+        self._token_cache.pop(account_id, None)
+
     def load(self) -> tuple[dict[str, AccountRecord], str | None]:
         try:
             raw = json.loads(self.path.read_text())
@@ -1750,6 +1759,40 @@ class AuthStore:
             if tmp.exists():
                 tmp.unlink()
 
+    @staticmethod
+    def _jwt_exp(token: str) -> float | None:
+        """Extract expiry timestamp from JWT access_token without verification."""
+        try:
+            parts = token.split(".")
+            if len(parts) < 2:
+                return None
+            payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=="))
+            return float(payload.get("exp", 0))
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _try_load_codex_snapshot(account_id: str) -> CachedToken | None:
+        """Try to load a fresh access_token from AiMaMi/Codex snapshot files."""
+        if not CODEX_SNAPSHOT_DIR.is_dir():
+            return None
+        for entry in CODEX_SNAPSHOT_DIR.iterdir():
+            if not entry.name.endswith(f"__{account_id}.json"):
+                continue
+            try:
+                data = json.loads(entry.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            tokens = data.get("tokens", {})
+            access_token = tokens.get("access_token")
+            if not access_token:
+                continue
+            expires_at = AuthStore._jwt_exp(access_token)
+            if not expires_at or (expires_at - time.time()) < TOKEN_REFRESH_BUFFER_SECS:
+                continue
+            return CachedToken(token=access_token, expires_at=expires_at)
+        return None
+
     def get_access_token(self, requested_account_id: str | None) -> tuple[str, str]:
         lock_path = self.path.with_suffix(".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1765,6 +1808,12 @@ class AuthStore:
                 cached = self._token_cache.get(account_id)
                 if cached and not cached.is_expiring_soon():
                     return account_id, cached.token
+
+                # Try AiMaMi/Codex snapshot before triggering our own refresh
+                snapshot_token = self._try_load_codex_snapshot(account_id)
+                if snapshot_token:
+                    self._token_cache[account_id] = snapshot_token
+                    return account_id, snapshot_token.token
 
                 record = accounts[account_id]
                 token_data = self._refresh_token(record.refresh_token)
@@ -1859,14 +1908,9 @@ class AuthStore:
                 last_exc = exc
                 if attempt < _TOKEN_REFRESH_MAX_RETRIES - 1:
                     backoff = 2 ** attempt
-                    logger.warning(
-                        "token_refresh_retry",
-                        extra={
-                            "attempt": attempt + 1,
-                            "max_retries": _TOKEN_REFRESH_MAX_RETRIES,
-                            "backoff_seconds": backoff,
-                            "error": upstream_exception_detail(exc),
-                        },
+                    print(
+                        f"{log_timestamp()} [token-refresh-retry] attempt={attempt + 1}/{_TOKEN_REFRESH_MAX_RETRIES} backoff={backoff}s error={upstream_exception_detail(exc)}",
+                        file=sys.stderr,
                     )
                     time.sleep(backoff)
                     continue
@@ -3618,6 +3662,14 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                                         file=sys.stderr,
                                     )
                                     break
+                            if response.status_code == 401:
+                                self.server.auth_store.invalidate_cache(account_id)
+                                if has_next_account:
+                                    print(
+                                        f"{log_timestamp()} [bridge-account-failover] request_id={request_id} from_account={account_id} reason=HTTP 401 (token invalidated)",
+                                        file=sys.stderr,
+                                    )
+                                    break
                             body = error_body if error_body is not None else b""
                             self._send_upstream_headers(response, is_stream=is_stream, content_length=len(body))
                             self._write_bytes(body, flush=True)
@@ -3897,6 +3949,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         maybe_record_active_stream("open", force=True)
 
         try:
+            heartbeat: bytes | None = None
             while True:
                 timeout = self._reasoning_placeholder_timeout(state)
                 poll_timeout = timeout if timeout is not None else STREAM_IDLE_LOG_SECS
