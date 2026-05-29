@@ -1709,6 +1709,20 @@ def mask_url_credentials(value: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, f"<redacted>@{host}{port}", parsed.path, parsed.query, parsed.fragment))
 
 
+def _launcher_app_status() -> dict[str, Any]:
+    app_path = Path("/Applications/BridgeDeck.app")
+    installed = app_path.exists()
+    running = False
+    if installed:
+        proc = run_quiet(["/bin/ps", "-axo", "pid,command"], timeout=2)
+        if proc and proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                if "BridgeDeck" in line and "bridgedeck.py" not in line:
+                    running = True
+                    break
+    return {"installed": installed, "running": running}
+
+
 def run_quiet(args: list[str], *, timeout: float = 3) -> subprocess.CompletedProcess[str] | None:
     try:
         return subprocess.run(args, check=False, capture_output=True, text=True, timeout=timeout)
@@ -2748,6 +2762,7 @@ class BridgeManager:
         self._load_oauth_flows()
         self._oauth_callback_server: ThreadingHTTPServer | None = None
         self._oauth_callback_thread: threading.Thread | None = None
+        self._usage_events_watermark: set[str] = set()
 
     def _backup_file(self, path: Path, label: str) -> str | None:
         if not path.exists():
@@ -2762,6 +2777,7 @@ class BridgeManager:
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.paths.db))
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -2772,6 +2788,111 @@ class BridgeManager:
             yield conn
         finally:
             conn.close()
+
+    def _ensure_usage_daily_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS usage_daily ("
+            " date TEXT NOT NULL,"
+            " provider TEXT NOT NULL DEFAULT '',"
+            " requests INTEGER NOT NULL DEFAULT 0,"
+            " tokens INTEGER NOT NULL DEFAULT 0,"
+            " PRIMARY KEY (date, provider)"
+            ")"
+        )
+        conn.commit()
+
+    def _record_usage_daily(self, events: list[dict[str, Any]]) -> None:
+        if not events:
+            return
+        # Per-event watermark: only record events not yet processed
+        new_events: list[dict[str, Any]] = []
+        for ev in events:
+            ev_id = ev.get("request_id") or f"{ev.get('at', 0)}_{ev.get('total_tokens', 0)}_{ev.get('account_id', '')}"
+            if ev_id and ev_id not in self._usage_events_watermark:
+                new_events.append(ev)
+        if not new_events:
+            return
+        bucket: dict[tuple[str, str], dict[str, int]] = {}
+        for ev in new_events:
+            ts = safe_int(ev.get("at"), 0)
+            if ts <= 0:
+                continue
+            day = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).strftime("%Y-%m-%d")
+            provider = str(ev.get("account_id") or ev.get("source") or "unknown")
+            key = (day, provider)
+            if key not in bucket:
+                bucket[key] = {"requests": 0, "tokens": 0}
+            bucket[key]["requests"] += 1
+            bucket[key]["tokens"] += safe_int(ev.get("total_tokens"), 0)
+        if not bucket:
+            return
+        try:
+            with self._managed_connect() as conn:
+                self._ensure_usage_daily_table(conn)
+                for (day, provider), vals in bucket.items():
+                    conn.execute(
+                        "INSERT INTO usage_daily (date, provider, requests, tokens) "
+                        "VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(date, provider) DO UPDATE SET "
+                        " requests = usage_daily.requests + excluded.requests,"
+                        " tokens = usage_daily.tokens + excluded.tokens",
+                        (day, provider, vals["requests"], vals["tokens"]),
+                    )
+                conn.commit()
+            # Mark events as processed (after successful DB write)
+            for ev in new_events:
+                ev_id = ev.get("request_id") or f"{ev.get('at', 0)}_{ev.get('total_tokens', 0)}_{ev.get('account_id', '')}"
+                if ev_id:
+                    self._usage_events_watermark.add(ev_id)
+            # Cap watermark size to prevent unbounded growth
+            if len(self._usage_events_watermark) > 1000:
+                self._usage_events_watermark = set(list(self._usage_events_watermark)[-500:])
+        except Exception:  # noqa: BLE001
+            logger.debug("usage_daily record failed", exc_info=True)
+
+    def _query_usage_daily(self, days: int = 28) -> list[dict[str, Any]]:
+        cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).strftime("%Y-%m-%d")
+        try:
+            with self._managed_connect() as conn:
+                self._ensure_usage_daily_table(conn)
+                rows = conn.execute(
+                    "SELECT date, SUM(requests) AS requests, SUM(tokens) AS tokens "
+                    "FROM usage_daily WHERE date >= ? "
+                    "GROUP BY date ORDER BY date",
+                    (cutoff,),
+                ).fetchall()
+                return [{"date": str(r["date"]), "requests": int(r["requests"]), "tokens": int(r["tokens"])} for r in rows]
+        except Exception:  # noqa: BLE001
+            logger.debug("usage_daily query failed", exc_info=True)
+            return []
+
+    def _query_usage_monthly_summary(self) -> dict[str, Any]:
+        now = dt.datetime.now(dt.timezone.utc)
+        month_start = now.strftime("%Y-%m-01")
+        try:
+            with self._managed_connect() as conn:
+                self._ensure_usage_daily_table(conn)
+                rows = conn.execute(
+                    "SELECT provider, SUM(requests) AS requests, SUM(tokens) AS tokens "
+                    "FROM usage_daily WHERE date >= ? "
+                    "GROUP BY provider ORDER BY SUM(requests) DESC",
+                    (month_start,),
+                ).fetchall()
+                providers = [
+                    {"provider": str(r["provider"]), "requests": int(r["requests"]), "tokens": int(r["tokens"])}
+                    for r in rows
+                ]
+                total_requests = sum(p["requests"] for p in providers)
+                total_tokens = sum(p["tokens"] for p in providers)
+                return {
+                    "month": now.strftime("%Y-%m"),
+                    "total_requests": total_requests,
+                    "total_tokens": total_tokens,
+                    "providers": providers,
+                }
+        except Exception:  # noqa: BLE001
+            logger.debug("usage_monthly_summary query failed", exc_info=True)
+            return {"month": now.strftime("%Y-%m"), "total_requests": 0, "total_tokens": 0, "providers": []}
 
     def _cleanup_oauth_flows(self) -> None:
         cutoff = time.time() - CODEX_OAUTH_FLOW_TTL_SECS
@@ -6470,6 +6591,38 @@ class BridgeManager:
             "unknown_count": sum(1 for item in sources if item.get("status") == "unknown"),
         }
 
+    # -- Coding tools detection (cached 5 minutes, binary-only via shutil.which) --
+    _coding_tools_cache: dict[str, Any] = {}
+    _coding_tools_cache_ts: float = 0.0
+    _CODING_TOOLS_CACHE_TTL = 300.0  # 5 minutes
+
+    _CODING_TOOLS_SPEC: tuple[tuple[str, str, str], ...] = (
+        ("claude", "claude", "Claude Code"),
+        ("codex", "codex", "Codex CLI"),
+        ("opencode", "opencode", "OpenCode"),
+        ("gemini", "gemini", "Gemini CLI"),
+        ("cursor", "cursor", "Cursor"),
+    )
+
+    @classmethod
+    def _detect_coding_tools(cls) -> list[dict[str, Any]]:
+        now = time.time()
+        if cls._coding_tools_cache and (now - cls._coding_tools_cache_ts) < cls._CODING_TOOLS_CACHE_TTL:
+            return cls._coding_tools_cache.get("tools", [])
+        tools: list[dict[str, Any]] = []
+        for binary, key, label in cls._CODING_TOOLS_SPEC:
+            path = which(binary)
+            tools.append({
+                "key": key,
+                "name": label,
+                "binary": binary,
+                "installed": path is not None,
+                "path": path or "",
+            })
+        cls._coding_tools_cache = {"tools": tools}
+        cls._coding_tools_cache_ts = now
+        return tools
+
     def snapshot(self, include_secrets: bool = False) -> dict[str, Any]:
         try:
             plugin_sync = self.sync_claude_enabled_plugins()
@@ -6508,8 +6661,11 @@ class BridgeManager:
             "codex_desktop": self._codex_desktop_status(),
             "current_codex_launcher": self._current_codex_launcher_status(),
             "omc_codex_shim": self._omc_codex_shim_status(),
+            "launcher_app": _launcher_app_status(),
             "usage_metrics": local_bridge_state.get("usage_metrics", {}),
             "usage_events": local_bridge_state.get("usage_events", []),
+            "usage_daily": self._query_usage_daily(28),
+            "usage_monthly_summary": self._query_usage_monthly_summary(),
             "active_stream": local_bridge_state.get("active_stream", {}),
             "stream_diagnostics": stream_diagnostics,
             "claude_hook_risks": hook_risks,
@@ -6522,6 +6678,7 @@ class BridgeManager:
             "plugin_status": plugin_status,
             "claude_attribution_header": self.claude_attribution_header_status(),
             "ccswitch_315": {},
+            "coding_tools": self._detect_coding_tools(),
         }
 
         if not self.paths.db.exists():
@@ -8324,6 +8481,53 @@ def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[st
     handler.wfile.write(body)
 
 
+# ---- lightweight input validation helpers ----
+
+_MAX_LEN_ID = 512          # provider_id / account_id / flow_id
+_MAX_LEN_NAME = 1024       # provider_name / label / profile_name
+_MAX_LEN_PATH = 4096       # target_dir
+_MAX_LEN_TOKEN = 10240     # code / code_or_url (~10 KB)
+_MAX_LEN_SHORT = 256       # mode / action / strategy
+_MAX_DICT_KEYS = 50        # compact_config / context_config / model_config
+_MAX_LIST_LEN = 200        # account_ids
+
+
+def _require_str(payload: dict, key: str, *, max_len: int = _MAX_LEN_ID) -> str | None:
+    """Return validated string value, or error message string on failure."""
+    val = payload.get(key)
+    if val is None or (isinstance(val, str) and not val.strip()):
+        return f"输入验证失败: {key} 不能为空"
+    if not isinstance(val, str):
+        return f"输入验证失败: {key} 必须是字符串"
+    if len(val) > max_len:
+        return f"输入验证失败: {key} 长度超出限制 ({len(val)} > {max_len})"
+    return None
+
+
+def _validate_dict_field(payload: dict, key: str, *, max_keys: int = _MAX_DICT_KEYS) -> str | None:
+    """Validate an optional dict field. Returns error message or None."""
+    val = payload.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, dict):
+        return f"输入验证失败: {key} 必须是对象"
+    if len(val) > max_keys:
+        return f"输入验证失败: {key} 键数量超出限制 ({len(val)} > {max_keys})"
+    return None
+
+
+def _validate_list_field(payload: dict, key: str, *, max_len: int = _MAX_LIST_LEN) -> str | None:
+    """Validate an optional list field. Returns error message or None."""
+    val = payload.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, list):
+        return f"输入验证失败: {key} 必须是数组"
+    if len(val) > max_len:
+        return f"输入验证失败: {key} 长度超出限制 ({len(val)} > {max_len})"
+    return None
+
+
 INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -8556,6 +8760,18 @@ INDEX_HTML = """<!doctype html>
     .overviewLabel { color:var(--muted); font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.02em; }
     .overviewMain { font-size:17px; font-weight:600; overflow-wrap:anywhere; color:var(--apple-ink); }
     .overviewMeta { color:var(--muted); font-size:12px; line-height:1.45; overflow-wrap:anywhere; }
+    .launcherTip { border:1px solid var(--apple-hairline); border-radius:var(--radius-3); padding:16px; background:var(--apple-canvas); margin-top:12px; display:grid; gap:12px; }
+    .launcherTip.ok { border-color:#b5e8cd; background:linear-gradient(135deg, #f0faf4 0%, var(--apple-canvas) 100%); }
+    .launcherTip.warn { border-color:#ffe0a3; background:linear-gradient(135deg, #fffbeb 0%, var(--apple-canvas) 100%); }
+    .launcherTipHead { display:flex; align-items:center; gap:10px; }
+    .launcherTipIcon { width:34px; height:34px; border-radius:var(--radius-2); display:grid; place-items:center; font-size:17px; }
+    .launcherTipIcon.ok { background:#e8f8ed; color:var(--ok); }
+    .launcherTipIcon.warn { background:#fff8eb; color:var(--warn); }
+    .launcherTipTitle { font-size:15px; font-weight:600; color:var(--apple-ink); }
+    .launcherTipDesc { color:var(--muted); font-size:12px; line-height:1.5; }
+    .launcherQuickOps { display:grid; grid-template-columns:repeat(auto-fill, minmax(180px, 1fr)); gap:8px; margin-top:4px; }
+    .launcherQuickOps button { min-height:36px; font-weight:600; font-size:12px; text-align:left; padding:8px 12px; display:flex; align-items:center; gap:6px; }
+    .launcherQuickOps .opIcon { font-size:14px; flex:0 0 auto; }
     .taskList { display:grid; gap:8px; }
     .taskItem { border:1px solid var(--apple-hairline); border-radius:var(--radius-2); padding:10px 12px; background:var(--apple-pearl); color:var(--soft); font-size:12px; line-height:1.45; }
     .taskItem.bad { border-color:#ffc9c9; background:#fff5f5; color:var(--bad); }
@@ -8563,6 +8779,18 @@ INDEX_HTML = """<!doctype html>
     .taskItem.ok { border-color:#b5e8cd; background:#f0faf4; color:#1b8a3e; }
     .quickActions { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
     .quickActions button { min-height:40px; font-weight:600; }
+    .codingToolsGrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr)); gap:10px; margin-top:12px; }
+    .codingToolCard { border:1px solid var(--apple-hairline); border-radius:var(--radius-3); padding:14px; background:var(--apple-canvas); display:grid; gap:6px; align-content:center; min-height:80px; text-align:center; transition:border-color .15s, background .15s; }
+    .codingToolCard.installed { border-color:#b5e8cd; background:linear-gradient(135deg, #f0faf4 0%, var(--apple-canvas) 100%); }
+    .codingToolCard.missing { border-color:var(--apple-hairline); opacity:.65; }
+    .codingToolIcon { font-size:20px; line-height:1; }
+    .codingToolIcon.ok { color:var(--ok); }
+    .codingToolIcon.muted { color:var(--muted); }
+    .codingToolName { font-size:13px; font-weight:600; color:var(--apple-ink); }
+    .codingToolStatus { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.02em; }
+    .codingToolStatus.ok { color:var(--ok); }
+    .codingToolStatus.muted { color:var(--muted); }
+    .codingToolPath { font-size:10px; color:var(--muted); font-family:ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .summaryGrid, .splitGrid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; }
     .recommend { margin-top:10px; padding:12px; border:1px solid var(--apple-hairline); border-radius:var(--radius-2); background:var(--apple-pearl); line-height:1.55; font-size:14px; }
     .recommend.okState { border-color:#b5e8cd; background:#f0faf4; }
@@ -8615,6 +8843,25 @@ INDEX_HTML = """<!doctype html>
     .quotaProgress.bad::-webkit-progress-value { background:var(--bad); }
     .quotaProgress::-moz-progress-bar { border-radius:var(--radius-round); background:var(--ok); }
     .quotaWindows { color:var(--muted); font-size:12px; line-height:1.45; }
+    .rlBarWrap { margin-top:14px; padding:14px; border:1px solid var(--apple-hairline); border-radius:var(--radius-2); background:var(--apple-pearl); }
+    .rlBarWrap.hidden { display:none; }
+    .rlBarTitle { font-size:12px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:10px; }
+    .rlBarItem { display:grid; gap:4px; margin-bottom:8px; }
+    .rlBarItem:last-child { margin-bottom:0; }
+    .rlBarMeta { display:flex; justify-content:space-between; align-items:center; font-size:12px; color:var(--muted); }
+    .rlBarMeta strong { color:var(--text); }
+    .rlBarTrack { width:100%; height:6px; border-radius:var(--radius-round); background:var(--apple-parchment); overflow:hidden; position:relative; }
+    .rlBarFill { height:100%; border-radius:var(--radius-round); transition:width .4s cubic-bezier(.16,1,.3,1); will-change:width; }
+    .rlBarFill.ok { background:var(--ok); }
+    .rlBarFill.warn { background:var(--warn); }
+    .rlBarFill.bad { background:var(--bad); }
+    .rlBarAlert { display:inline-flex; align-items:center; gap:5px; margin-top:6px; font-size:11px; font-weight:600; padding:3px 10px; border-radius:var(--radius-round); border:1px solid; }
+    .rlBarAlert.warn { border-color:#ffe0a3; background:#fffbeb; color:#b35c00; }
+    .rlBarAlert.bad { border-color:#ffc9c9; background:#fff5f5; color:var(--bad); }
+    .rlThresholdRow { display:flex; gap:10px; align-items:center; margin-top:10px; flex-wrap:wrap; }
+    .rlThresholdRow label { font-size:12px; color:var(--muted); display:flex; align-items:center; gap:5px; }
+    .rlThresholdRow input[type="number"] { width:60px; min-width:0; padding:5px 8px; font-size:12px; text-align:center; }
+    .rlThresholdRow .miniBtn { font-size:11px; padding:4px 12px; }
     .servicePanel { border-top:1px solid var(--apple-divider); margin-top:12px; padding-top:12px; }
     .serviceGrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin-top:8px; }
     .serviceItem { min-height:84px; }
@@ -8658,9 +8905,76 @@ INDEX_HTML = """<!doctype html>
       .topBar { flex-direction:column; }
       input, select { min-width:0; width:100%; }
     }
+    /* Toast notification component */
+    .toast-container {
+      position:fixed; top:16px; right:16px; z-index:9999;
+      display:flex; flex-direction:column; gap:8px;
+      pointer-events:none; max-width:380px;
+    }
+    .toast {
+      pointer-events:auto;
+      padding:12px 18px; border-radius:12px;
+      background:rgba(255,255,255,0.72);
+      -webkit-backdrop-filter:blur(20px) saturate(180%);
+      backdrop-filter:blur(20px) saturate(180%);
+      box-shadow:0 2px 12px rgba(0,0,0,0.08), 0 0 0 1px var(--apple-hairline);
+      font-size:14px; line-height:1.4; color:var(--apple-ink);
+      transform:translateX(120%); opacity:0;
+      transition:transform .35s cubic-bezier(.16,1,.3,1), opacity .35s cubic-bezier(.16,1,.3,1);
+      will-change:transform, opacity;
+      display:flex; align-items:center; gap:10px;
+    }
+    .toast.visible { transform:translateX(0); opacity:1; }
+    .toast.leaving { transform:translateX(120%); opacity:0; }
+    .toast-icon { flex-shrink:0; width:20px; height:20px; border-radius:50%; display:grid; place-items:center; font-size:12px; font-weight:700; color:#fff; }
+    .toast[data-type="success"] .toast-icon { background:var(--ok); }
+    .toast[data-type="warning"] .toast-icon { background:var(--warn); }
+    .toast[data-type="error"] .toast-icon { background:var(--bad); }
+    .toast[data-type="info"] .toast-icon { background:var(--brand); }
+    .toast[data-type="success"] { border-left:3px solid var(--ok); }
+    .toast[data-type="warning"] { border-left:3px solid var(--warn); }
+    .toast[data-type="error"] { border-left:3px solid var(--bad); }
+    .toast[data-type="info"] { border-left:3px solid var(--brand); }
+    @media (max-width:480px) {
+      .toast-container { top:8px; right:8px; left:8px; max-width:none; }
+    }
+    /* Usage trend sparkline */
+    .trendCard { margin:12px 0; border:1px solid var(--apple-hairline); border-radius:var(--radius-3); background:var(--apple-canvas); padding:16px; display:grid; gap:10px; }
+    .trendHeader { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .trendTitle { font-weight:600; font-size:14px; color:var(--apple-ink); }
+    .trendSummary { display:flex; gap:16px; font-size:12px; color:var(--muted); }
+    .trendSummary strong { color:var(--text); }
+    .trendCanvasWrap { position:relative; width:100%; height:120px; }
+    .trendCanvas { width:100%; height:100%; display:block; border-radius:var(--radius-2); }
+    .trendEmpty { color:var(--muted); font-size:13px; line-height:1.5; padding:12px 0; }
+    @media (max-width:768px) {
+      .trendCanvasWrap { height:90px; }
+    }
+    /* Monthly usage summary */
+    .monthlyUsageCard { margin:12px 0; border:1px solid var(--apple-hairline); border-radius:var(--radius-3); background:var(--apple-canvas); padding:16px; display:grid; gap:12px; }
+    .monthlyUsageHeader { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .monthlyUsageTitle { font-weight:600; font-size:14px; color:var(--apple-ink); }
+    .monthlyUsageMetrics { display:flex; gap:20px; }
+    .monthlyUsageMetric { display:flex; flex-direction:column; align-items:center; gap:2px; }
+    .monthlyUsageMetricValue { font-size:18px; font-weight:700; color:var(--text); letter-spacing:-0.3px; }
+    .monthlyUsageMetricLabel { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.3px; }
+    .providerBarWrap { display:flex; flex-direction:column; gap:8px; }
+    .providerBarTrack { display:flex; height:24px; border-radius:6px; overflow:hidden; background:var(--apple-hairline); }
+    .providerBarSegment { min-width:3px; transition:flex 0.3s ease; position:relative; }
+    .providerBarSegment:hover { opacity:0.85; }
+    .providerBarLegend { display:flex; flex-wrap:wrap; gap:10px 16px; font-size:12px; }
+    .providerBarLegendItem { display:flex; align-items:center; gap:5px; color:var(--muted); }
+    .providerBarLegendItem strong { color:var(--text); font-weight:600; }
+    .providerBarLegendSwatch { width:10px; height:10px; border-radius:3px; flex-shrink:0; }
+    .monthlyUsageEmpty { color:var(--muted); font-size:13px; line-height:1.5; padding:8px 0; text-align:center; }
+    @media (max-width:768px) {
+      .monthlyUsageMetrics { gap:14px; }
+      .monthlyUsageMetricValue { font-size:15px; }
+    }
   </style>
 </head>
 <body>
+  <div class="toast-container" aria-live="polite" role="alert"></div>
   <div class="wrap">
     <div class="appShell">
       <aside class="appSidebar">
@@ -8769,6 +9083,12 @@ INDEX_HTML = """<!doctype html>
                 <div id="overviewOmniMeta" class="overviewMeta">-</div>
               </div>
             </div>
+            <div class="panel mt10">
+              <h2>已安装编码工具</h2>
+              <div class="sectionHint">自动检测 PATH 中的编码工具，结果缓存 5 分钟。</div>
+              <div id="codingToolsGrid" class="codingToolsGrid"><div class="codingToolCard"><span class="codingToolIcon muted">⏳</span><span class="codingToolName">检测中...</span></div></div>
+            </div>
+            <div id="launcherTipCard" class="launcherTip"></div>
             <div id="recommendation" class="recommend">加载中...</div>
             <div class="summaryGrid mt10">
               <div class="panel">
@@ -8795,6 +9115,27 @@ INDEX_HTML = """<!doctype html>
                   <button class="miniBtn" data-page="diagnostics">状态矩阵</button>
                 </div>
               </div>
+            <div class="monthlyUsageCard" id="monthlyUsageCard">
+              <div class="monthlyUsageHeader">
+                <span class="monthlyUsageTitle" id="monthlyUsageTitle">本月用量摘要</span>
+                <div class="monthlyUsageMetrics">
+                  <div class="monthlyUsageMetric">
+                    <span class="monthlyUsageMetricValue" id="monthlyUsageRequests">0</span>
+                    <span class="monthlyUsageMetricLabel">请求数</span>
+                  </div>
+                  <div class="monthlyUsageMetric">
+                    <span class="monthlyUsageMetricValue" id="monthlyUsageTokens">0</span>
+                    <span class="monthlyUsageMetricLabel">Token</span>
+                  </div>
+                </div>
+              </div>
+              <div class="providerBarWrap" id="monthlyProviderBarWrap">
+                <div class="providerBarTrack" id="monthlyProviderBarTrack"></div>
+                <div class="providerBarLegend" id="monthlyProviderBarLegend"></div>
+              </div>
+              <div class="monthlyUsageEmpty" id="monthlyUsageEmpty" style="display:none;">本月暂无 Bridge 用量数据；首次 LLM 请求后将自动记录。</div>
+            </div>
+            <div class="summaryGrid mt10">
               <div class="panel">
                 <h2>Claude 插件启用态</h2>
                 <div id="pluginSyncStatus" class="sectionHint">插件同步检测中...</div>
@@ -8839,6 +9180,11 @@ INDEX_HTML = """<!doctype html>
                 <div class="hudStat"><div class="hudStatLabel">缓存写入</div><div id="usageHudCacheWrite" class="hudStatValue">-</div></div>
                 <div class="hudStat"><div class="hudStatLabel">命中缓存</div><div id="usageHudCacheRead" class="hudStatValue">-</div></div>
                 <div class="hudStat"><div class="hudStatLabel">未命中缓存</div><div id="usageHudCacheMiss" class="hudStatValue">-</div></div>
+              </div>
+              <div id="rlBarWrap" class="rlBarWrap hidden">
+                <div class="rlBarTitle">Rate Limit 用量</div>
+                <div id="rlBarList"></div>
+                <div id="rlBarAlert"></div>
               </div>
             </div>
             <div class="usageControls">
@@ -8983,6 +9329,17 @@ INDEX_HTML = """<!doctype html>
             </div>
             <div class="card guideSection" data-guide="quota">
               <div id="quotaBoard" class="quotaBar">额度加载中...</div>
+              <div class="trendCard" id="usageTrendCard">
+                <div class="trendHeader">
+                  <span class="trendTitle">28 天用量趋势</span>
+                  <div class="trendSummary">
+                    <span>请求 <strong id="trendTotalReqs">-</strong></span>
+                    <span>Token <strong id="trendTotalTokens">-</strong></span>
+                  </div>
+                </div>
+                <div class="trendCanvasWrap"><canvas id="usageTrendCanvas" class="trendCanvas"></canvas></div>
+                <div class="trendEmpty" id="usageTrendEmpty" style="display:none;">暂无持久化用量数据；数据将在首次 LLM 请求后自动记录。</div>
+              </div>
               <div class="toggleLine">
                 <label><input type="checkbox" id="autoSwitchEnabled"> OpenAI 自动切换</label>
                 <label><input type="checkbox" id="autoSwitchClaude" checked> 自动切 Claude Code</label>
@@ -8997,6 +9354,12 @@ INDEX_HTML = """<!doctype html>
               </div>
               <div id="missingBridgeStatus" class="muted mt10">新账号检测中...</div>
               <div id="autoSwitchStatus" class="muted mt10">未运行</div>
+              <div class="rlThresholdRow">
+                <span class="muted">Rate Limit 告警阈值：</span>
+                <label>告警 <input type="number" id="rlWarnThreshold" min="1" max="100" value="80">%</label>
+                <label>阻断提示 <input type="number" id="rlBlockThreshold" min="1" max="100" value="100">%</label>
+                <button class="miniBtn" data-action="save-rl-thresholds">保存阈值</button>
+              </div>
             </div>
             <div class="card guideSection" id="aimamiSyncPanel" data-guide="aimamiSync">
               <h2>AiMaMi 同步</h2>
@@ -9469,6 +9832,7 @@ INDEX_HTML = """<!doctype html>
     let tokenVisible = false;
     let lastAccounts = [];
     let activeOAuthFlowId = '';
+    let lastQuotaData = null;
     let oauthPollTimer = null;
     let oauthExpiryTimer = null;
     let activeOAuthExpiresAt = '';
@@ -9759,6 +10123,24 @@ INDEX_HTML = """<!doctype html>
       const el = document.getElementById(id);
       if (el) el.textContent = value;
     }
+    function renderCodingTools(data) {
+      const grid = document.getElementById('codingToolsGrid');
+      if (!grid) return;
+      const tools = data.coding_tools || [];
+      if (!tools.length) {
+        grid.innerHTML = '<div class="codingToolCard"><span class="codingToolIcon muted">-</span><span class="codingToolName">无数据</span></div>';
+        return;
+      }
+      grid.innerHTML = tools.map((t) => {
+        const icon = t.installed ? '&#10003;' : '&#10005;';
+        const iconCls = t.installed ? 'ok' : 'muted';
+        const cardCls = t.installed ? 'installed' : 'missing';
+        const statusText = t.installed ? '已安装' : '未检测到';
+        const statusCls = t.installed ? 'ok' : 'muted';
+        const pathLine = t.installed && t.path ? `<div class="codingToolPath" title="${esc(t.path)}">${esc(humanPath(t.path))}</div>` : '';
+        return `<div class="codingToolCard ${cardCls}"><span class="codingToolIcon ${iconCls}">${icon}</span><span class="codingToolName">${esc(t.name)}</span><span class="codingToolStatus ${statusCls}">${statusText}</span>${pathLine}</div>`;
+      }).join('');
+    }
     function renderOverviewDashboard(data) {
       const codexProviders = data.codex_providers || [];
       const mismatchedProviders = codexProviders.filter((provider) => provider.token_mismatch);
@@ -9807,6 +10189,23 @@ INDEX_HTML = """<!doctype html>
       if (taskBox) {
         taskBox.innerHTML = tasks.map((item) => `<div class="taskItem ${item.cls}">${esc(item.text)}</div>`).join('');
       }
+
+      renderLauncherTip(data);
+    }
+    function renderLauncherTip(data) {
+      const card = document.getElementById('launcherTipCard');
+      if (!card) return;
+      const app = data.launcher_app || {};
+      if (app.running) {
+        card.className = 'launcherTip ok';
+        card.innerHTML = `<div class="launcherTipHead"><div class="launcherTipIcon ok">&#9989;</div><div class="launcherTipTitle">菜单栏 Launcher 运行中</div></div><div class="launcherTipDesc">BridgeDeck 菜单栏快捷入口已就绪，可直接操作。</div><div class="launcherQuickOps"><button class="miniBtn" data-page="switching"><span class="opIcon">&#8644;</span>入口切换</button><button class="miniBtn" data-page="quota"><span class="opIcon">&#9201;</span>额度详情</button><button class="miniBtn" data-page="diagnostics"><span class="opIcon">&#9881;</span>账号矩阵</button><button class="miniBtn" data-page="services"><span class="opIcon">&#9654;</span>服务状态</button><button class="miniBtn" data-action="install-scan"><span class="opIcon">&#10003;</span>安装扫描</button><button class="miniBtn" data-action="refresh"><span class="opIcon">&#8635;</span>刷新状态</button></div>`;
+      } else if (app.installed) {
+        card.className = 'launcherTip warn';
+        card.innerHTML = `<div class="launcherTipHead"><div class="launcherTipIcon warn">&#9888;</div><div class="launcherTipTitle">BridgeDeck 已安装，Launcher 未运行</div></div><div class="launcherTipDesc">打开 /Applications/BridgeDeck.app 启动菜单栏快捷入口，即可在菜单栏快速切换账号、查看额度。</div><div class="launcherQuickOps"><button class="miniBtn" onclick="window.open('bridge-deck://open')"><span class="opIcon">&#9654;</span>启动 Launcher</button><button class="miniBtn" data-page="services"><span class="opIcon">&#9654;</span>服务状态</button></div>`;
+      } else {
+        card.className = 'launcherTip warn';
+        card.innerHTML = `<div class="launcherTipHead"><div class="launcherTipIcon warn">&#128229;</div><div class="launcherTipTitle">安装 BridgeDeck 菜单栏 App</div></div><div class="launcherTipDesc">安装后可在菜单栏一键切换账号、查看额度、启动服务，无需打开浏览器。</div><div class="launcherQuickOps"><button class="miniBtn" data-action="install-scan"><span class="opIcon">&#10003;</span>安装扫描</button><button class="miniBtn" data-page="services"><span class="opIcon">&#9654;</span>服务状态</button></div>`;
+      }
     }
     function renderUsageDashboard(data) {
       const usage = data.usage_metrics || {};
@@ -9846,6 +10245,62 @@ INDEX_HTML = """<!doctype html>
           <td><span class="${statusClass}">${esc(status || '-')}</span><br><span class="muted">${esc(fmtDuration(event.duration_ms))}</span></td>
         </tr>`;
       }).join('');
+    }
+    function loadRLThresholds() {
+      try {
+        const stored = JSON.parse(localStorage.getItem('bridgedeck_rl_thresholds') || '{}');
+        const warn = document.getElementById('rlWarnThreshold');
+        const block = document.getElementById('rlBlockThreshold');
+        if (warn && Number.isFinite(Number(stored.warn))) warn.value = String(stored.warn);
+        if (block && Number.isFinite(Number(stored.block))) block.value = String(stored.block);
+      } catch (_) {}
+    }
+    function saveRLThresholds() {
+      const warnEl = document.getElementById('rlWarnThreshold');
+      const blockEl = document.getElementById('rlBlockThreshold');
+      const warn = Math.max(1, Math.min(100, Number(warnEl?.value) || 80));
+      const block = Math.max(1, Math.min(100, Number(blockEl?.value) || 100));
+      if (warnEl) warnEl.value = String(warn);
+      if (blockEl) blockEl.value = String(block);
+      localStorage.setItem('bridgedeck_rl_thresholds', JSON.stringify({ warn, block }));
+      renderRateLimitHUD(lastQuotaData);
+      showToast('阈值已保存', 'success');
+    }
+    function renderRateLimitHUD(quotaData) {
+      const wrap = document.getElementById('rlBarWrap');
+      const list = document.getElementById('rlBarList');
+      const alertBox = document.getElementById('rlBarAlert');
+      if (!wrap || !list) return;
+      const quotas = quotaData && Array.isArray(quotaData.quotas) ? quotaData.quotas : [];
+      if (!quotas.length) { wrap.classList.add('hidden'); return; }
+      const warnThreshold = Math.max(1, Math.min(100, Number(document.getElementById('rlWarnThreshold')?.value) || 80));
+      const blockThreshold = Math.max(1, Math.min(100, Number(document.getElementById('rlBlockThreshold')?.value) || 100));
+      let maxUsedAll = 0;
+      const items = [];
+      quotas.forEach((q) => {
+        const label = maskEmail(q.email || q.label || maskId(q.account_id || ''));
+        const windows = q.windows || [];
+        windows.forEach((w) => {
+          const used = Math.max(0, Math.min(100, Number(w.used_percent ?? 0)));
+          maxUsedAll = Math.max(maxUsedAll, used);
+          const reset = w.reset_after_seconds ? `重置 ${w.reset_after_seconds}s` : (w.reset_at ? `重置 ${new Date(w.reset_at > 1e12 ? w.reset_at : w.reset_at * 1000).toLocaleTimeString()}` : '');
+          const cls = used >= blockThreshold ? 'bad' : (used >= warnThreshold ? 'warn' : 'ok');
+          items.push(`<div class="rlBarItem">
+            <div class="rlBarMeta"><span>${esc(label)} · ${esc(w.name || '额度')}</span><strong>${esc(used)}%</strong>${reset ? `<span class="quotaReset">${esc(reset)}</span>` : ''}</div>
+            <div class="rlBarTrack"><div class="rlBarFill ${cls}" style="width:${esc(used)}%"></div></div>
+          </div>`);
+        });
+      });
+      if (!items.length) { wrap.classList.add('hidden'); return; }
+      wrap.classList.remove('hidden');
+      list.innerHTML = items.join('');
+      if (maxUsedAll >= blockThreshold) {
+        alertBox.innerHTML = `<span class="rlBarAlert bad">⚠ 用量已达 ${esc(maxUsedAll)}%，接近阻断阈值 ${esc(blockThreshold)}%</span>`;
+      } else if (maxUsedAll >= warnThreshold) {
+        alertBox.innerHTML = `<span class="rlBarAlert warn">⚠ 用量已达 ${esc(maxUsedAll)}%，超过告警阈值 ${esc(warnThreshold)}%</span>`;
+      } else {
+        alertBox.innerHTML = '';
+      }
     }
     function renderOverviewQuotaMetrics(payload) {
       const quotas = payload && Array.isArray(payload.quotas) ? payload.quotas : [];
@@ -10066,6 +10521,150 @@ INDEX_HTML = """<!doctype html>
         </div>`;
       }).join('');
     }
+    function renderUsageTrend(rows) {
+      const canvas = document.getElementById('usageTrendCanvas');
+      const empty = document.getElementById('usageTrendEmpty');
+      const totalReqs = document.getElementById('trendTotalReqs');
+      const totalTokens = document.getElementById('trendTotalTokens');
+      if (!canvas || !empty) return;
+      if (!Array.isArray(rows) || rows.length === 0) {
+        empty.style.display = '';
+        canvas.style.display = 'none';
+        setText('trendTotalReqs', '-');
+        setText('trendTotalTokens', '-');
+        return;
+      }
+      empty.style.display = 'none';
+      canvas.style.display = '';
+      const isMobile = window.innerWidth <= 768;
+      const lookback = isMobile ? 14 : 28;
+      const today = new Date();
+      const dateMap = {};
+      let sumReqs = 0, sumTokens = 0;
+      for (const r of rows) { dateMap[r.date] = r; sumReqs += r.requests || 0; sumTokens += r.tokens || 0; }
+      const series = [];
+      for (let i = lookback - 1; i >= 0; i--) {
+        const d = new Date(today);
+        d.setDate(d.getDate() - i);
+        const key = d.toISOString().slice(0, 10);
+        const entry = dateMap[key];
+        series.push({ date: key, requests: entry ? entry.requests : 0, tokens: entry ? entry.tokens : 0 });
+      }
+      setText('trendTotalReqs', fmtMetricNumber(sumReqs));
+      setText('trendTotalTokens', fmtMetricNumber(sumTokens));
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      const w = Math.round(rect.width * dpr);
+      const h = Math.round(rect.height * dpr);
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.scale(dpr, dpr);
+      const cw = rect.width;
+      const ch = rect.height;
+      const padL = 0, padR = 0, padT = 6, padB = 20;
+      const plotW = cw - padL - padR;
+      const plotH = ch - padT - padB;
+      const vals = series.map((s) => s.requests);
+      const maxVal = Math.max(1, ...vals);
+      const stepX = plotW / Math.max(1, series.length - 1);
+      /* Area fill */
+      ctx.beginPath();
+      ctx.moveTo(padL, padT + plotH);
+      for (let i = 0; i < series.length; i++) {
+        const x = padL + i * stepX;
+        const y = padT + plotH - (vals[i] / maxVal) * plotH;
+        if (i === 0) ctx.lineTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.lineTo(padL + (series.length - 1) * stepX, padT + plotH);
+      ctx.closePath();
+      const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+      grad.addColorStop(0, 'rgba(0,102,204,0.18)');
+      grad.addColorStop(1, 'rgba(0,102,204,0.02)');
+      ctx.fillStyle = grad;
+      ctx.fill();
+      /* Line */
+      ctx.beginPath();
+      for (let i = 0; i < series.length; i++) {
+        const x = padL + i * stepX;
+        const y = padT + plotH - (vals[i] / maxVal) * plotH;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = 'var(--apple-blue)';
+      ctx.strokeStyle = '#0066cc';
+      ctx.lineWidth = 2;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.stroke();
+      /* X-axis labels (every 7th day) */
+      ctx.fillStyle = '#7a7a7a';
+      ctx.font = '10px -apple-system, BlinkMacSystemFont, sans-serif';
+      ctx.textAlign = 'center';
+      for (let i = 0; i < series.length; i++) {
+        if (i % 7 === 0 || i === series.length - 1) {
+          const x = padL + i * stepX;
+          const label = series[i].date.slice(5);
+          ctx.fillText(label, x, ch - 4);
+        }
+      }
+      /* Hover tooltip support */
+      canvas._trendData = series;
+      canvas._trendMax = maxVal;
+      canvas._trendPad = { padL, padT, plotW, plotH, stepX };
+    }
+    function handleTrendHover(e) {
+      const canvas = e.target;
+      if (!canvas._trendData) return;
+      const series = canvas._trendData;
+      const { padL, padT, plotH, stepX } = canvas._trendPad;
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const idx = Math.round((mx - padL) / stepX);
+      if (idx < 0 || idx >= series.length) { canvas.title = ''; return; }
+      const d = series[idx];
+      canvas.title = `${d.date}\n请求数: ${d.requests}\nToken: ${fmtMetricNumber(d.tokens)}`;
+    }
+    document.addEventListener('mousemove', function(e) {
+      if (e.target && e.target.id === 'usageTrendCanvas') handleTrendHover(e);
+    });
+    const PROVIDER_COLORS = ['#0066cc', '#34c759', '#ff9500', '#af52de', '#ff3b30', '#5ac8fa', '#ffcc00', '#ff2d55', '#64d2ff', '#8e8e93'];
+    function renderMonthlyUsageSummary(summary) {
+      const title = document.getElementById('monthlyUsageTitle');
+      const reqsEl = document.getElementById('monthlyUsageRequests');
+      const tokensEl = document.getElementById('monthlyUsageTokens');
+      const barWrap = document.getElementById('monthlyProviderBarWrap');
+      const track = document.getElementById('monthlyProviderBarTrack');
+      const legend = document.getElementById('monthlyProviderBarLegend');
+      const emptyEl = document.getElementById('monthlyUsageEmpty');
+      if (!reqsEl || !track || !emptyEl) return;
+      const s = summary || {};
+      const month = s.month || '';
+      if (title && month) title.textContent = month.replace('-', '年') + '月用量摘要';
+      const providers = Array.isArray(s.providers) ? s.providers : [];
+      const totalReqs = s.total_requests || 0;
+      const totalTokens = s.total_tokens || 0;
+      setText('monthlyUsageRequests', fmtMetricNumber(totalReqs));
+      setText('monthlyUsageTokens', fmtMetricNumber(totalTokens));
+      if (!providers.length) {
+        emptyEl.style.display = '';
+        if (barWrap) barWrap.style.display = 'none';
+        return;
+      }
+      emptyEl.style.display = 'none';
+      if (barWrap) barWrap.style.display = '';
+      track.innerHTML = providers.map(function(p, i) {
+        const pct = totalReqs > 0 ? (p.requests / totalReqs * 100) : 0;
+        const color = PROVIDER_COLORS[i % PROVIDER_COLORS.length];
+        return '<div class="providerBarSegment" style="flex:' + pct + ';background:' + color + ';" title="' + esc(p.provider) + ': ' + fmtMetricNumber(p.requests) + ' 请求, ' + fmtMetricNumber(p.tokens) + ' Token"></div>';
+      }).join('');
+      legend.innerHTML = providers.map(function(p, i) {
+        const color = PROVIDER_COLORS[i % PROVIDER_COLORS.length];
+        const pct = totalReqs > 0 ? (p.requests / totalReqs * 100).toFixed(1) : '0';
+        return '<div class="providerBarLegendItem"><span class="providerBarLegendSwatch" style="background:' + color + '"></span>' + esc(p.provider) + ' <strong>' + fmtMetricNumber(p.requests) + '</strong> (' + pct + '%)</div>';
+      }).join('');
+    }
     function renderMissingBridgeStatus(payload) {
       const box = document.getElementById('missingBridgeStatus');
       if (!box) return;
@@ -10160,9 +10759,15 @@ INDEX_HTML = """<!doctype html>
     async function refreshQuotas() {
       try {
         const payload = await api('/api/quotas');
+        lastQuotaData = payload;
         renderQuotaBoard(payload);
         renderMissingBridgeStatus(payload);
         renderOverviewQuotaMetrics(payload);
+        renderRateLimitHUD(payload);
+        if (lastData && Array.isArray(lastData.usage_daily)) {
+          renderUsageTrend(lastData.usage_daily);
+        }
+        if (lastData) renderMonthlyUsageSummary(lastData.usage_monthly_summary);
         return payload;
       } catch (e) {
         document.getElementById('quotaBoard').textContent = `额度查询失败: ${e.message}`;
@@ -10184,7 +10789,7 @@ INDEX_HTML = """<!doctype html>
         ? '已开启：只在当前是 Local Codex Bridge 时自动切换。'
         : '已关闭自动切换。';
       if (res.auto_switch?.enabled) await runAutoSwitch(false, false);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     async function runAutoSwitch(force=true, refresh=true) {
       const res = await api('/api/auto-switch-run', 'POST', { force });
@@ -10193,7 +10798,7 @@ INDEX_HTML = """<!doctype html>
         ? `当前优先账号：${accountDisplay(res.selected_account_id)}，${quotaStatusText(res.selected_quota_status)}。${actions}`
         : (res.message || '未切换');
       log(`自动切换检查: ${document.getElementById('autoSwitchStatus').textContent}`);
-      if (refresh) await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      if (refresh) await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       return res;
     }
     async function createMissingBridges() {
@@ -10207,7 +10812,7 @@ INDEX_HTML = """<!doctype html>
         document.getElementById('missingBridgeStatus').innerHTML += ` <span class="warnText">跳过 ${skipped.length} 个异常账号。</span>`;
       }
       log(`新账号桥接创建: created=${created.length}, skipped=${skipped.length}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       return res;
     }
     async function previewAimamiImport() {
@@ -10222,7 +10827,7 @@ INDEX_HTML = """<!doctype html>
       renderAimamiSync({ detected: true, candidates: [...(res.imported || []), ...(res.skipped || [])], summary: res.summary || {} });
       const created = res.bridge_providers ? (res.bridge_providers.created || []).length : 0;
       log(`AiMaMi 导入完成: imported=${(res.imported || []).length}, skipped=${(res.skipped || []).length}, bridges=${created}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       return res;
     }
     async function saveAimamiFollow() {
@@ -10237,7 +10842,7 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/aimami-follow-run', 'POST', { force });
       renderAimamiFollow({ enabled: res.enabled, last_result: res });
       log(`AiMaMi follow: ${res.action || 'noop'} / ${res.reason || '-'} / ${res.selected_account_id ? maskId(res.selected_account_id) : '-'}`);
-      if (refresh) await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      if (refresh) await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       return res;
     }
     async function previewAimamiExport() {
@@ -10680,7 +11285,7 @@ INDEX_HTML = """<!doctype html>
       const okCount = (res.quotas || []).filter((q) => ['ok', 'near_limit', 'limit_reached'].includes(q.quota_status)).length;
       document.getElementById('serviceMessage').textContent = actions || `额度查询已刷新，正常账号 ${okCount} 个`;
       log(`额度修复: ${document.getElementById('serviceMessage').textContent}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       return res;
     }
     async function repairCodexEnvConflicts() {
@@ -10700,7 +11305,7 @@ INDEX_HTML = """<!doctype html>
       const box = document.getElementById('attributionHeaderStatus');
       if (box) box.innerHTML = `<span class="ok">${esc(message)}</span>`;
       log(`Attribution Header 修复: ${message}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       return res;
     }
     function showAttributionHeaderPaths() {
@@ -10717,6 +11322,27 @@ INDEX_HTML = """<!doctype html>
       const box = document.getElementById('simpleResult');
       const cls = level === 'ok' ? 'ok' : (level === 'warn' ? 'warnText' : (level === 'bad' ? 'bad' : ''));
       box.innerHTML = cls ? `<strong class="${cls}">${esc(message)}</strong>` : esc(message);
+    }
+    /* Toast notification — non-intrusive overlay for new features */
+    function showToast(message, type='info', duration=3500) {
+      const container = document.querySelector('.toast-container');
+      if (!container) return;
+      const icons = { success:'✓', warning:'⚠', error:'✗', info:'i' };
+      const el = document.createElement('div');
+      el.className = 'toast';
+      el.setAttribute('data-type', type);
+      el.setAttribute('role', 'alert');
+      el.innerHTML = `<span class="toast-icon">${icons[type] || icons.info}</span><span>${esc(message)}</span>`;
+      container.appendChild(el);
+      requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('visible')));
+      const dismiss = () => {
+        el.classList.remove('visible');
+        el.classList.add('leaving');
+        el.addEventListener('transitionend', () => el.remove(), { once:true });
+        setTimeout(() => { if (el.parentNode) el.remove(); }, 500);
+      };
+      el.addEventListener('click', dismiss);
+      if (duration > 0) setTimeout(dismiss, duration);
     }
     function setOAuthResult(message, level='') {
       const box = document.getElementById('oauthResult');
@@ -10792,7 +11418,7 @@ INDEX_HTML = """<!doctype html>
         stopOAuthPolling();
         stopOAuthExpiryTimer();
         setOAuthResult(`授权完成：${result.email || result.account_id || '新账号'}`, 'ok');
-        await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+        await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       } else if (result.status === 'error') {
         stopOAuthPolling();
         stopOAuthExpiryTimer();
@@ -10858,7 +11484,7 @@ INDEX_HTML = """<!doctype html>
       setOAuthResult(result.message || 'CC Switch 已更新。', 'ok');
       const button = document.getElementById('oauthApplyBridgeBtn');
       if (button) button.textContent = '更新 CC Switch';
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       return result;
     }
     async function finishCodexOAuth() {
@@ -10872,7 +11498,7 @@ INDEX_HTML = """<!doctype html>
       if (result.status === 'completed') {
         stopOAuthPolling();
         setOAuthResult(`授权完成：${result.email || result.account_id || '新账号'}`, 'ok');
-        await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+        await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       } else {
         setOAuthResult(result.error || result.message || '授权未完成', result.ok === false ? 'bad' : '');
       }
@@ -10994,7 +11620,7 @@ INDEX_HTML = """<!doctype html>
     async function toggleTokens() {
       tokenVisible = !tokenVisible;
       document.getElementById('tokenToggle').textContent = tokenVisible ? '隐藏 token' : '显示 token';
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     function applyCliAccountDefaults(item) {
       if (!item) return;
@@ -11656,7 +12282,10 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('paths').textContent = `db: ${humanPath(data.paths.db)}\\nsettings: ${humanPath(data.paths.settings)}\\nauth_store: ${humanPath(data.paths.auth_store)}`;
       renderHealth(data);
       renderOverviewDashboard(data);
+      renderCodingTools(data);
       renderUsageDashboard(data);
+      if (Array.isArray(data.usage_daily)) renderUsageTrend(data.usage_daily);
+      renderMonthlyUsageSummary(data.usage_monthly_summary);
       renderAccounts(data);
       renderAccountMatrix(data);
       renderProviders(data);
@@ -11683,10 +12312,10 @@ INDEX_HTML = """<!doctype html>
       });
       refreshQuotas();
       if (data.aimami_follow && data.aimami_follow.enabled) {
-        runAimamiFollow(false, false).catch((e) => log(`AiMaMi follow 失败: ${e.message}`));
+        runAimamiFollow(false, false).catch((e) => { log(`AiMaMi follow 失败: ${e.message}`); setSimpleResult('AiMaMi follow 失败: ' + e.message, 'bad'); });
       }
       if (data.auto_switch && data.auto_switch.enabled) {
-        runAutoSwitch(false, false).catch((e) => log(`自动切换失败: ${e.message}`));
+        runAutoSwitch(false, false).catch((e) => { log(`自动切换失败: ${e.message}`); setSimpleResult('自动切换失败: ' + e.message, 'bad'); });
       }
       if (data.accounts.length > 0 && !document.getElementById('simpleResult').dataset.touched) {
         setSimpleResult('已准备好。Claude Code、单独 Codex CLI、全局 Codex CLI 可以分别选不同账号。');
@@ -11716,7 +12345,7 @@ INDEX_HTML = """<!doctype html>
         compact_config: compactConfigPayload()
       });
       log(`${res.message}: ${res.provider_name} (${res.provider_id})`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       return res;
     }
     async function createCliHome() {
@@ -11727,7 +12356,7 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/create-cli-launcher', 'POST', { account_id: accountId, target_dir: targetDir, profile_name: profileName });
       document.getElementById('cliCommand').textContent = `启动命令: ${humanPath(res.run_command)}\\n启动脚本: ${humanPath(res.launcher)}`;
       log(`${res.message}: ${res.target_dir}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       return res;
     }
     async function simpleClaude() {
@@ -11756,7 +12385,7 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('simpleResult').dataset.touched = '1';
       setSimpleResult(`正在把全局 Codex CLI 固定入口设为 ${accountLabel(item)}...`);
       const res = await api('/api/set-default-codex', 'POST', { account_id: item.account_id });
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       const currentLauncher = res.current_launcher ? `；固定入口：${humanPath(res.current_launcher)}` : '';
       const omcText = (res.omc_codex_shims || []).length ? '；OMC/tmux 已接管 codex' : '';
       setSimpleResult(`完成：全局 Codex CLI 固定入口已设为 ${accountLabel(item)}${currentLauncher}${omcText}；Codex Desktop 未改动。`, 'ok');
@@ -11767,7 +12396,7 @@ INDEX_HTML = """<!doctype html>
     }
     async function restoreDesktopNativeMode() {
       const res = await api('/api/codex-desktop-native-mode', 'POST', {});
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       const backup = res.backup ? `；备份：${humanPath(res.backup)}` : '';
       setSimpleResult(`${res.message}${backup}。重启 Codex Desktop 后生效。`, res.changed ? 'ok' : '');
       log(`${res.message}: ${humanPath(res.config_path)}；removed=${(res.removed || []).join(', ') || '-'}`);
@@ -11780,7 +12409,7 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/migrate-cli-launcher', 'POST', { account_id: accountId, target_dir: targetDir, profile_name: profileName });
       document.getElementById('cliCommand').textContent = `启动命令: ${humanPath(res.run_command)}\\n启动脚本: ${humanPath(res.launcher)}`;
       log(`${res.message}: ${res.target_dir}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
       return res;
     }
     async function setCurrentFromSelected() {
@@ -11788,21 +12417,21 @@ INDEX_HTML = """<!doctype html>
       if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/set-current', 'POST', { provider_id: id });
       log(`${res.message}: ${id}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     async function patchSelected() {
       const id = selectedProviderActionId();
       if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/patch-provider', 'POST', { provider_id: id });
       log(`${res.message}: ${id}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     async function saveCompactSelected() {
       const id = selectedProviderActionId();
       if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/provider-compact', 'POST', { provider_id: id, context_config: bridgeModelConfigPayload(), compact_config: compactConfigPayload() });
       log(`${res.message}: ${providerCompactText({ compact_enabled: res.compact_config.enabled, compact_window_tokens: res.compact_config.window_tokens, compact_threshold_percent: res.compact_config.threshold_percent })}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     async function saveForcedModelSelected() {
       const id = selectedProviderActionId();
@@ -11810,7 +12439,7 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/provider-model', 'POST', { provider_id: id, model_config: bridgeModelConfigPayload() });
       setRoutingMode('forced');
       log(`${res.message}: ${res.model_config.model}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     async function clearForcedModelSelected() {
       const id = selectedProviderActionId();
@@ -11828,14 +12457,14 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/provider-routing', 'POST', { provider_id: id, mode: 'auto', apply: true });
       setRoutingMode('auto');
       log(`${res.message}: 已移除 ${res.removed_model || '-'}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     async function syncCommonEnvSelected() {
       const id = selectedProviderActionId();
       if (!id) return log('请先选账号或选中一个 provider');
       const res = await api('/api/sync-common-env', 'POST', { provider_id: id });
       log(`${res.message}: 更新 ${res.updated.length} 个，跳过 ${res.skipped.length} 个；keys: ${res.env_keys.join(', ')}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     async function copyApiBaseUrl() {
       return copyText(apiAccessBaseUrl(selectedAccount('simpleApiAccount')), 'BASE_URL');
@@ -11850,13 +12479,13 @@ INDEX_HTML = """<!doctype html>
       const res = await api('/api/sync-claude-plugins', 'POST', {});
       const added = res.added && res.added.length ? `新增：${res.added.join(', ')}` : '没有新增';
       log(`插件启用态已同步：${added}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     async function extractSafeCommonConfig() {
       const res = await api('/api/extract-safe-common-config', 'POST', {});
       const keys = [...(res.keys || []), ...(res.env_keys || []).map((key) => `env.${key}`)];
       log(`${res.message}: ${keys.length ? keys.join(', ') : '没有可提取项'}；移除 env ${res.removed_env_keys.length} 项`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     function dedupePlanText(plan) {
       if (!plan || !plan.length) return '没有重复 Local Bridge provider';
@@ -11870,12 +12499,12 @@ INDEX_HTML = """<!doctype html>
       if (apply && !confirm('只会删除同账号重复的 Local Bridge provider，并先备份。继续？')) return;
       const res = await api('/api/dedupe-bridge-providers', 'POST', { apply });
       log(apply ? `${res.message}: 删除 ${res.deleted.length} 个；${dedupePlanText(res.plan)}` : dedupePlanText(res.plan));
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     async function repairPlusPro() {
       const res = await api('/api/repair-plus-pro', 'POST', {});
       log(`${res.message}: ${JSON.stringify(res.patched)}`);
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     function desktopRoutePlanText(plan) {
       if (!plan || !plan.length) return '没有需要修复的 Claude Desktop Local Bridge provider';
@@ -11888,7 +12517,7 @@ INDEX_HTML = """<!doctype html>
       if (apply && !confirm('只会修复 Claude Desktop Local Bridge provider 的 3.15 路由字段，并先备份。继续？')) return;
       const res = await api('/api/ccswitch-315-desktop-routes', 'POST', { apply });
       log(apply ? `${res.message}: 更新 ${res.updated.length} 个；${desktopRoutePlanText(res.plan)}` : desktopRoutePlanText(res.plan));
-      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+      await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
     function bindActions() {
       document.addEventListener('click', (event) => {
@@ -11929,12 +12558,11 @@ INDEX_HTML = """<!doctype html>
           if (action === 'save-forced-model-selected') return saveForcedModelSelected();
           if (action === 'clear-forced-model-selected') return clearForcedModelSelected();
           if (action === 'sync-common-env-selected') return syncCommonEnvSelected();
-          if (action === 'copy-api-base-url') return copyApiBaseUrl();
-          if (action === 'copy-api-env') return copyApiEnv();
           if (action === 'copy-claude-env') return copyClaudeEnv();
           if (action === 'extract-safe-common-config') return extractSafeCommonConfig();
           if (action === 'sync-claude-plugins') return syncClaudePlugins();
           if (action === 'save-auto-switch') return saveAutoSwitch();
+          if (action === 'save-rl-thresholds') return saveRLThresholds();
           if (action === 'run-auto-switch') return runAutoSwitch(true, true);
           if (action === 'refresh-quota') return refreshQuotas();
           if (action === 'create-missing-bridges') return createMissingBridges();
@@ -11986,7 +12614,7 @@ INDEX_HTML = """<!doctype html>
           button.textContent = '刷新中...';
         }
         Promise.resolve(run())
-          .catch((e) => log(`操作失败: ${e.message}`))
+          .catch((e) => { log(`操作失败: ${e.message}`); setSimpleResult('操作失败: ' + e.message, 'bad'); })
           .finally(() => {
             if (shouldShowBusy) {
               button.disabled = false;
@@ -12005,14 +12633,20 @@ INDEX_HTML = """<!doctype html>
     bindActions();
     renderBridgeModels();
     initGuideObserver();
+    loadRLThresholds();
     setInitState('正在连接本地 UI 服务...');
     refreshData().catch(handleInitError);
-    setInterval(() => {
+    const autoRefreshTimer = setInterval(() => {
       if (document.getElementById('autoSwitchEnabled')?.checked) {
-        runAutoSwitch(false, false).catch((e) => log(`自动切换失败: ${e.message}`));
+        runAutoSwitch(false, false).catch((e) => { log(`自动切换失败: ${e.message}`); setSimpleResult('自动切换失败: ' + e.message, 'bad'); });
         refreshQuotas();
       }
     }, 60000);
+    window.addEventListener('pagehide', () => {
+      stopOAuthPolling();
+      stopOAuthExpiryTimer();
+      if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+    });
   </script>
 </body>
 </html>
@@ -12092,6 +12726,11 @@ def build_handler(
                         json_response(self, 403, {"ok": False, "error": "Secret display is disabled for remote mode"})
                         return
                     snapshot = manager.snapshot(include_secrets=include_secrets)
+                    # Record usage daily aggregates from new events only (watermark-deduped)
+                    try:
+                        manager._record_usage_daily(snapshot.get("usage_events", []))
+                    except Exception:  # noqa: BLE001
+                        logger.debug("usage_daily record skipped", exc_info=True)
                     if not allow_sensitive:
                         snapshot = redact_snapshot(snapshot)
                     payload = {"ok": True, **snapshot}
@@ -12110,6 +12749,22 @@ def build_handler(
                     payload = manager.health()
                     if not allow_sensitive:
                         payload = redact_snapshot(payload)
+                    json_response(self, 200, payload)
+                except Exception as exc:  # noqa: BLE001
+                    json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
+            if parsed.path == "/api/usage-trend":
+                try:
+                    if not self._valid_fetch_metadata():
+                        json_response(self, 403, {"ok": False, "error": "Invalid fetch metadata"})
+                        return
+                    if not self._valid_csrf():
+                        json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    query = urllib.parse.parse_qs(parsed.query)
+                    days = int(query.get("days", ["28"])[0])
+                    days = max(7, min(90, days))
+                    payload = {"ok": True, "usage_daily": manager._query_usage_daily(days)}
                     json_response(self, 200, payload)
                 except Exception as exc:  # noqa: BLE001
                     json_response(self, 500, {"ok": False, "error": str(exc)})
@@ -12383,10 +13038,24 @@ def build_handler(
             try:
                 if self.path in {"/api/set-current", "/api/switch-claude"}:
                     provider_id = str(payload.get("provider_id") or "")
+                    err = _require_str(payload, "provider_id")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     result = manager.set_current_provider(provider_id)
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/create-provider":
+                    for fld in ("account_id", "provider_name"):
+                        err = _require_str(payload, fld, max_len=_MAX_LEN_NAME)
+                        if err:
+                            json_response(self, 400, {"ok": False, "error": err})
+                            return
+                    for fld in ("compact_config", "context_config", "model_config"):
+                        err = _validate_dict_field(payload, fld)
+                        if err:
+                            json_response(self, 400, {"ok": False, "error": err})
+                            return
                     account_id = str(payload.get("account_id") or "")
                     provider_name = str(payload.get("provider_name") or "")
                     set_current = bool(payload.get("set_current", True))
@@ -12404,11 +13073,24 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/patch-provider":
+                    err = _require_str(payload, "provider_id")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     provider_id = str(payload.get("provider_id") or "")
                     result = manager.patch_provider(provider_id)
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/provider-compact":
+                    err = _require_str(payload, "provider_id")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
+                    for fld in ("compact_config", "context_config"):
+                        err = _validate_dict_field(payload, fld)
+                        if err:
+                            json_response(self, 400, {"ok": False, "error": err})
+                            return
                     provider_id = str(payload.get("provider_id") or "")
                     compact_config = payload.get("compact_config") if isinstance(payload.get("compact_config"), dict) else {}
                     context_config = payload.get("context_config") if isinstance(payload.get("context_config"), dict) else None
@@ -12416,12 +13098,24 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/provider-model":
+                    err = _require_str(payload, "provider_id")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
+                    err = _validate_dict_field(payload, "model_config")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     provider_id = str(payload.get("provider_id") or "")
                     model_config = payload.get("model_config") if isinstance(payload.get("model_config"), dict) else None
                     result = manager.update_provider_forced_model(provider_id, model_config)
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/provider-routing":
+                    err = _require_str(payload, "provider_id")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     provider_id = str(payload.get("provider_id") or "")
                     mode = str(payload.get("mode") or "auto")
                     if mode != "auto":
@@ -12430,6 +13124,10 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/sync-common-env":
+                    err = _require_str(payload, "provider_id")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     provider_id = str(payload.get("provider_id") or "")
                     result = manager.sync_common_env_to_bridge_providers(provider_id)
                     json_response(self, 200, result)
@@ -12455,6 +13153,19 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path in {"/api/create-cli-home", "/api/create-cli-launcher"}:
+                    for fld in ("account_id",):
+                        err = _require_str(payload, fld)
+                        if err:
+                            json_response(self, 400, {"ok": False, "error": err})
+                            return
+                    err = _require_str(payload, "target_dir", max_len=_MAX_LEN_PATH)
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
+                    err = _require_str(payload, "profile_name", max_len=_MAX_LEN_NAME)
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     account_id = str(payload.get("account_id") or "")
                     target_dir = str(payload.get("target_dir") or "")
                     profile_name = str(payload.get("profile_name") or "")
@@ -12465,11 +13176,19 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/set-default-codex":
+                    err = _require_str(payload, "account_id")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     account_id = str(payload.get("account_id") or "")
                     result = manager.set_default_codex_account(account_id)
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/codex-desktop-bridge-mode":
+                    err = _require_str(payload, "account_id")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     account_id = str(payload.get("account_id") or "")
                     result = manager.enable_codex_desktop_bridge_mode(account_id)
                     json_response(self, 200 if result.get("ok", True) else 409, result)
@@ -12479,6 +13198,19 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/migrate-cli-launcher":
+                    for fld in ("account_id",):
+                        err = _require_str(payload, fld)
+                        if err:
+                            json_response(self, 400, {"ok": False, "error": err})
+                            return
+                    err = _require_str(payload, "target_dir", max_len=_MAX_LEN_PATH)
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
+                    err = _require_str(payload, "profile_name", max_len=_MAX_LEN_NAME)
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     account_id = str(payload.get("account_id") or "")
                     target_dir = str(payload.get("target_dir") or "")
                     profile_name = str(payload.get("profile_name") or "")
@@ -12486,6 +13218,9 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/auto-switch-config":
+                    if len(payload) > _MAX_DICT_KEYS:
+                        json_response(self, 400, {"ok": False, "error": f"输入验证失败: payload 键数量超出限制 ({len(payload)} > {_MAX_DICT_KEYS})"})
+                        return
                     result = manager.update_auto_switch_config(payload)
                     json_response(self, 200, result)
                     return
@@ -12494,6 +13229,9 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/aimami-follow-config":
+                    if len(payload) > _MAX_DICT_KEYS:
+                        json_response(self, 400, {"ok": False, "error": f"输入验证失败: payload 键数量超出限制 ({len(payload)} > {_MAX_DICT_KEYS})"})
+                        return
                     result = manager.update_aimami_follow_config(payload)
                     json_response(self, 200, result)
                     return
@@ -12510,11 +13248,23 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/aimami-sync/export":
+                    err = _validate_list_field(payload, "account_ids")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     account_ids = payload.get("account_ids") if isinstance(payload.get("account_ids"), list) else []
                     result = manager.export_aimami_accounts([str(item) for item in account_ids])
                     json_response(self, 200 if result.get("ok", True) else 409, result)
                     return
                 if self.path == "/api/aimami-sync/inject":
+                    err = _validate_list_field(payload, "account_ids")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
+                    err = _require_str(payload, "mode", max_len=_MAX_LEN_SHORT)
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     account_ids = payload.get("account_ids") if isinstance(payload.get("account_ids"), list) else []
                     result = manager.inject_aimami_accounts(
                         account_ids=[str(item) for item in account_ids],
@@ -12529,17 +13279,34 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/codex-oauth/apply-bridge":
+                    err = _require_str(payload, "flow_id")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     flow_id = str(payload.get("flow_id") or "")
                     result = manager.apply_codex_oauth_bridge(flow_id)
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/codex-oauth/finish":
+                    err = _require_str(payload, "flow_id")
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
+                    code_val = payload.get("code") or payload.get("code_or_url") or ""
+                    err = _require_str({"code": code_val}, "code", max_len=_MAX_LEN_TOKEN)
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     flow_id = str(payload.get("flow_id") or "")
-                    code_input = str(payload.get("code") or payload.get("code_or_url") or "")
+                    code_input = str(code_val)
                     result = manager.complete_codex_oauth(flow_id, code_input)
                     json_response(self, 200 if result.get("ok", True) else 400, result)
                     return
                 if self.path == "/api/local-bridge-control":
+                    err = _require_str(payload, "action", max_len=_MAX_LEN_SHORT)
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     result = manager.control_local_bridge(
                         str(payload.get("action") or ""),
                         force=bool(payload.get("force")),
@@ -12583,12 +13350,23 @@ def build_handler(
                     json_response(self, 200 if result.get("ok", True) else 400, result)
                     return
                 if self.path == "/api/keys/create":
+                    err = _require_str(payload, "label", max_len=_MAX_LEN_NAME)
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     label = str(payload.get("label") or "")
                     result = manager.create_api_key(label)
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/keys/revoke":
-                    key = str(payload.get("key") or payload.get("key_prefix") or "")
+                    key_val = payload.get("key") or payload.get("key_prefix") or ""
+                    if not key_val or not str(key_val).strip():
+                        json_response(self, 400, {"ok": False, "error": "输入验证失败: key 不能为空"})
+                        return
+                    if not isinstance(key_val, str) or len(key_val) > _MAX_LEN_ID:
+                        json_response(self, 400, {"ok": False, "error": "输入验证失败: key 格式不合法"})
+                        return
+                    key = str(key_val)
                     try:
                         # Support prefix matching: "xxx..." -> find full key
                         if "..." in key:
@@ -12637,6 +13415,10 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/rotation-strategy":
+                    err = _require_str(payload, "strategy", max_len=_MAX_LEN_SHORT)
+                    if err:
+                        json_response(self, 400, {"ok": False, "error": err})
+                        return
                     strategy = str(payload.get("strategy") or "manual")
                     auto_failover = bool(payload.get("auto_failover", False))
                     result = manager.save_rotation_strategy(strategy, auto_failover)
