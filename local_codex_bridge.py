@@ -56,6 +56,7 @@ PROMPT_CACHE_KEY_MODE_ENV = "CODEX_BRIDGE_PROMPT_CACHE_KEY"
 REASONING_PLACEHOLDER_HEARTBEAT_SECS = 8.0
 REASONING_PLACEHOLDER_MODE_ENV = "CODEX_BRIDGE_REASONING_PLACEHOLDER_MODE"
 STREAM_IDLE_LOG_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_LOG_SECS", "20"))
+STREAM_KEEPALIVE_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_KEEPALIVE_SECS", "10"))
 STREAM_IDLE_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_FAIL_SECS", "300"))
 STREAM_IDLE_PARTIAL_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_PARTIAL_FAIL_SECS", "900"))
 STREAM_LONG_WARNING_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_LONG_WARNING_SECS", "240"))
@@ -3229,6 +3230,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             "cache-control",
             "x-request-id",
             "openai-processing-ms",
+            "retry-after",
         ]
         for key in passthrough_headers:
             value = response.headers.get(key)
@@ -3240,7 +3242,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
         if content_length is not None:
             self.send_header("Content-Length", str(content_length))
-        self.send_header("Connection", "close")
+        self.send_header("Connection", "keep-alive" if is_stream else "close")
         self.end_headers()
 
     def do_POST(self) -> None:
@@ -3700,14 +3702,16 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         if output_format == "messages":
                             self.send_response(response.status_code)
                             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                            self.send_header("Cache-Control", "no-cache")
-                            self.send_header("Connection", "close")
+                            self.send_header("Cache-Control", "no-cache, no-store")
+                            self.send_header("X-Accel-Buffering", "no")
+                            self.send_header("Connection", "keep-alive")
                             self.end_headers()
                         elif output_format == "chat":
                             self.send_response(response.status_code)
                             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                            self.send_header("Cache-Control", "no-cache")
-                            self.send_header("Connection", "close")
+                            self.send_header("Cache-Control", "no-cache, no-store")
+                            self.send_header("X-Accel-Buffering", "no")
+                            self.send_header("Connection", "keep-alive")
                             self.end_headers()
                         else:
                             self._send_upstream_headers(response, is_stream=True)
@@ -3923,6 +3927,10 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             f"{log_timestamp()} [bridge-stream-idle] request_id={stream_request_id} account_id={account_id} model={requested_model or 'unknown'} requested_effort={requested_effort or 'unknown'} actual_effort={actual_effort or requested_effort or 'unknown'} phase={idle_phase} idle_s={idle_for:.1f} limit_s={idle_fail_secs:.1f} active_reasoning={str(state.active).lower()} upstream_events={metrics.upstream_events} heartbeats={state.emitted_count}",
                             file=sys.stderr,
                         )
+                    # Periodic SSE keepalive comment to prevent client reconnect
+                    if idle_for >= STREAM_KEEPALIVE_SECS and not heartbeat:
+                        yield f": keepalive idle_s={idle_for:.0f}\n\n".encode("utf-8")
+                        continue
                     heartbeat = self._build_reasoning_placeholder_sse(
                         account_id,
                         state,
