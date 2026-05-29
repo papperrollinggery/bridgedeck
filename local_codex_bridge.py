@@ -1813,36 +1813,65 @@ class AuthStore:
             self._session_affinity[session_key] = account_id
 
     def _refresh_token(self, refresh_token: str) -> dict[str, Any]:
-        try:
-            with build_upstream_http_client(timeout=30.0) as client:
-                response = client.post(
-                    OAUTH_TOKEN_URL,
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "User-Agent": CODEX_USER_AGENT,
-                    },
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh_token,
-                        "client_id": CODEX_CLIENT_ID,
-                        "scope": "openid profile email",
-                    },
+        _TOKEN_REFRESH_MAX_RETRIES = 3
+        _TOKEN_REFRESH_RETRYABLE = (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteError,
+        )
+        last_exc: BaseException | None = None
+        for attempt in range(_TOKEN_REFRESH_MAX_RETRIES):
+            try:
+                with build_upstream_http_client(timeout=30.0) as client:
+                    response = client.post(
+                        OAUTH_TOKEN_URL,
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "User-Agent": CODEX_USER_AGENT,
+                        },
+                        data={
+                            "grant_type": "refresh_token",
+                            "refresh_token": refresh_token,
+                            "client_id": CODEX_CLIENT_ID,
+                            "scope": "openid profile email",
+                        },
+                    )
+                response.raise_for_status()
+                log_upstream_result("oauth_token", None, True, status_code=response.status_code)
+                return response.json()
+            except httpx.HTTPStatusError as exc:
+                # HTTP 4xx (including 401 invalid_grant) — do not retry
+                log_upstream_result(
+                    "oauth_token",
+                    None,
+                    False,
+                    status_code=exc.response.status_code,
+                    detail=exc.response.text,
                 )
-            response.raise_for_status()
-            log_upstream_result("oauth_token", None, True, status_code=response.status_code)
-            return response.json()
-        except httpx.HTTPStatusError as exc:
-            log_upstream_result(
-                "oauth_token",
-                None,
-                False,
-                status_code=exc.response.status_code,
-                detail=exc.response.text,
-            )
-            raise
-        except Exception as exc:
-            log_upstream_result("oauth_token", None, False, detail=upstream_exception_detail(exc))
-            raise
+                raise
+            except _TOKEN_REFRESH_RETRYABLE as exc:
+                last_exc = exc
+                if attempt < _TOKEN_REFRESH_MAX_RETRIES - 1:
+                    backoff = 2 ** attempt
+                    logger.warning(
+                        "token_refresh_retry",
+                        extra={
+                            "attempt": attempt + 1,
+                            "max_retries": _TOKEN_REFRESH_MAX_RETRIES,
+                            "backoff_seconds": backoff,
+                            "error": upstream_exception_detail(exc),
+                        },
+                    )
+                    time.sleep(backoff)
+                    continue
+                log_upstream_result("oauth_token", None, False, detail=upstream_exception_detail(exc))
+                raise
+            except Exception as exc:
+                log_upstream_result("oauth_token", None, False, detail=upstream_exception_detail(exc))
+                raise
+        # Should not reach here, but satisfy type checker
+        raise last_exc  # type: ignore[misc]
 
 
 def normalize_request_body(body: dict[str, Any]) -> dict[str, Any]:
