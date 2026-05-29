@@ -3555,7 +3555,17 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             return
 
         for account_index, candidate_account_id in enumerate(candidate_account_ids):
-            account_id, access_token = self.server.auth_store.get_access_token(candidate_account_id)
+            try:
+                account_id, access_token = self.server.auth_store.get_access_token(candidate_account_id)
+            except Exception as exc:
+                has_next = account_index < len(candidate_account_ids) - 1
+                if has_next:
+                    print(
+                        f"{log_timestamp()} [bridge-token-failover] request_id={request_id} candidate={candidate_account_id} error={truncate_log_text(str(exc))} trying_next=true",
+                        file=sys.stderr,
+                    )
+                    continue
+                raise
             upstream_headers = self._build_upstream_headers(account_id, access_token)
             has_next_account = account_index < len(candidate_account_ids) - 1
             for attempt in range(1, max_attempts + 1):
