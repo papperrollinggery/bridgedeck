@@ -1769,14 +1769,18 @@ class AuthStore:
                 record = accounts[account_id]
                 token_data = self._refresh_token(record.refresh_token)
 
+                # Validate response before updating state
+                access_token = token_data.get("access_token")
+                if not access_token:
+                    raise RuntimeError("token refresh returned no access_token")
+                expires_in = int(token_data.get("expires_in", 3600))
+
                 new_refresh = token_data.get("refresh_token")
                 if new_refresh and new_refresh != record.refresh_token:
                     record.refresh_token = new_refresh
                     accounts[account_id] = record
                     self.save(accounts, default_account_id)
 
-                access_token = token_data["access_token"]
-                expires_in = int(token_data.get("expires_in", 3600))
                 self._token_cache[account_id] = CachedToken(
                     token=access_token,
                     expires_at=time.time() + expires_in,
