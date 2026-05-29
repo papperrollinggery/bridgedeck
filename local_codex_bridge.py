@@ -56,6 +56,7 @@ PROMPT_CACHE_KEY_MODE_ENV = "CODEX_BRIDGE_PROMPT_CACHE_KEY"
 REASONING_PLACEHOLDER_HEARTBEAT_SECS = 8.0
 REASONING_PLACEHOLDER_MODE_ENV = "CODEX_BRIDGE_REASONING_PLACEHOLDER_MODE"
 STREAM_IDLE_LOG_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_LOG_SECS", "20"))
+STREAM_KEEPALIVE_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_KEEPALIVE_SECS", "10"))
 STREAM_IDLE_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_FAIL_SECS", "300"))
 STREAM_IDLE_PARTIAL_FAIL_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_IDLE_PARTIAL_FAIL_SECS", "900"))
 STREAM_LONG_WARNING_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_LONG_WARNING_SECS", "240"))
@@ -1768,14 +1769,18 @@ class AuthStore:
                 record = accounts[account_id]
                 token_data = self._refresh_token(record.refresh_token)
 
+                # Validate response before updating state
+                access_token = token_data.get("access_token")
+                if not access_token:
+                    raise RuntimeError("token refresh returned no access_token")
+                expires_in = int(token_data.get("expires_in", 3600))
+
                 new_refresh = token_data.get("refresh_token")
                 if new_refresh and new_refresh != record.refresh_token:
                     record.refresh_token = new_refresh
                     accounts[account_id] = record
                     self.save(accounts, default_account_id)
 
-                access_token = token_data["access_token"]
-                expires_in = int(token_data.get("expires_in", 3600))
                 self._token_cache[account_id] = CachedToken(
                     token=access_token,
                     expires_at=time.time() + expires_in,
@@ -1813,36 +1818,65 @@ class AuthStore:
             self._session_affinity[session_key] = account_id
 
     def _refresh_token(self, refresh_token: str) -> dict[str, Any]:
-        try:
-            with build_upstream_http_client(timeout=30.0) as client:
-                response = client.post(
-                    OAUTH_TOKEN_URL,
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "User-Agent": CODEX_USER_AGENT,
-                    },
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh_token,
-                        "client_id": CODEX_CLIENT_ID,
-                        "scope": "openid profile email",
-                    },
+        _TOKEN_REFRESH_MAX_RETRIES = 3
+        _TOKEN_REFRESH_RETRYABLE = (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteError,
+        )
+        last_exc: BaseException | None = None
+        for attempt in range(_TOKEN_REFRESH_MAX_RETRIES):
+            try:
+                with build_upstream_http_client(timeout=30.0) as client:
+                    response = client.post(
+                        OAUTH_TOKEN_URL,
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "User-Agent": CODEX_USER_AGENT,
+                        },
+                        data={
+                            "grant_type": "refresh_token",
+                            "refresh_token": refresh_token,
+                            "client_id": CODEX_CLIENT_ID,
+                            "scope": "openid profile email",
+                        },
+                    )
+                response.raise_for_status()
+                log_upstream_result("oauth_token", None, True, status_code=response.status_code)
+                return response.json()
+            except httpx.HTTPStatusError as exc:
+                # HTTP 4xx (including 401 invalid_grant) — do not retry
+                log_upstream_result(
+                    "oauth_token",
+                    None,
+                    False,
+                    status_code=exc.response.status_code,
+                    detail=exc.response.text,
                 )
-            response.raise_for_status()
-            log_upstream_result("oauth_token", None, True, status_code=response.status_code)
-            return response.json()
-        except httpx.HTTPStatusError as exc:
-            log_upstream_result(
-                "oauth_token",
-                None,
-                False,
-                status_code=exc.response.status_code,
-                detail=exc.response.text,
-            )
-            raise
-        except Exception as exc:
-            log_upstream_result("oauth_token", None, False, detail=upstream_exception_detail(exc))
-            raise
+                raise
+            except _TOKEN_REFRESH_RETRYABLE as exc:
+                last_exc = exc
+                if attempt < _TOKEN_REFRESH_MAX_RETRIES - 1:
+                    backoff = 2 ** attempt
+                    logger.warning(
+                        "token_refresh_retry",
+                        extra={
+                            "attempt": attempt + 1,
+                            "max_retries": _TOKEN_REFRESH_MAX_RETRIES,
+                            "backoff_seconds": backoff,
+                            "error": upstream_exception_detail(exc),
+                        },
+                    )
+                    time.sleep(backoff)
+                    continue
+                log_upstream_result("oauth_token", None, False, detail=upstream_exception_detail(exc))
+                raise
+            except Exception as exc:
+                log_upstream_result("oauth_token", None, False, detail=upstream_exception_detail(exc))
+                raise
+        # Should not reach here, but satisfy type checker
+        raise last_exc  # type: ignore[misc]
 
 
 def normalize_request_body(body: dict[str, Any]) -> dict[str, Any]:
@@ -3200,6 +3234,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             "cache-control",
             "x-request-id",
             "openai-processing-ms",
+            "retry-after",
         ]
         for key in passthrough_headers:
             value = response.headers.get(key)
@@ -3211,7 +3246,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
         if content_length is not None:
             self.send_header("Content-Length", str(content_length))
-        self.send_header("Connection", "close")
+        self.send_header("Connection", "keep-alive" if is_stream else "close")
         self.end_headers()
 
     def do_POST(self) -> None:
@@ -3524,7 +3559,17 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             return
 
         for account_index, candidate_account_id in enumerate(candidate_account_ids):
-            account_id, access_token = self.server.auth_store.get_access_token(candidate_account_id)
+            try:
+                account_id, access_token = self.server.auth_store.get_access_token(candidate_account_id)
+            except Exception as exc:
+                has_next = account_index < len(candidate_account_ids) - 1
+                if has_next:
+                    print(
+                        f"{log_timestamp()} [bridge-token-failover] request_id={request_id} candidate={candidate_account_id} error={truncate_log_text(str(exc))} trying_next=true",
+                        file=sys.stderr,
+                    )
+                    continue
+                raise
             upstream_headers = self._build_upstream_headers(account_id, access_token)
             has_next_account = account_index < len(candidate_account_ids) - 1
             for attempt in range(1, max_attempts + 1):
@@ -3671,14 +3716,16 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         if output_format == "messages":
                             self.send_response(response.status_code)
                             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                            self.send_header("Cache-Control", "no-cache")
-                            self.send_header("Connection", "close")
+                            self.send_header("Cache-Control", "no-cache, no-store")
+                            self.send_header("X-Accel-Buffering", "no")
+                            self.send_header("Connection", "keep-alive")
                             self.end_headers()
                         elif output_format == "chat":
                             self.send_response(response.status_code)
                             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                            self.send_header("Cache-Control", "no-cache")
-                            self.send_header("Connection", "close")
+                            self.send_header("Cache-Control", "no-cache, no-store")
+                            self.send_header("X-Accel-Buffering", "no")
+                            self.send_header("Connection", "keep-alive")
                             self.end_headers()
                         else:
                             self._send_upstream_headers(response, is_stream=True)
@@ -3894,6 +3941,10 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             f"{log_timestamp()} [bridge-stream-idle] request_id={stream_request_id} account_id={account_id} model={requested_model or 'unknown'} requested_effort={requested_effort or 'unknown'} actual_effort={actual_effort or requested_effort or 'unknown'} phase={idle_phase} idle_s={idle_for:.1f} limit_s={idle_fail_secs:.1f} active_reasoning={str(state.active).lower()} upstream_events={metrics.upstream_events} heartbeats={state.emitted_count}",
                             file=sys.stderr,
                         )
+                    # Periodic SSE keepalive comment to prevent client reconnect
+                    if idle_for >= STREAM_KEEPALIVE_SECS and not heartbeat:
+                        yield f": keepalive idle_s={idle_for:.0f}\n\n".encode("utf-8")
+                        continue
                     heartbeat = self._build_reasoning_placeholder_sse(
                         account_id,
                         state,
