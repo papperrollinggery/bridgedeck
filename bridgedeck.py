@@ -2848,7 +2848,7 @@ class BridgeManager:
             if len(self._usage_events_watermark) > 1000:
                 self._usage_events_watermark = set(list(self._usage_events_watermark)[-500:])
         except Exception:  # noqa: BLE001
-            logger.debug("usage_daily record failed", exc_info=True)
+            logger.warning("usage_daily record failed", exc_info=True)
 
     def _query_usage_daily(self, days: int = 28) -> list[dict[str, Any]]:
         cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).strftime("%Y-%m-%d")
