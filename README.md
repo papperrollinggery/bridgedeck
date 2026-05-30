@@ -204,7 +204,7 @@ BridgeDeck may read or write these local files depending on the action you choos
 ```text
 ~/.cc-switch/cc-switch.db
 ~/.cc-switch/settings.json
-~/.cc-switch/codex_oauth_auth.json
+~/.cc-switch/bridgedeck-auth.json
 ~/.cc-switch/codex-cli-launchers/*
 ~/.cc-switch/bridgedeck-backups/*
 ~/.cc-switch/bridgedeck-local-bridge-state.json
@@ -234,7 +234,7 @@ Backups are written before local configuration changes:
 Never publish these files or raw screenshots from a real machine:
 
 ```text
-~/.cc-switch/codex_oauth_auth.json
+~/.cc-switch/bridgedeck-auth.json
 ~/.cc-switch/cc-switch.db
 ~/.codex/auth.json
 ~/.codex-cli-*/auth.json
@@ -258,7 +258,7 @@ logs containing tokens, account IDs, emails, local paths, or proxy credentials
 ```text
 --db PATH              path to cc-switch.db
 --settings PATH        path to settings.json
---auth-store PATH      path to codex_oauth_auth.json
+--auth-store PATH      path to bridgedeck-auth.json
 --host HOST            listen host, default 127.0.0.1
 --port PORT            listen port, default 8899
 --allow-remote         allow non-loopback bind; read-only and no secret reveal

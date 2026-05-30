@@ -204,7 +204,7 @@ BridgeDeck 会根据你点击的操作读取或写入这些本机文件：
 ```text
 ~/.cc-switch/cc-switch.db
 ~/.cc-switch/settings.json
-~/.cc-switch/codex_oauth_auth.json
+~/.cc-switch/bridgedeck-auth.json
 ~/.cc-switch/codex-cli-launchers/*
 ~/.cc-switch/bridgedeck-backups/*
 ~/.cc-switch/bridgedeck-local-bridge-state.json
@@ -234,7 +234,7 @@ BridgeDeck 会根据你点击的操作读取或写入这些本机文件：
 不要公开这些文件或真实环境截图：
 
 ```text
-~/.cc-switch/codex_oauth_auth.json
+~/.cc-switch/bridgedeck-auth.json
 ~/.cc-switch/cc-switch.db
 ~/.codex/auth.json
 ~/.codex-cli-*/auth.json
@@ -258,7 +258,7 @@ BridgeDeck 会根据你点击的操作读取或写入这些本机文件：
 ```text
 --db PATH              cc-switch.db 路径
 --settings PATH        settings.json 路径
---auth-store PATH      codex_oauth_auth.json 路径
+--auth-store PATH      bridgedeck-auth.json 路径
 --host HOST            监听地址，默认 127.0.0.1
 --port PORT            监听端口，默认 8899
 --allow-remote         允许非本机监听；默认只读且不能显示完整 token

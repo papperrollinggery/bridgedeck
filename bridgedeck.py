@@ -3681,14 +3681,14 @@ class BridgeManager:
         import subprocess
         try:
             if action == "stop":
-                result = subprocess.run(["pkill", "-f", "(python|Python).*bridgedeck"], capture_output=True, timeout=5)
+                result = subprocess.run(["pkill", "-f", "python.*local_codex_bridge\\.py"], capture_output=True, timeout=5)
                 if result.returncode == 1:
                     return {"ok": True, "message": "服务未运行"}
                 return {"ok": True, "message": "服务停止信号已发送"}
             elif action == "start":
                 return {"ok": False, "error": "请通过 launchd 或手动启动服务", "message": "请通过 launchd 或手动启动服务"}
             elif action == "restart":
-                result = subprocess.run(["pkill", "-f", "(python|Python).*bridgedeck"], capture_output=True, timeout=5)
+                result = subprocess.run(["pkill", "-f", "python.*bridgedeck\\.py --host"], capture_output=True, timeout=5)
                 if result.returncode == 1:
                     return {"ok": True, "message": "服务未运行，无需重启"}
                 return {"ok": True, "message": "重启信号已发送"}
@@ -4116,6 +4116,30 @@ class BridgeManager:
             fcntl.flock(_auth_lock_fd, fcntl.LOCK_UN)
             _auth_lock_fd.close()
         return {"ok": True, "default_account_id": account_id}
+
+    def delete_account(self, account_id: str) -> dict[str, Any]:
+        _auth_lock_path = self.paths.auth_store.with_suffix('.lock')
+        _auth_lock_fd = _auth_lock_path.open('w')
+        try:
+            fcntl.flock(_auth_lock_fd, fcntl.LOCK_EX)
+            with self._lock:
+                raw = load_json(self.paths.auth_store, {})
+                store = raw if isinstance(raw, dict) else {}
+                accounts = store.get("accounts") if isinstance(store.get("accounts"), dict) else {}
+                if account_id not in accounts:
+                    raise ValueError(f"Account {account_id} not found")
+                self._backup_file(self.paths.auth_store, "delete-account")
+                deleted_email = accounts[account_id].get("email", "")
+                del accounts[account_id]
+                store["accounts"] = accounts
+                if store.get("default_account_id") == account_id:
+                    remaining = list(accounts.keys())
+                    store["default_account_id"] = remaining[0] if remaining else ""
+                dump_json(self.paths.auth_store, store)
+        finally:
+            fcntl.flock(_auth_lock_fd, fcntl.LOCK_UN)
+            _auth_lock_fd.close()
+        return {"ok": True, "deleted_account_id": account_id, "deleted_email": deleted_email, "remaining_count": len(accounts)}
 
     def aimami_export_preview(self) -> dict[str, Any]:
         aimami = self.aimami_import_preview()
@@ -9833,6 +9857,7 @@ INDEX_HTML = """<!doctype html>
                       <th class="accountCol">邮箱</th>
                       <th class="smallCol">默认</th>
                       <th class="smallCol">来源</th>
+                      <th class="smallCol">操作</th>
                     </tr>
                   </thead>
                   <tbody></tbody>
@@ -11141,6 +11166,7 @@ INDEX_HTML = """<!doctype html>
           <td>${esc(acct.email)}</td>
           <td>${acct.is_default ? '<span class="ok">✓ 默认</span>' : ''}</td>
           <td class="muted">${esc(acct.source || '')}</td>
+          <td><button class="miniBtn warn" data-action="delete-account" data-account-id="${esc(acct.account_id)}">删除</button></td>
         `;
         tbody.appendChild(tr);
       });
@@ -11156,6 +11182,24 @@ INDEX_HTML = """<!doctype html>
         await refreshAccountPool();
       } else {
         log(`切换失败: ${res.error}`);
+      }
+    }
+
+    async function deleteAccount(accountId) {
+      const account = (lastData?.accounts || []).find(a => a.account_id === accountId);
+      const label = account?.email || account?.label || maskId(accountId);
+      const isDefault = lastData?.default_account_id === accountId;
+      let msg = `确认删除账号 ${label}？此操作不可撤销。`;
+      if (isDefault) msg += '\\n这是默认账号，删除后将自动切换到下一个可用账号。';
+      if (!confirm(msg)) return;
+      try {
+        await api('/api/delete-account', 'POST', { account_id: accountId });
+        log(`已删除账号: ${label}`);
+        setSimpleResult(`已删除账号: ${label}`, 'ok');
+        await refreshData();
+      } catch (e) {
+        log(`删除失败: ${e.message}`);
+        setSimpleResult(`删除失败: ${e.message}`, 'bad');
       }
     }
 
@@ -12688,6 +12732,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'select-cli-account') return selectCliAccount(button.dataset.accountId || '');
           // New Phase 4 actions
           if (action === 'set-default-account') return setDefaultAccount();
+          if (action === 'delete-account') return deleteAccount(button.dataset.accountId);
           if (action === 'save-rotation-strategy') return saveRotationStrategy();
           if (action === 'create-api-key') return createApiKey();
           if (action === 'revoke-key') { const k = button.getAttribute('data-key'); if (k) return revokeApiKey(k); }
@@ -12736,6 +12781,13 @@ INDEX_HTML = """<!doctype html>
       stopOAuthPolling();
       stopOAuthExpiryTimer();
       if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+    });
+    window.addEventListener('unhandledrejection', (event) => {
+        const msg = event.reason?.message || String(event.reason || 'unknown error');
+        log(`未处理错误: ${msg}`);
+        const box = document.getElementById('simpleResult');
+        if (box) { box.textContent = `错误: ${msg}`; box.className = 'result bad'; }
+        event.preventDefault();
     });
   </script>
 </body>
@@ -13487,6 +13539,19 @@ def build_handler(
                         json_response(self, 400, {"ok": False, "error": str(exc)})
                     except RuntimeError as exc:
                         json_response(self, 500, {"ok": False, "error": "Auth store file is corrupted", "detail": str(exc)})
+                    return
+                if self.path == "/api/delete-account":
+                    account_id = str(payload.get("account_id") or "")
+                    if not account_id:
+                        json_response(self, 400, {"ok": False, "error": "Missing account_id"})
+                        return
+                    try:
+                        result = manager.delete_account(account_id)
+                        json_response(self, 200, result)
+                    except ValueError as exc:
+                        json_response(self, 400, {"ok": False, "error": str(exc)})
+                    except RuntimeError as exc:
+                        json_response(self, 500, {"ok": False, "error": str(exc)})
                     return
                 if self.path == "/api/service-control":
                     action = str(payload.get("action") or "")
