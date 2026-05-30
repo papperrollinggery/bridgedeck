@@ -10065,7 +10065,9 @@ INDEX_HTML = """<!doctype html>
       return `${text.slice(0, 8)}...${text.slice(-4)}`;
     }
     function humanPath(value) {
-      return String(value || '').replace(/^\\\/Users\\\/[^\\\/]+/, '~');
+      const s = String(value || '');
+      const idx = s.indexOf('/Users/');
+      return idx === 0 ? '~' + s.slice(idx + 6) : s;
     }
     function log(msg) {
       const box = document.getElementById('log');
