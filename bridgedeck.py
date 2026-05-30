@@ -5940,12 +5940,31 @@ class BridgeManager:
         if snapshot_valid:
             result["token_status"] = "ok"
             result["token_detail"] = f"snapshot有效 {snapshot_expires_h}h"
-        elif rt_len > 100:
-            result["token_status"] = "ok"
-            result["token_detail"] = "refresh_token有效"
         elif rt_len > 0:
-            result["token_status"] = "needs_reauth"
-            result["token_detail"] = "refresh_token已消费"
+            # Try bridge proxy to verify token is actually usable
+            if tcp_open("127.0.0.1", LOCAL_BRIDGE_PORT):
+                try:
+                    url = f"http://127.0.0.1:{LOCAL_BRIDGE_PORT}/accounts/{urllib.parse.quote(account_id, safe='')}/quota"
+                    raw = read_local_url(url, timeout=10, max_bytes=64 * 1024)
+                    body = json.loads(raw) if raw else {}
+                    if isinstance(body, dict) and not body.get("error"):
+                        result["token_status"] = "ok"
+                        result["token_detail"] = "refresh_token有效"
+                    elif "refresh_token_reused" in str(body.get("error", "")):
+                        result["token_status"] = "needs_reauth"
+                        result["token_detail"] = "refresh_token已消费"
+                    elif "token_invalidated" in str(body.get("error", "")):
+                        result["token_status"] = "needs_reauth"
+                        result["token_detail"] = "token已被吊销"
+                    else:
+                        result["token_status"] = "ok"
+                        result["token_detail"] = "refresh_token已授权"
+                except Exception:
+                    result["token_status"] = "ok"
+                    result["token_detail"] = "refresh_token已授权"
+            else:
+                result["token_status"] = "ok"
+                result["token_detail"] = "refresh_token已授权"
         else:
             result["token_status"] = "missing"
             result["token_detail"] = "无token"
