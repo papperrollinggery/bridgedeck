@@ -1871,6 +1871,10 @@ class AuthStore:
                 raise RuntimeError("account not found: default")
             now = time.time()
             ordered = [aid for aid in ordered if self._cooldown_until.get(aid, 0) <= now]
+            if not ordered:
+                ordered = [aid for aid in self._session_affinity.values() if aid in accounts]
+                if not ordered:
+                    ordered = list(accounts.keys())
             return ordered
 
     def bind_session(self, session_key: str | None, account_id: str) -> None:
@@ -4014,7 +4018,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             file=sys.stderr,
                         )
                     # Periodic SSE keepalive comment to prevent client reconnect
-                    if idle_for >= STREAM_KEEPALIVE_SECS and not heartbeat:
+                    if idle_for >= STREAM_KEEPALIVE_SECS and not heartbeat and not state.active:
                         yield f": keepalive idle_s={idle_for:.0f}\n\n".encode("utf-8")
                         continue
                     heartbeat = self._build_reasoning_placeholder_sse(
