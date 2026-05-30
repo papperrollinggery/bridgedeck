@@ -5011,12 +5011,15 @@ class BridgeManager:
                 advice = "回 CC Switch 重新授权该账号"
             elif "missing_cli_launcher" in risk_flags:
                 advice = "生成 Codex CLI 启动器"
+            token_health = self._check_token_health(account_id)
             matrix.append(
                 {
                     "account_id": account_id,
                     "email": account.get("email") or "",
                     "label": account.get("label") or "",
                     "account_status": status,
+                    "token_status": token_health["token_status"],
+                    "token_detail": token_health["token_detail"],
                     "quota_status": "unknown",
                     "claude_current": any(bool(p.get("is_current")) for p in account_providers),
                     "claude_providers": [p.get("name") for p in account_providers],
@@ -5872,6 +5875,59 @@ class BridgeManager:
         payload["services"] = self.services().get("services", {})
         return payload
 
+    def _check_token_health(self, account_id: str) -> dict[str, Any]:
+        """Check token authorization status without making network calls."""
+        result: dict[str, Any] = {"token_status": "unknown", "token_detail": ""}
+
+        # Check refresh_token in bridgedeck-auth.json
+        rt_len = 0
+        try:
+            store = self._load_auth_store_raw()
+            accounts = store.get("accounts", {}) if isinstance(store, dict) else {}
+            acc = accounts.get(account_id, {})
+            rt = acc.get("refresh_token", "")
+            rt_len = len(rt)
+        except Exception:
+            rt_len = 0
+
+        # Check AiMaMi snapshot JWT
+        snapshot_dir = Path.home() / ".codex" / "accounts" / "snapshots"
+        snapshot_valid = False
+        snapshot_expires_h = 0
+        if snapshot_dir.is_dir():
+            for entry in snapshot_dir.iterdir():
+                if not entry.name.endswith(f"__{account_id}.json"):
+                    continue
+                try:
+                    data = json.loads(entry.read_text())
+                    at = data.get("tokens", {}).get("access_token", "")
+                    if at and "." in at:
+                        parts = at.split(".")
+                        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=="))
+                        exp = payload.get("exp", 0)
+                        remaining = (exp - time.time()) / 3600
+                        if remaining > 0:
+                            snapshot_valid = True
+                            snapshot_expires_h = int(remaining)
+                except Exception:
+                    continue
+
+        # Determine status
+        if snapshot_valid:
+            result["token_status"] = "ok"
+            result["token_detail"] = f"snapshot有效 {snapshot_expires_h}h"
+        elif rt_len > 100:
+            result["token_status"] = "ok"
+            result["token_detail"] = "refresh_token有效"
+        elif rt_len > 0:
+            result["token_status"] = "needs_reauth"
+            result["token_detail"] = "refresh_token已消费"
+        else:
+            result["token_status"] = "missing"
+            result["token_detail"] = "无token"
+
+        return result
+
     def _fetch_quota(self, account: dict[str, Any]) -> dict[str, Any]:
         account_id = str(account.get("account_id") or "")
         result: dict[str, Any] = {
@@ -5885,6 +5941,10 @@ class BridgeManager:
             "windows": [],
             "error": "",
         }
+        # Check token health
+        health = self._check_token_health(account_id)
+        result["token_status"] = health["token_status"]
+        result["token_detail"] = health["token_detail"]
         if not account_id:
             result["quota_status"] = "network_error"
             result["error"] = "missing account id"
@@ -10525,6 +10585,7 @@ INDEX_HTML = """<!doctype html>
               <div class="quotaMeta">
                 <span class="badge warn">${esc(quotaPlanLabel(q))}</span>
                 <span class="badge ${cls}">${esc(quotaStatusText(status))}</span>
+                ${q.token_status ? `<span class="badge ${q.token_status === 'ok' ? 'ok' : (q.token_status === 'needs_reauth' ? 'bad' : 'warn')}">${esc(q.token_status === 'ok' ? '授权有效' : (q.token_status === 'needs_reauth' ? '需重新授权' : '未知'))}</span>` : ''}
                 ${currentCls ? '<span class="badge ok">当前使用</span>' : ''}
                 ${remainingText}
               </div>
@@ -12173,12 +12234,15 @@ INDEX_HTML = """<!doctype html>
         const cls = status === 'ok' ? 'ok' : (status === 'stale_launcher' ? 'warnText' : 'bad');
         const tr = document.createElement('tr');
         const desktopLabel = row.account_id && desktopAccount ? (row.account_id === desktopAccount ? '默认' : '备用') : desktopUnknown;
+        const tkStatus = row.token_status || '';
+        const tkCls = tkStatus === 'ok' ? 'ok' : (tkStatus === 'needs_reauth' ? 'bad' : (tkStatus === 'missing' ? 'bad' : ''));
+        const tkText = tkStatus === 'ok' ? '授权有效' : (tkStatus === 'needs_reauth' ? '需重新授权' : (tkStatus === 'missing' ? '无token' : ''));
         tr.innerHTML = `
           <td>${esc(maskEmail(row.email || row.label || maskId(row.account_id || '')))}</td>
           <td>${row.claude_current ? '<span class="ok">当前</span>' : '<span class="muted">备用</span>'}</td>
           <td>${(row.cli_launchers || []).length ? '<span class="ok">launcher</span>' : '<span class="warnText">未生成</span>'}</td>
           <td>${esc(desktopLabel)}</td>
-          <td><span class="${cls}">${esc(statusText(status))}</span></td>
+          <td><span class="${cls}">${esc(statusText(status))}</span>${tkText ? ` <span class="${tkCls}">${esc(tkText)}</span>` : ''}</td>
           <td>${esc(row.advice || '')}</td>
         `;
         body.appendChild(tr);
