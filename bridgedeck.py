@@ -12055,14 +12055,33 @@ INDEX_HTML = """<!doctype html>
       setSimpleResult(`单独 Codex CLI 已选择 ${accountLabel(item)}。`);
       log(`单独 Codex CLI 账号已选中: ${maskId(accountId)}`);
     }
+    async function refreshCsrfToken() {
+      try {
+        const resp = await fetch('/');
+        const html = await resp.text();
+        const m = html.match(/CSRF_TOKEN\s*=\s*"([^"]+)"/);
+        if (m) { CSRF_TOKEN = m[1]; return true; }
+      } catch {}
+      return false;
+    }
     async function api(path, method='GET', payload=null) {
       const init = { method, headers: { 'X-CCSBT-Token': CSRF_TOKEN } };
       if (payload !== null) {
         init.headers['Content-Type'] = 'application/json';
         init.body = JSON.stringify(payload);
       }
-      const resp = await fetch(path, init);
-      const data = await resp.json().catch(() => ({}));
+      let resp = await fetch(path, init);
+      let data = await resp.json().catch(() => ({}));
+      // Auto-retry on CSRF error: fetch fresh token and retry once
+      if ((resp.status === 403 || (data.error || '').toLowerCase().includes('csrf')) && !api._csrfRetried) {
+        api._csrfRetried = true;
+        if (await refreshCsrfToken()) {
+          init.headers['X-CCSBT-Token'] = CSRF_TOKEN;
+          resp = await fetch(path, init);
+          data = await resp.json().catch(() => ({}));
+        }
+        api._csrfRetried = false;
+      }
       if (!resp.ok || data.ok === false) {
         const err = new Error(data.error || data.message || `HTTP ${resp.status}`);
         err.status = resp.status;
