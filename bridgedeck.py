@@ -9909,6 +9909,7 @@ INDEX_HTML = """<!doctype html>
     let activeOAuthFlowId = '';
     let lastQuotaData = null;
     let oauthPollTimer = null;
+    let _refreshDataPending = false;
     let oauthExpiryTimer = null;
     let activeOAuthExpiresAt = '';
     const BRIDGE_MODELS = __BRIDGE_MODELS_JSON__;
@@ -12124,6 +12125,7 @@ INDEX_HTML = """<!doctype html>
     }
     function renderCliAccounts(accounts) {
       const body = document.querySelector('#cliAccountsTable tbody');
+      if (!body) return;
       body.innerHTML = '';
       accounts.forEach((a) => {
         const tr = document.createElement('tr');
@@ -12139,6 +12141,7 @@ INDEX_HTML = """<!doctype html>
     }
     function renderProviders(data) {
       const body = document.querySelector('#providersTable tbody');
+      if (!body) return;
       body.innerHTML = '';
       const selectedAccountProvider = providerForSelectedClaudeAccount();
       data.providers.forEach((p) => {
@@ -12159,6 +12162,7 @@ INDEX_HTML = """<!doctype html>
     }
     function renderCodexProviders(data) {
       const body = document.querySelector('#codexProvidersTable tbody');
+      if (!body) return;
       body.innerHTML = '';
       data.codex_providers.forEach((p) => {
         const tr = document.createElement('tr');
@@ -12351,6 +12355,9 @@ INDEX_HTML = """<!doctype html>
       box.innerHTML = `<b>自动检测意见</b><br>${advice.map((item) => `- ${esc(item)}`).join('<br>')}`;
     }
     async function refreshData(showFeedback=false) {
+      if (_refreshDataPending) return;
+      _refreshDataPending = true;
+      try {
       if (showFeedback) {
         const result = document.getElementById('simpleResult');
         if (result) result.dataset.touched = '1';
@@ -12360,7 +12367,8 @@ INDEX_HTML = """<!doctype html>
       lastData = data;
       const mismatches = data.codex_providers.filter((p) => p.token_mismatch).length;
       document.getElementById('status').innerHTML = `版本: <b>${esc(data.version || '')}</b> | 账号: <b>${data.accounts.length}</b> | Claude providers: <b>${data.providers.length}</b> | Codex mismatches: <b class="${mismatches ? 'bad' : 'ok'}">${mismatches}</b>`;
-      document.getElementById('paths').textContent = `db: ${humanPath(data.paths.db)}\\nsettings: ${humanPath(data.paths.settings)}\\nauth_store: ${humanPath(data.paths.auth_store)}`;
+      const paths = data.paths || {};
+      document.getElementById('paths').textContent = `db: ${humanPath(paths.db)}\\nsettings: ${humanPath(paths.settings)}\\nauth_store: ${humanPath(paths.auth_store)}`;
       renderHealth(data);
       renderOverviewDashboard(data);
       renderCodingTools(data);
@@ -12408,6 +12416,7 @@ INDEX_HTML = """<!doctype html>
       refreshApiKeys();
       refreshServiceControl();
       refreshRotationStrategy();
+      } finally { _refreshDataPending = false; }
     }
     async function createProvider() {
       const accountId = document.getElementById('account').value;

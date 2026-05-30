@@ -1480,7 +1480,10 @@ def _read_bridge_state() -> dict[str, Any]:
         return {}
     try:
         payload = json.loads(BRIDGE_STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"{log_timestamp()} [bridge-state-read-error] {exc}", file=sys.stderr)
         return {}
     return payload if isinstance(payload, dict) else {}
 
@@ -1510,18 +1513,20 @@ def _write_bridge_state(state: dict[str, Any]) -> None:
 
 
 def record_bridge_stream_error(payload: dict[str, Any]) -> None:
-    state = _read_bridge_state()
-    state["last_stream_error"] = payload
-    _write_bridge_state(state)
+    with _bridge_state_lock:
+        state = _read_bridge_state()
+        state["last_stream_error"] = payload
+        _write_bridge_state(state)
 
 
 def record_bridge_active_stream(payload: dict[str, Any] | None) -> None:
-    state = _read_bridge_state()
-    if payload is None:
-        state.pop("active_stream", None)
-    else:
-        state["active_stream"] = payload
-    _write_bridge_state(state)
+    with _bridge_state_lock:
+        state = _read_bridge_state()
+        if payload is None:
+            state.pop("active_stream", None)
+        else:
+            state["active_stream"] = payload
+        _write_bridge_state(state)
 
 
 def _usage_int(value: Any) -> int:
@@ -1705,10 +1710,16 @@ class AuthStore:
         self._lock = threading.Lock()
         self._token_cache: dict[str, CachedToken] = {}
         self._session_affinity: dict[str, str] = {}
+        self._cooldown_until: dict[str, float] = {}
 
     def invalidate_cache(self, account_id: str) -> None:
         """Drop a cached token so the next request fetches a fresh one."""
-        self._token_cache.pop(account_id, None)
+        with self._lock:
+            self._token_cache.pop(account_id, None)
+            stale = [k for k, v in self._session_affinity.items() if v == account_id]
+            for k in stale:
+                del self._session_affinity[k]
+            self._cooldown_until[account_id] = time.time() + 30
 
     def load(self) -> tuple[dict[str, AccountRecord], str | None]:
         try:
@@ -1858,6 +1869,8 @@ class AuthStore:
                     ordered.append(account_id)
             if not ordered:
                 raise RuntimeError("account not found: default")
+            now = time.time()
+            ordered = [aid for aid in ordered if self._cooldown_until.get(aid, 0) <= now]
             return ordered
 
     def bind_session(self, session_key: str | None, account_id: str) -> None:
@@ -1865,6 +1878,9 @@ class AuthStore:
             return
         with self._lock:
             self._session_affinity[session_key] = account_id
+            if len(self._session_affinity) > 1000:
+                oldest = next(iter(self._session_affinity))
+                del self._session_affinity[oldest]
 
     def _refresh_token(self, refresh_token: str) -> dict[str, Any]:
         _TOKEN_REFRESH_MAX_RETRIES = 3
@@ -1896,12 +1912,15 @@ class AuthStore:
                 return response.json()
             except httpx.HTTPStatusError as exc:
                 # HTTP 4xx (including 401 invalid_grant) — do not retry
+                detail = exc.response.text
+                if 'refresh_token_reused' in detail:
+                    print(f"{log_timestamp()} [token-refresh-reused] detail={detail[:200]}", file=sys.stderr)
                 log_upstream_result(
                     "oauth_token",
                     None,
                     False,
                     status_code=exc.response.status_code,
-                    detail=exc.response.text,
+                    detail=detail,
                 )
                 raise
             except _TOKEN_REFRESH_RETRYABLE as exc:
