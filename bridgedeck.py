@@ -1050,6 +1050,8 @@ def classify_error_text(text: str | None) -> str:
     value = (text or "").lower()
     if "refresh_token_reused" in value or "refresh token reused" in value:
         return "refresh_token_reused"
+    if "token_invalidated" in value or "invalid_grant" in value:
+        return "token_invalidated"
     if "unsupported_country_region_territory" in value or "country, region, or territory not supported" in value:
         return "unsupported_region"
     if "connection refused" in value or "bridge_down" in value:
@@ -5941,30 +5943,8 @@ class BridgeManager:
             result["token_status"] = "ok"
             result["token_detail"] = f"snapshot有效 {snapshot_expires_h}h"
         elif rt_len > 0:
-            # Try bridge proxy to verify token is actually usable
-            if tcp_open("127.0.0.1", LOCAL_BRIDGE_PORT):
-                try:
-                    url = f"http://127.0.0.1:{LOCAL_BRIDGE_PORT}/accounts/{urllib.parse.quote(account_id, safe='')}/quota"
-                    raw = read_local_url(url, timeout=10, max_bytes=64 * 1024)
-                    body = json.loads(raw) if raw else {}
-                    if isinstance(body, dict) and not body.get("error"):
-                        result["token_status"] = "ok"
-                        result["token_detail"] = "refresh_token有效"
-                    elif "refresh_token_reused" in str(body.get("error", "")):
-                        result["token_status"] = "needs_reauth"
-                        result["token_detail"] = "refresh_token已消费"
-                    elif "token_invalidated" in str(body.get("error", "")):
-                        result["token_status"] = "needs_reauth"
-                        result["token_detail"] = "token已被吊销"
-                    else:
-                        result["token_status"] = "ok"
-                        result["token_detail"] = "refresh_token已授权"
-                except Exception:
-                    result["token_status"] = "ok"
-                    result["token_detail"] = "refresh_token已授权"
-            else:
-                result["token_status"] = "ok"
-                result["token_detail"] = "refresh_token已授权"
+            result["token_status"] = "unknown"
+            result["token_detail"] = "refresh_token存在，待额度查询验证"
         else:
             result["token_status"] = "missing"
             result["token_detail"] = "无token"
@@ -6004,10 +5984,16 @@ class BridgeManager:
             detail = exc.read(2048).decode("utf-8", "replace")
             result["quota_status"] = classify_error_text(detail or str(exc))
             result["error"] = detail or str(exc)
+            if result["quota_status"] in {"refresh_token_reused", "token_invalidated"}:
+                result["token_status"] = "needs_reauth"
+                result["token_detail"] = "refresh_token已失效"
             return result
         except Exception as exc:  # noqa: BLE001
             result["quota_status"] = classify_error_text(str(exc))
             result["error"] = f"{type(exc).__name__}: {exc}"
+            if result["quota_status"] in {"refresh_token_reused", "token_invalidated"}:
+                result["token_status"] = "needs_reauth"
+                result["token_detail"] = "refresh_token已失效"
             return result
 
         try:
@@ -6020,6 +6006,8 @@ class BridgeManager:
             return result
 
         result.update(summarize_quota_payload(payload))
+        result["token_status"] = "ok"
+        result["token_detail"] = "额度查询成功"
         if isinstance(payload.get("email"), str) and payload.get("email"):
             result["email"] = payload["email"]
         return result
@@ -6077,7 +6065,7 @@ class BridgeManager:
             account_id = str(account.get("account_id") or "")
             quota = quota_by_account.get(account_id, account)
             status = str(quota.get("quota_status") or "unknown")
-            if status in {"refresh_token_reused", "unsupported_region", "bridge_down", "network_error"}:
+            if status in {"refresh_token_reused", "token_invalidated", "unsupported_region", "bridge_down", "network_error"}:
                 skipped.append({**account, "reason": status})
                 continue
             provider_name = self._provider_name_for_quota(account_id, quota, existing_names)
@@ -9952,6 +9940,7 @@ INDEX_HTML = """<!doctype html>
     let lastAccounts = [];
     let activeOAuthFlowId = '';
     let lastQuotaData = null;
+    let quotaRefreshPromise = null;
     let oauthPollTimer = null;
     let _refreshDataPending = false;
     let oauthExpiryTimer = null;
@@ -10555,6 +10544,7 @@ INDEX_HTML = """<!doctype html>
         near_limit: '接近限额',
         limit_reached: '已达限',
         refresh_token_reused: '需重新授权',
+        token_invalidated: '需重新授权',
         unsupported_region: '地区受限',
         bridge_down: 'bridge 断开',
         proxy_down: '代理失败',
@@ -10880,6 +10870,8 @@ INDEX_HTML = """<!doctype html>
       `;
     }
     async function refreshQuotas() {
+      if (quotaRefreshPromise) return quotaRefreshPromise;
+      quotaRefreshPromise = (async () => {
       try {
         const payload = await api('/api/quotas');
         lastQuotaData = payload;
@@ -10899,7 +10891,11 @@ INDEX_HTML = """<!doctype html>
         setText('metricQuotaRemaining', '-');
         setMetricIcon('metricQuotaIcon', 'bad');
         return null;
+      } finally {
+        quotaRefreshPromise = null;
       }
+      })();
+      return quotaRefreshPromise;
     }
     async function saveAutoSwitch() {
       const payload = {
@@ -12298,6 +12294,7 @@ INDEX_HTML = """<!doctype html>
         near_limit: '接近限额',
         limit_reached: '额度用完',
         refresh_token_reused: '需重新授权',
+        token_invalidated: '需重新授权',
         unsupported_region: '地区受限',
         bridge_down: 'bridge 断开',
         proxy_down: 'CC Switch 断开',

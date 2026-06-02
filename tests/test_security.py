@@ -2687,6 +2687,58 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(result["quota_status"], "network_error")
         self.assertIn("TimeoutError", result["error"])
 
+    def test_token_health_does_not_query_quota_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = LauncherCase().make_manager(Path(tmp))
+            with mock.patch.object(bridgedeck, "read_local_url") as read_local:
+                result = manager._check_token_health("acct-1")
+
+        read_local.assert_not_called()
+        self.assertEqual(result["token_status"], "unknown")
+        self.assertIn("待额度查询验证", result["token_detail"])
+
+    def test_fetch_quota_queries_once_and_marks_token_ok_on_success(self) -> None:
+        payload = {
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": True,
+                "limit_reached": False,
+                "primary_window": {"used_percent": 3, "limit_window_seconds": 18000},
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = LauncherCase().make_manager(Path(tmp))
+            with (
+                mock.patch.object(bridgedeck, "tcp_open", return_value=True),
+                mock.patch.object(bridgedeck, "read_local_url", return_value=json.dumps(payload).encode("utf-8")) as read_local,
+            ):
+                result = manager._fetch_quota({"account_id": "acct-1", "email": "person@example.com"})
+
+        self.assertEqual(read_local.call_count, 1)
+        self.assertEqual(result["quota_status"], "ok")
+        self.assertEqual(result["token_status"], "ok")
+        self.assertEqual(result["token_detail"], "额度查询成功")
+
+    def test_fetch_quota_marks_reauth_on_refresh_token_reused(self) -> None:
+        error = urllib.error.HTTPError(
+            "http://127.0.0.1:8876/accounts/acct-1/quota",
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO(b'{"error":"refresh_token_reused"}'),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = LauncherCase().make_manager(Path(tmp))
+            with (
+                mock.patch.object(bridgedeck, "tcp_open", return_value=True),
+                mock.patch.object(bridgedeck, "read_local_url", side_effect=error),
+            ):
+                result = manager._fetch_quota({"account_id": "acct-1", "email": "person@example.com"})
+
+        self.assertEqual(result["quota_status"], "refresh_token_reused")
+        self.assertEqual(result["token_status"], "needs_reauth")
+        self.assertEqual(result["token_detail"], "refresh_token已失效")
+
     def test_repair_quota_query_does_not_restart_running_bridge_on_quota_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manager = LauncherCase().make_manager(Path(tmp))
