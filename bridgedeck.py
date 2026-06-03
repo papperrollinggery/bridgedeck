@@ -86,7 +86,7 @@ DEFAULT_AIMAMI_FOLLOW_PATH = Path.home() / ".cc-switch" / "bridgedeck-aimami-fol
 DEFAULT_API_KEYS_PATH = Path.home() / ".cc-switch" / "bridgedeck-keys.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.22"
+APP_VERSION = "0.2.23"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -8148,6 +8148,8 @@ def quota_window_name(seconds: Any) -> str:
         value = int(seconds)
     except (TypeError, ValueError):
         return "unknown"
+    if value <= 0:
+        return "unknown"
     if value == 18_000:
         return "5小时"
     if value == 604_800:
@@ -8169,12 +8171,19 @@ def summarize_rate_limit_windows(rate_limit: dict[str, Any]) -> tuple[list[dict[
             used = float(used_raw)
         except (TypeError, ValueError):
             continue
-        max_used = max(max_used, used)
         window_seconds = window.get("limit_window_seconds")
+        try:
+            seconds_value = int(window_seconds)
+        except (TypeError, ValueError):
+            seconds_value = 0
+        if seconds_value <= 0:
+            continue
+        max_used = max(max_used, used)
         windows.append(
             {
-                "name": quota_window_name(window_seconds),
+                "name": quota_window_name(seconds_value),
                 "used_percent": int(used) if used.is_integer() else round(used, 1),
+                "limit_window_seconds": seconds_value,
                 "reset_after_seconds": window.get("reset_after_seconds"),
                 "reset_at": window.get("reset_at"),
             }
@@ -8257,7 +8266,7 @@ def summarize_quota_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "quota_status": status,
         "windows": windows,
         "capacity_factor": capacity_factor,
-        "effective_remaining_units": effective_remaining_units(windows, capacity_factor),
+        "effective_remaining_units": effective_remaining_units(windows, capacity_factor) if windows else None,
         "additional_limits": additional_limits,
         "queried_at": int(time.time()),
     }
@@ -10430,8 +10439,8 @@ INDEX_HTML = """<!doctype html>
       const maxUsed = usedValues.length ? Math.max(...usedValues) : NaN;
       setText('metricQuotaValue', Number.isFinite(maxUsed) ? `${fmtMetricNumber(maxUsed)}%` : '未返回');
       setText('metricQuotaAccount', maskEmail(currentQuota.email || currentQuota.label || maskId(currentQuota.account_id || '')));
-      const remaining = Number(currentQuota.effective_remaining_units);
-      setText('metricQuotaRemaining', Number.isFinite(remaining) ? fmtMetricNumber(remaining) : '-');
+      const remaining = finiteNumberOrNull(currentQuota.effective_remaining_units);
+      setText('metricQuotaRemaining', remaining !== null ? fmtMetricNumber(remaining) : '-');
       setMetricIcon('metricQuotaIcon', currentQuota.quota_status === 'limit_reached' ? 'bad' : (currentQuota.quota_status === 'near_limit' ? 'warn' : 'ok'));
     }
     function renderActualCurrentAccounts(data) {
@@ -10560,6 +10569,11 @@ INDEX_HTML = """<!doctype html>
       if (!Number.isFinite(used)) return 'bad';
       return used >= 100 ? 'bad' : (used >= 80 ? 'warn' : 'ok');
     }
+    function finiteNumberOrNull(value) {
+      if (value === null || value === undefined || value === '') return null;
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
     function quotaWindowLabel(windowInfo) {
       const seconds = Number(windowInfo?.window_seconds || windowInfo?.limit_window_seconds || 0);
       if (seconds >= 600000) return '周限额';
@@ -10574,7 +10588,12 @@ INDEX_HTML = """<!doctype html>
       return date.toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
     }
     function quotaMeter(windowInfo, labelPrefix='') {
-      const used = Math.max(0, Math.min(100, Number(windowInfo?.used_percent ?? 0)));
+      const usedValue = finiteNumberOrNull(windowInfo?.used_percent);
+      const seconds = Number(windowInfo?.window_seconds || windowInfo?.limit_window_seconds || 0);
+      const rawName = String(windowInfo?.name || '').trim();
+      const hasUsableLabel = rawName && rawName !== '0天' && rawName.toLowerCase() !== 'unknown';
+      if (usedValue === null || (seconds <= 0 && !hasUsableLabel)) return '';
+      const used = Math.max(0, Math.min(100, usedValue));
       const cls = quotaPercentClass(used);
       const label = `${labelPrefix}${quotaWindowLabel(windowInfo)}`;
       const reset = quotaResetText(windowInfo);
@@ -10611,8 +10630,8 @@ INDEX_HTML = """<!doctype html>
         const sparkWindows = spark
           ? (spark.windows || []).map((w) => quotaMeter(w, 'GPT-5.3-Codex-Spark ')).join('')
           : '';
-        const remaining = Number(q.effective_remaining_units);
-        const remainingText = Number.isFinite(remaining)
+        const remaining = finiteNumberOrNull(q.effective_remaining_units);
+        const remainingText = remaining !== null
           ? `<span class="badge ok">剩余 ${esc(remaining)} 单位</span>`
           : '';
         return `<div class="quotaPill${currentCls}">

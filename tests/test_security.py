@@ -719,6 +719,7 @@ class PoolAuthStore:
     def __init__(self) -> None:
         self.token_requests: list[str | None] = []
         self.bound: tuple[str | None, str] | None = None
+        self.unsupported_models: dict[str, set[str]] = {}
 
     def get_access_token(self, requested_account_id: str | None) -> tuple[str, str]:
         self.token_requests.append(requested_account_id)
@@ -727,6 +728,12 @@ class PoolAuthStore:
 
     def bind_session(self, session_key: str | None, account_id: str) -> None:
         self.bound = (session_key, account_id)
+
+    def mark_model_unsupported(self, account_id: str, model_id: str | None) -> None:
+        self.unsupported_models.setdefault(account_id, set()).add(local_codex_bridge.normalize_bridge_model_id(model_id))
+
+    def is_model_unsupported(self, account_id: str, model_id: str | None) -> bool:
+        return local_codex_bridge.normalize_bridge_model_id(model_id) in self.unsupported_models.get(account_id, set())
 
 
 class SlowReasoningResponse:
@@ -1753,6 +1760,22 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(by_id["claude-opus-4-7"]["context_length"], 272000)
         self.assertTrue(by_id["claude-opus-4-7"]["capabilities"]["claude_desktop_gateway"])
 
+    def test_models_registry_marks_account_unsupported_models(self) -> None:
+        payload = local_codex_bridge.build_models_payload(
+            account_id="acct-pro",
+            unsupported_model_ids={"gpt-5.3-codex-spark"},
+        )
+        by_id = {item["id"]: item for item in payload["data"]}
+
+        self.assertEqual(payload["account_id"], "acct-pro")
+        self.assertEqual(payload["unsupported_model_ids"], ["gpt-5.3-codex-spark"])
+        self.assertFalse(by_id["gpt-5.3-codex-spark"]["supported_in_api"])
+        self.assertFalse(by_id["gpt-5.3-codex-spark"]["capabilities"]["responses"])
+        self.assertEqual(by_id["gpt-5.3-codex-spark"]["unsupported_reason"], "account_model_unsupported")
+        self.assertTrue(by_id["gpt-5.5"]["supported_in_api"])
+        self.assertFalse(by_id["claude-haiku-4-5"]["supported_in_api"])
+        self.assertFalse(by_id["claude-haiku-4-5"]["bridge_target_model_supported"])
+
     def test_claude_desktop_safe_route_maps_before_forwarding(self) -> None:
         body = local_codex_bridge.normalize_request_body(
             {"model": "claude-opus-4-7", "input": [{"role": "user", "content": []}]}
@@ -1824,6 +1847,40 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertIn("gpt-5.5", by_codex_id)
         self.assertEqual(by_codex_id["gpt-5.5"]["context_length"], 272000)
         self.assertEqual(by_codex_id["gpt-5.5"]["thinking"]["levels"], ["low", "medium", "high", "xhigh"])
+
+    def test_models_endpoint_marks_cached_account_model_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            auth_path = Path(tmp) / "auth.json"
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "accounts": {"acct-pro": {"refresh_token": "refresh-pro"}},
+                        "default_account_id": "acct-pro",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            auth_store = local_codex_bridge.AuthStore(auth_path)
+            auth_store.mark_model_unsupported("acct-pro", "gpt-5.3-codex-spark")
+            server = local_codex_bridge.CodexBridgeServer(
+                ("127.0.0.1", 0),
+                local_codex_bridge.CodexBridgeHandler,
+                auth_store,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+
+            request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/accounts/acct-pro/v1/models")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+
+        by_id = {item["id"]: item for item in payload["data"]}
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["account_id"], "acct-pro")
+        self.assertFalse(by_id["gpt-5.3-codex-spark"]["supported_in_api"])
+        self.assertEqual(by_id["gpt-5.3-codex-spark"]["unsupported_reason"], "account_model_unsupported")
 
     def test_models_endpoint_accepts_openai_base_url_path_variants(self) -> None:
         server = self.start_local_bridge_server()
@@ -2659,6 +2716,89 @@ class LocalCodexBridgeCase(unittest.TestCase):
         written = b"".join(call.args[0] for call in handler._write_bytes.call_args_list)
         self.assertIn(b"ok", written)
         self.assertNotIn(b"busy", written)
+
+    def test_forward_responses_fails_over_when_model_unsupported_for_account(self) -> None:
+        handler = self.make_handler()
+        auth_store = PoolAuthStore()
+        handler.server = types.SimpleNamespace(auth_store=auth_store)
+        handler.headers = {}
+        handler._send_upstream_headers = mock.Mock()
+        handler._write_bytes = mock.Mock(return_value=True)
+        responses = [
+            FakeForwardResponse(
+                400,
+                body=b"{\"detail\":\"The 'gpt-5.3-codex-spark' model is not supported when using Codex with a ChatGPT account.\"}",
+            ),
+            FakeForwardResponse(
+                200,
+                body=(
+                    b"event: response.output_text.delta\n"
+                    b'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+                ),
+            ),
+        ]
+
+        with mock.patch.object(
+            local_codex_bridge,
+            "build_upstream_http_client",
+            side_effect=lambda timeout: FakeForwardClient(responses),
+        ):
+            handler._forward_responses_body(
+                candidate_account_ids=["acct-pro20", "acct-neo"],
+                session_key="session:spark",
+                route_path="/v1/responses",
+                request_id="bridge-test",
+                request_type="responses",
+                original_body={"model": "gpt-5.3-codex-spark", "input": []},
+                normalized_body={"model": "gpt-5.3-codex-spark", "input": [], "stream": False},
+                is_stream=False,
+                requested_model="gpt-5.3-codex-spark",
+                requested_effort=None,
+                output_format="responses",
+            )
+
+        self.assertEqual(auth_store.token_requests, ["acct-pro20", "acct-neo"])
+        self.assertEqual(auth_store.unsupported_models["acct-pro20"], {"gpt-5.3-codex-spark"})
+        self.assertEqual(auth_store.bound, ("session:spark", "acct-neo"))
+        self.assertEqual(handler._send_upstream_headers.call_count, 1)
+        written = b"".join(call.args[0] for call in handler._write_bytes.call_args_list)
+        self.assertIn(b"ok", written)
+        self.assertNotIn(b"not supported", written)
+
+        auth_store.token_requests.clear()
+        handler._send_upstream_headers.reset_mock()
+        handler._write_bytes.reset_mock()
+        responses = [
+            FakeForwardResponse(
+                200,
+                body=(
+                    b"event: response.output_text.delta\n"
+                    b'data: {"type":"response.output_text.delta","delta":"ok-again"}\n\n'
+                ),
+            ),
+        ]
+        with mock.patch.object(
+            local_codex_bridge,
+            "build_upstream_http_client",
+            side_effect=lambda timeout: FakeForwardClient(responses),
+        ):
+            handler._forward_responses_body(
+                candidate_account_ids=["acct-pro20", "acct-neo"],
+                session_key="session:spark",
+                route_path="/v1/responses",
+                request_id="bridge-test-2",
+                request_type="responses",
+                original_body={"model": "gpt-5.3-codex-spark", "input": []},
+                normalized_body={"model": "gpt-5.3-codex-spark", "input": [], "stream": False},
+                is_stream=False,
+                requested_model="gpt-5.3-codex-spark",
+                requested_effort=None,
+                output_format="responses",
+            )
+
+        self.assertEqual(auth_store.token_requests, ["acct-neo"])
+        written = b"".join(call.args[0] for call in handler._write_bytes.call_args_list)
+        self.assertIn(b"ok-again", written)
 
     def test_request_log_redacts_account_id_and_sensitive_query(self) -> None:
         handler = self.make_handler()
@@ -4023,6 +4163,37 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertEqual(result["additional_limits"][0]["limit_name"], "GPT-5.3-Codex-Spark")
         self.assertEqual(result["additional_limits"][0]["quota_status"], "ok")
         self.assertEqual(result["additional_limits"][0]["windows"][1]["used_percent"], 28)
+
+    def test_quota_summary_ignores_zero_second_windows(self) -> None:
+        payload = {
+            "plan_type": "pro",
+            "rate_limit": {
+                "limit_reached": False,
+                "primary_window": {
+                    "used_percent": 0,
+                    "limit_window_seconds": 0,
+                    "reset_at": 1780469400,
+                },
+            },
+            "additional_rate_limits": [
+                {
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                    "metered_feature": "codex_bengalfox",
+                    "rate_limit": {
+                        "allowed": True,
+                        "limit_reached": False,
+                        "primary_window": {"used_percent": 0, "limit_window_seconds": 0},
+                    },
+                }
+            ],
+        }
+
+        result = bridgedeck.summarize_quota_payload(payload)
+
+        self.assertEqual(result["quota_status"], "ok")
+        self.assertEqual(result["windows"], [])
+        self.assertIsNone(result["effective_remaining_units"])
+        self.assertEqual(result["additional_limits"][0]["windows"], [])
 
     def test_read_local_url_disables_proxy_lookup(self) -> None:
         class FakeResponse:

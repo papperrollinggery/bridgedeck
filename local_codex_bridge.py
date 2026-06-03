@@ -77,6 +77,7 @@ CLAUDE_ATTRIBUTION_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 RETRYABLE_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+CHATGPT_ACCOUNT_MODEL_UNSUPPORTED_MARKER = "not supported when using codex with a chatgpt account"
 MAX_REQUEST_BODY_BYTES = 50 * 1024 * 1024  # 50 MB – refuse before reading
 MAX_DECOMPRESSED_BODY_BYTES = 10 * 1024 * 1024  # 10 MB – refuse after decompression
 SENSITIVE_QUERY_KEYS = {
@@ -636,6 +637,20 @@ def is_retryable_http_status(status_code: int) -> bool:
     return status_code in RETRYABLE_HTTP_STATUSES or 500 <= status_code < 600
 
 
+def is_model_unsupported_for_chatgpt_account(
+    status_code: int,
+    error_detail: str | None,
+    requested_model: str | None,
+) -> bool:
+    if status_code != 400 or not error_detail:
+        return False
+    text = error_detail.lower()
+    if CHATGPT_ACCOUNT_MODEL_UNSUPPORTED_MARKER not in text:
+        return False
+    model = normalize_bridge_model_id(requested_model)
+    return not model or model.lower() in text
+
+
 def is_retryable_stream_exception(exc: BaseException) -> bool:
     retryable_types = (
         httpx.RemoteProtocolError,
@@ -762,7 +777,10 @@ def model_payload_item(
     *,
     model_id: str | None = None,
     display_name: str | None = None,
+    supported_in_api: bool = True,
+    unsupported_reason: str | None = None,
 ) -> dict[str, Any]:
+    supported = bool(supported_in_api)
     item: dict[str, Any] = {
         "id": model_id or model.id,
         "slug": model_id or model.id,
@@ -775,7 +793,7 @@ def model_payload_item(
         "description": display_name or model.display_name,
         "shell_type": "shell_command",
         "visibility": "list",
-        "supported_in_api": True,
+        "supported_in_api": supported,
         "minimal_client_version": "0.98.0",
         "availability_nux": None,
         "upgrade": None,
@@ -798,12 +816,14 @@ def model_payload_item(
         "supports_search_tool": True,
         "additional_speed_tiers": ["fast"],
         "capabilities": {
-            "responses": True,
-            "messages": True,
-            "streaming": True,
-            "tools": True,
+            "responses": supported,
+            "messages": supported,
+            "streaming": supported,
+            "tools": supported,
         },
     }
+    if unsupported_reason:
+        item["unsupported_reason"] = unsupported_reason
     if model.context_length is not None:
         item["context_length"] = model.context_length
         item["context_window"] = model.context_length
@@ -824,10 +844,22 @@ def model_payload_item(
     return item
 
 
-def build_models_payload() -> dict[str, Any]:
+def build_models_payload(
+    *,
+    account_id: str | None = None,
+    unsupported_model_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    unsupported = {normalize_bridge_model_id(model_id) for model_id in (unsupported_model_ids or set())}
     data: list[dict[str, Any]] = []
     for model in BRIDGE_MODELS:
-        data.append(model_payload_item(model))
+        supported = model.id not in unsupported
+        data.append(
+            model_payload_item(
+                model,
+                supported_in_api=supported,
+                unsupported_reason=None if supported else "account_model_unsupported",
+            )
+        )
     route_map = claude_desktop_model_route_map()
     for route in CLAUDE_DESKTOP_MODEL_ROUTES:
         route_id = route["id"]
@@ -836,12 +868,20 @@ def build_models_payload() -> dict[str, Any]:
             id=source_model or route["default"],
             display_name=source_model or route["default"],
         )
-        item = model_payload_item(source, model_id=route_id, display_name=route["display_name"])
+        supported = source.id not in unsupported
+        item = model_payload_item(
+            source,
+            model_id=route_id,
+            display_name=route["display_name"],
+            supported_in_api=supported,
+            unsupported_reason=None if supported else "bridge_target_model_unsupported",
+        )
         item["owned_by"] = "anthropic"
         item["bridge_target_model"] = source.id
+        item["bridge_target_model_supported"] = supported
         item["capabilities"]["claude_desktop_gateway"] = True
         data.append(item)
-    return {
+    payload = {
         "object": "list",
         "data": data,
         "models": data,
@@ -849,6 +889,11 @@ def build_models_payload() -> dict[str, Any]:
         "first_id": data[0]["id"] if data else None,
         "last_id": data[-1]["id"] if data else None,
     }
+    if account_id:
+        payload["account_id"] = account_id
+        payload["model_capabilities_source"] = "cached_upstream_errors"
+        payload["unsupported_model_ids"] = sorted(unsupported)
+    return payload
 
 
 def mask_proxy_url(proxy_url: str | None) -> str:
@@ -1711,6 +1756,7 @@ class AuthStore:
         self._token_cache: dict[str, CachedToken] = {}
         self._session_affinity: dict[str, str] = {}
         self._cooldown_until: dict[str, float] = {}
+        self._unsupported_models: dict[str, set[str]] = {}
 
     def invalidate_cache(self, account_id: str) -> None:
         """Drop a cached token so the next request fetches a fresh one."""
@@ -1720,6 +1766,31 @@ class AuthStore:
             for k in stale:
                 del self._session_affinity[k]
             self._cooldown_until[account_id] = time.time() + 30
+
+    def mark_model_unsupported(self, account_id: str, model_id: str | None) -> None:
+        normalized_model = normalize_bridge_model_id(model_id)
+        if not account_id or not normalized_model:
+            return
+        with self._lock:
+            models = self._unsupported_models.setdefault(account_id, set())
+            models.add(normalized_model)
+
+    def is_model_unsupported(self, account_id: str, model_id: str | None) -> bool:
+        normalized_model = normalize_bridge_model_id(model_id)
+        if not account_id or not normalized_model:
+            return False
+        with self._lock:
+            return normalized_model in self._unsupported_models.get(account_id, set())
+
+    def model_support_overrides(self, requested_account_id: str | None) -> dict[str, Any]:
+        with self._lock:
+            accounts, default_account_id = self.load()
+            account_id = requested_account_id or default_account_id or ""
+            unsupported = self._unsupported_models.get(account_id, set()) if account_id in accounts else set()
+            return {
+                "account_id": account_id,
+                "unsupported_model_ids": sorted(unsupported),
+            }
 
     def load(self) -> tuple[dict[str, AccountRecord], str | None]:
         try:
@@ -3236,7 +3307,18 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             self._write_bytes(payload)
             return
         if route_path in MODELS_PATHS:
-            self._write_json_payload(200, build_models_payload())
+            requested_account_id = route_account_id or self.headers.get("x-account-id") or self.headers.get("chatgpt-account-id")
+            support = {}
+            support_overrides = getattr(self.server.auth_store, "model_support_overrides", None)
+            if callable(support_overrides):
+                support = support_overrides(requested_account_id)
+            self._write_json_payload(
+                200,
+                build_models_payload(
+                    account_id=str(support.get("account_id") or requested_account_id or ""),
+                    unsupported_model_ids=set(support.get("unsupported_model_ids") or []),
+                ),
+            )
             return
         if route_path == "/quota":
             try:
@@ -3313,7 +3395,8 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
         if content_length is not None:
             self.send_header("Content-Length", str(content_length))
-        self.send_header("Connection", "keep-alive" if is_stream else "close")
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
 
     def do_POST(self) -> None:
@@ -3625,6 +3708,17 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 self._write_json_error(500, upstream_exception_detail(exc))
             return
 
+        if len(candidate_account_ids) > 1 and requested_model:
+            is_unsupported = getattr(self.server.auth_store, "is_model_unsupported", None)
+            if callable(is_unsupported):
+                supported_candidates = [
+                    account_id
+                    for account_id in candidate_account_ids
+                    if not is_unsupported(account_id, requested_model)
+                ]
+                if supported_candidates:
+                    candidate_account_ids = supported_candidates
+
         for account_index, candidate_account_id in enumerate(candidate_account_ids):
             try:
                 account_id, access_token = self.server.auth_store.get_access_token(candidate_account_id)
@@ -3658,6 +3752,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             else error_body.decode("utf-8", "replace") if error_body is not None else None,
                         )
                         if not response.is_success:
+                            error_detail = error_body.decode("utf-8", "replace") if error_body is not None else None
                             log_upstream_diagnostic(
                                 request_type,
                                 account_id,
@@ -3666,8 +3761,22 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                                 response_headers=response.headers,
                                 request_shape=summarize_request_shape(original_body),
                                 normalized_shape=summarize_request_shape(normalized_body),
-                                error_detail=error_body.decode("utf-8", "replace") if error_body is not None else None,
+                                error_detail=error_detail,
                             )
+                            if is_model_unsupported_for_chatgpt_account(
+                                response.status_code,
+                                error_detail,
+                                requested_model,
+                            ):
+                                mark_unsupported = getattr(self.server.auth_store, "mark_model_unsupported", None)
+                                if callable(mark_unsupported):
+                                    mark_unsupported(account_id, requested_model)
+                                if has_next_account:
+                                    print(
+                                        f"{log_timestamp()} [bridge-account-failover] request_id={request_id} from_account={account_id} model={requested_model or 'unknown'} reason=model_unsupported_for_chatgpt_account",
+                                        file=sys.stderr,
+                                    )
+                                    break
                             if is_retryable_http_status(response.status_code):
                                 if is_stream and attempt < max_attempts:
                                     log_bridge_stream_retry(
@@ -3793,14 +3902,16 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                             self.send_header("Cache-Control", "no-cache, no-store")
                             self.send_header("X-Accel-Buffering", "no")
-                            self.send_header("Connection", "keep-alive")
+                            self.send_header("Connection", "close")
+                            self.close_connection = True
                             self.end_headers()
                         elif output_format == "chat":
                             self.send_response(response.status_code)
                             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                             self.send_header("Cache-Control", "no-cache, no-store")
                             self.send_header("X-Accel-Buffering", "no")
-                            self.send_header("Connection", "keep-alive")
+                            self.send_header("Connection", "close")
+                            self.close_connection = True
                             self.end_headers()
                         else:
                             self._send_upstream_headers(response, is_stream=True)

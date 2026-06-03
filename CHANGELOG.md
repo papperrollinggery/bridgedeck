@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.23
+
+- Fixed quota rendering for accounts whose upstream usage payload has no usable rate-limit window, preventing fake `0 days`, `0%`, and remaining-unit badges.
+- Added account-scoped model capability tracking in Local Codex Bridge so ChatGPT-account-only failures for `gpt-5.3-codex-spark` are cached and exposed through `/v1/models`.
+- Added failover for accountless Local Codex Bridge requests when one account rejects the requested Codex model but another account can still serve it.
+- Closed proxied SSE responses explicitly after stream completion to prevent clients from hanging on keep-alive streams without a content length.
+
 ## 0.2.22
 
 - Added Codex Desktop Doctor diagnostics for deprecated hooks config, stale Desktop app-server state, native proxy setup, version split, and recent Desktop reconnect/deprecation log signals.
