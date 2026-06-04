@@ -2088,16 +2088,51 @@ def normalize_request_body(body: dict[str, Any]) -> dict[str, Any]:
     input_items = normalized.get("input")
     if isinstance(input_items, list):
         rewritten = []
+        instruction_parts: list[str] = []
         for item in input_items:
-            if isinstance(item, dict) and "role" in item and "type" not in item:
-                cloned = dict(item)
-                cloned["type"] = "message"
-                rewritten.append(cloned)
-            else:
-                rewritten.append(item)
+            if isinstance(item, dict):
+                role = str(item.get("role") or "")
+                if role in {"system", "developer"}:
+                    text = _responses_message_text(item.get("content"))
+                    if text:
+                        instruction_parts.append(text)
+                    continue
+                if "role" in item and "type" not in item:
+                    cloned = dict(item)
+                    cloned["type"] = "message"
+                    rewritten.append(cloned)
+                    continue
+            rewritten.append(item)
+        if instruction_parts:
+            existing = normalized.get("instructions")
+            parts = [existing] if isinstance(existing, str) and existing else []
+            parts.extend(instruction_parts)
+            normalized["instructions"] = "\n\n".join(parts)
         normalized["input"] = rewritten
 
     return normalized
+
+
+def _responses_message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return _coerce_text(content)
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append(part)
+            continue
+        if not isinstance(part, dict):
+            text = _coerce_text(part)
+            if text:
+                parts.append(text)
+            continue
+        part_type = part.get("type")
+        text = part.get("text")
+        if part_type in {"input_text", "text"} and isinstance(text, str):
+            parts.append(text)
+    return "\n\n".join(part for part in parts if part)
 
 
 def parse_sse_blocks(raw_bytes: bytes) -> list[tuple[str | None, dict[str, Any] | None]]:

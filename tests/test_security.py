@@ -1819,6 +1819,24 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(with_meta["cache_key_source"], "session_identity")
         self.assertEqual(with_session["input"][0]["arguments"], '{"a":1,"b":2}')
 
+    def test_normalize_moves_responses_system_input_to_instructions(self) -> None:
+        body = local_codex_bridge.normalize_request_body(
+            {
+                "model": "gpt-5.5",
+                "instructions": "Base instruction.",
+                "input": [
+                    {"role": "system", "content": [{"type": "input_text", "text": "System rule."}]},
+                    {"role": "developer", "content": "Developer rule."},
+                    {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                ],
+            }
+        )
+
+        self.assertEqual(body["instructions"], "Base instruction.\n\nSystem rule.\n\nDeveloper rule.")
+        self.assertEqual(len(body["input"]), 1)
+        self.assertEqual(body["input"][0]["role"], "user")
+        self.assertEqual(body["input"][0]["type"], "message")
+
     def test_prompt_cache_key_can_be_disabled_by_env(self) -> None:
         with mock.patch.dict(os.environ, {"CODEX_BRIDGE_PROMPT_CACHE_KEY": "never"}):
             body, meta = local_codex_bridge.prepare_upstream_responses_body(

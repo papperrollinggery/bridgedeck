@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.24
+
+- Fixed Local Codex Bridge Responses normalization so `system` and `developer` input messages are moved into `instructions` before forwarding to the Codex upstream.
+- Added regression coverage for Claude Code requests that send system/developer content through the `/v1/responses` compatibility path.
+
 ## 0.2.23
 
 - Fixed quota rendering for accounts whose upstream usage payload has no usable rate-limit window, preventing fake `0 days`, `0%`, and remaining-unit badges.

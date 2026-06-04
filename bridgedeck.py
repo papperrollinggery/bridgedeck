@@ -86,7 +86,7 @@ DEFAULT_AIMAMI_FOLLOW_PATH = Path.home() / ".cc-switch" / "bridgedeck-aimami-fol
 DEFAULT_API_KEYS_PATH = Path.home() / ".cc-switch" / "bridgedeck-keys.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.23"
+APP_VERSION = "0.2.24"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -12074,7 +12074,7 @@ INDEX_HTML = """<!doctype html>
       try {
         const resp = await fetch('/');
         const html = await resp.text();
-        const m = html.match(/CSRF_TOKEN\s*=\s*"([^"]+)"/);
+        const m = html.match(/CSRF_TOKEN\\s*=\\s*"([^"]+)"/);
         if (m) { CSRF_TOKEN = m[1]; return true; }
       } catch {}
       return false;
