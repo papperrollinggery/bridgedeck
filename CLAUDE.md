@@ -1,39 +1,9 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **bridgedeck** (1364 symbols, 2912 relationships, 64 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **bridgedeck** (1494 symbols, 3234 relationships, 69 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
-
-## Token Management Architecture (CRITICAL)
-
-**Background:** BridgeDeck shares the macOS machine with Codex.app and AiMaMi.app. All three apps use the same OpenAI OAuth client (`app_EMoamEEZ73f0CkXaXp7hrann`) and manage tokens for the same accounts. OpenAI refresh tokens are **single-use** (rotation) — once used, the old token is immediately invalidated.
-
-**Problem (resolved):** Previously all three apps shared `~/.cc-switch/codex_oauth_auth.json`, causing a race condition where one app's refresh would invalidate the other's token → `refresh_token_reused` errors.
-
-**Current architecture:**
-
-| App | Auth file | Refresh behavior |
-|-----|-----------|-----------------|
-| Codex.app | `~/.codex/auth.json` + `~/.cc-switch/codex_oauth_auth.json` | Independent refresh |
-| AiMaMi | `~/.codex/accounts/snapshots/*.json` | Independent refresh, writes to snapshots |
-| BridgeDeck | `~/.cc-switch/bridgedeck-auth.json` | **Snapshot-first**: reads AiMaMi snapshots before refreshing |
-
-**BridgeDeck token resolution order** (`get_access_token` in `local_codex_bridge.py`):
-1. In-memory cache (`_token_cache`) — if not expiring soon, use directly
-2. AiMaMi snapshot (`~/.codex/accounts/snapshots/*__{account_id}.json`) — if access_token exists and not expired, use it (zero refresh, no token consumption)
-3. Own refresh via `bridgedeck-auth.json` — fallback only
-
-**NEVER DO:**
-- NEVER change `AUTH_STORE_PATH` back to `codex_oauth_auth.json` — this causes the multi-app race condition
-- NEVER delete `~/.codex/accounts/snapshots/` — BridgeDeck depends on AiMaMi's token snapshots
-- NEVER run token refresh in tests against real OpenAI endpoints — mock the `_refresh_token` method
-
-**If `refresh_token_reused` errors reappear:**
-1. Check if Codex.app or AiMaMi also refreshed the same account recently
-2. Check if `CODEX_SNAPSHOT_DIR` (`~/.codex/accounts/snapshots/`) exists and has fresh snapshots
-3. Check bridge log for `oauth_token` entries — count how many refreshes happened
-4. Consider separating accounts: assign some to AiMaMi only, others to BridgeDeck only
 
 ## Always Do
 
@@ -71,3 +41,61 @@ This project is indexed by GitNexus as **bridgedeck** (1364 symbols, 2912 relati
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+## BridgeDeck Safety Rules
+
+BridgeDeck is a local configuration and token bridge for Codex.app, Claude clients, CC Switch, and AiMaMi. Treat OAuth tokens, account IDs, emails, local paths, logs, screenshots, and generated diagnostics as sensitive.
+
+## Token Management Architecture (CRITICAL)
+
+BridgeDeck shares the macOS machine with Codex.app and AiMaMi.app. These apps may use the same OpenAI OAuth client (`app_EMoamEEZ73f0CkXaXp7hrann`) and the same accounts. OpenAI refresh tokens rotate on use, so multiple apps refreshing the same stored token can cause `refresh_token_reused` failures.
+
+Current token storage:
+
+| App | Auth file | Refresh behavior |
+|-----|-----------|------------------|
+| Codex.app | `~/.codex/auth.json` and `~/.cc-switch/codex_oauth_auth.json` | Independent refresh |
+| AiMaMi | `~/.codex/accounts/snapshots/*.json` | Independent refresh, writes token snapshots |
+| BridgeDeck | `~/.cc-switch/bridgedeck-auth.json` | Snapshot-first, then own refresh fallback |
+
+BridgeDeck token resolution order in `AuthStore.get_access_token()`:
+
+1. In-memory `_token_cache` when the access token is still fresh.
+2. AiMaMi/Codex snapshot from `~/.codex/accounts/snapshots/*__{account_id}.json`.
+3. Own refresh through `~/.cc-switch/bridgedeck-auth.json` only as fallback.
+
+Never:
+
+- Change `AUTH_STORE_PATH` back to `~/.cc-switch/codex_oauth_auth.json`.
+- Delete or ignore `~/.codex/accounts/snapshots/` when diagnosing token behavior.
+- Run token refresh tests against real OpenAI endpoints; mock refresh calls.
+- Publish raw auth stores, snapshots, logs, screenshots, or `.env` files.
+
+If `refresh_token_reused` reappears, first check whether Codex.app or AiMaMi recently refreshed the same account, whether fresh snapshots exist under `~/.codex/accounts/snapshots/`, and bridge logs for `oauth_token` events.
+
+## External Review Tools
+
+Use Oracle or similar external review tools only for complex code review, architecture review, difficult bug diagnosis, or broad refactor risk analysis.
+
+Before any real external review run:
+
+- Run a dry-run/package summary first.
+- Attach the smallest necessary reviewed file set.
+- Exclude auth stores, `.env`, local logs, screenshots, generated diagnostics, account data, customer data, large binaries, and unrelated private files.
+- Do not add Oracle MCP/global config without explicit user approval.
+- Treat external model output as advisory only; verify against source, tests, docs, and runtime behavior before applying changes.
+
+Allowed starting pattern:
+
+```bash
+npx -y @steipete/oracle --dry-run summary -p "<review task>" --file "<specific safe path>"
+```
+
+## Verification
+
+Run relevant checks after changes:
+
+```bash
+python3 -m py_compile bridgedeck.py local_codex_bridge.py
+python3 -m unittest discover -s tests
+```

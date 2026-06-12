@@ -25,8 +25,11 @@ The tool may access:
 本工具可能访问：
 
 - `~/.cc-switch/codex_oauth_auth.json`
+- `~/.cc-switch/bridgedeck-auth.json`
 - `~/.cc-switch/cc-switch.db`
+- `~/.cc-switch/bridgedeck-local-bridge-state.json`
 - `~/.codex/auth.json`
+- `~/.codex/accounts/snapshots/*.json`
 - `~/.codex-cli-*/auth.json`
 
 Do not publish these files.
@@ -68,7 +71,9 @@ Remove before posting:
 - emails
 - private local paths
 - screenshots containing account data
+- local token snapshots or generated diagnostics
 - 包含账号信息的截图
+- 本机 token 快照或生成的诊断文件
 
 Expected handling:
 

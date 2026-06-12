@@ -210,6 +210,7 @@ BridgeDeck may read or write these local files depending on the action you choos
 ~/.cc-switch/bridgedeck-local-bridge-state.json
 ~/.codex/config.toml
 ~/.codex/.env
+~/.codex/accounts/snapshots/*.json
 ~/.codex-cli-*
 ```
 
@@ -236,7 +237,9 @@ Never publish these files or raw screenshots from a real machine:
 ```text
 ~/.cc-switch/bridgedeck-auth.json
 ~/.cc-switch/cc-switch.db
+~/.cc-switch/bridgedeck-local-bridge-state.json
 ~/.codex/auth.json
+~/.codex/accounts/snapshots/*.json
 ~/.codex-cli-*/auth.json
 screenshots with account IDs or emails
 logs containing tokens, account IDs, emails, local paths, or proxy credentials

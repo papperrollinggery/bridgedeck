@@ -210,6 +210,7 @@ BridgeDeck 会根据你点击的操作读取或写入这些本机文件：
 ~/.cc-switch/bridgedeck-local-bridge-state.json
 ~/.codex/config.toml
 ~/.codex/.env
+~/.codex/accounts/snapshots/*.json
 ~/.codex-cli-*
 ```
 
@@ -236,7 +237,9 @@ BridgeDeck 会根据你点击的操作读取或写入这些本机文件：
 ```text
 ~/.cc-switch/bridgedeck-auth.json
 ~/.cc-switch/cc-switch.db
+~/.cc-switch/bridgedeck-local-bridge-state.json
 ~/.codex/auth.json
+~/.codex/accounts/snapshots/*.json
 ~/.codex-cli-*/auth.json
 包含账号 ID 或邮箱的截图
 包含 token、账号 ID、邮箱、本地路径或代理凭据的日志
