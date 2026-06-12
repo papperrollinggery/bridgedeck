@@ -1,6 +1,11 @@
 import Cocoa
 import Foundation
 
+if CommandLine.arguments.contains("--self-test") {
+    print("BridgeDeckLauncher OK")
+    exit(0)
+}
+
 let appURL = "http://127.0.0.1:8899"
 let uiPort = 8899
 let bridgePort = 8876
@@ -18,11 +23,6 @@ let installStateURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Application Support")
     .appendingPathComponent("BridgeDeck")
     .appendingPathComponent("install-state.json")
-
-if CommandLine.arguments.contains("--self-test") {
-    print("BridgeDeckLauncher OK")
-    exit(0)
-}
 
 func ensureLogFile() {
     let dir = logURL.deletingLastPathComponent()
@@ -106,7 +106,24 @@ func processOutput(_ executable: String, _ arguments: [String]) -> String {
 }
 
 func uiRunning() -> Bool {
-    runProcess("/usr/bin/curl", ["-fsS", "-H", "X-CCSBT-Token: probe", "\(appURL)/"], wait: true) == 0
+    if runProcess("/usr/bin/curl", ["-fsS", "-H", "X-CCSBT-Token: probe", "\(appURL)/"], wait: true) == 0 {
+        return true
+    }
+    return uiPortOwnerCommands().contains { $0.contains("bridgedeck.py") }
+}
+
+func uiPortOwnerCommands() -> [String] {
+    let output = processOutput("/usr/sbin/lsof", ["-tiTCP:\(uiPort)", "-sTCP:LISTEN"])
+    var commands: [String] = []
+    for line in output.split(whereSeparator: \.isWhitespace) {
+        guard Int32(line) != nil else { continue }
+        let command = processOutput("/bin/ps", ["-p", "\(line)", "-o", "command="])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !command.isEmpty {
+            commands.append(command)
+        }
+    }
+    return commands
 }
 
 func openUI() {
@@ -119,15 +136,24 @@ func openUI() {
 
 func startUI() {
     log("start_ui")
+    if uiRunning() {
+        openUI()
+        return
+    }
     runProcess(pythonBin(), [bridgeDeckScript, "--host", "127.0.0.1", "--port", "\(uiPort)"], wait: false, logOutput: true)
-    for _ in 0..<20 {
+    for _ in 0..<40 {
         if uiRunning() {
             openUI()
             return
         }
         Thread.sleep(forTimeInterval: 0.2)
     }
-    openUI()
+    let owners = uiPortOwnerCommands()
+    if !owners.isEmpty {
+        showInfo("8899 端口已被占用，BridgeDeck UI 未启动。\n\n\(owners.joined(separator: "\n"))")
+        return
+    }
+    showInfo("BridgeDeck UI 启动超时。请查看 ~/Library/Logs/bridgedeck-app.log。")
 }
 
 func stopUIKeepBridge() {
@@ -171,10 +197,10 @@ func showInfo(_ message: String) {
     _ = showAlert(title: "BridgeDeck", message: message, buttons: ["OK"])
 }
 
-func writeInstallSkipped() {
+func writeInstallState(status: String, ok: Bool) {
     let payload: [String: Any] = [
-        "status": "skipped",
-        "ok": true,
+        "status": status,
+        "ok": ok,
         "checked_at": ISO8601DateFormatter().string(from: Date()),
         "root": resourceURL.path,
     ]
@@ -185,6 +211,16 @@ func writeInstallSkipped() {
     }
 }
 
+func runInstallScanInBackground() {
+    log("install_scan_background")
+    runProcess(
+        pythonBin(),
+        [bridgeDeckScript, "--install-scan", "--write-install-state"],
+        wait: false,
+        logOutput: true
+    )
+}
+
 func firstInstallScanPrompt() {
     if FileManager.default.fileExists(atPath: installStateURL.path) {
         return
@@ -192,21 +228,13 @@ func firstInstallScanPrompt() {
     let response = showAlert(
         title: "BridgeDeck 安装扫描",
         message: "首次打开 BridgeDeck。建议先运行安装扫描：Python 编译检查、打包脚本语法检查、/Applications 版本检查。",
-        buttons: ["运行扫描并打开 UI", "直接打开 UI", "取消"]
+        buttons: ["直接打开 UI", "后台扫描并打开 UI", "取消"]
     )
     if response == .alertFirstButtonReturn {
-        let code = runProcess(
-            pythonBin(),
-            [bridgeDeckScript, "--install-scan", "--write-install-state"],
-            wait: true,
-            logOutput: true
-        )
-        if code != 0 {
-            showInfo("BridgeDeck 安装扫描失败。请查看 ~/Library/Logs/bridgedeck-app.log。")
-            exit(2)
-        }
+        writeInstallState(status: "skipped", ok: true)
     } else if response == .alertSecondButtonReturn {
-        writeInstallSkipped()
+        writeInstallState(status: "pending", ok: true)
+        runInstallScanInBackground()
     } else {
         exit(0)
     }

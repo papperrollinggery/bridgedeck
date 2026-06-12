@@ -108,7 +108,17 @@ python_bin() {
 }
 
 ui_running() {
-  /usr/bin/curl -fsS -H "X-CCSBT-Token: probe" "$APP_URL/" >/dev/null 2>&1
+  /usr/bin/curl -fsS -H "X-CCSBT-Token: probe" "$APP_URL/" >/dev/null 2>&1 && return 0
+  ui_port_owner_commands | /usr/bin/grep -q "bridgedeck.py"
+}
+
+ui_port_owner_commands() {
+  local pid cmd
+  /usr/sbin/lsof -tiTCP:8899 -sTCP:LISTEN 2>/dev/null | while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    cmd="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ -n "$cmd" ]] && /bin/echo "$cmd"
+  done
 }
 
 open_ui() {
@@ -119,15 +129,24 @@ open_ui() {
 
 start_ui() {
   log_event "start_ui"
+  if ui_running; then
+    open_ui
+    return 0
+  fi
   /usr/bin/nohup "$(python_bin)" "$RESOURCE_DIR/bridgedeck.py" --host 127.0.0.1 --port 8899 >> "$LOG_FILE" 2>&1 &
-  for _ in {1..30}; do
+  for _ in {1..40}; do
     if ui_running; then
       open_ui
       return 0
     fi
     sleep 0.2
   done
-  open_ui
+  owners="$(ui_port_owner_commands)"
+  if [[ -n "$owners" ]]; then
+    /usr/bin/osascript -e "display dialog \"8899 端口已被占用，BridgeDeck UI 未启动。\\n\\n$owners\" buttons {\"OK\"} with title \"BridgeDeck\"" >/dev/null 2>&1 || true
+  else
+    /usr/bin/osascript -e 'display dialog "BridgeDeck UI 启动超时。请查看 ~/Library/Logs/bridgedeck-app.log。" buttons {"OK"} with title "BridgeDeck"' >/dev/null 2>&1 || true
+  fi
 }
 
 stop_ui_keep_bridge() {
@@ -147,11 +166,18 @@ start_bridge_only() {
   /usr/bin/osascript -e 'display notification "8876 Local Bridge 已启动或已在运行" with title "BridgeDeck"' >/dev/null 2>&1 || true
 }
 
-write_install_skipped() {
+write_install_state() {
+  local status="$1"
+  local ok="$2"
   /bin/mkdir -p "$(/usr/bin/dirname "$INSTALL_STATE")"
   /bin/cat > "$INSTALL_STATE" <<STATE
-{"status":"skipped","ok":true,"checked_at":"$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')","root":"$RESOURCE_DIR"}
+{"status":"$status","ok":$ok,"checked_at":"$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')","root":"$RESOURCE_DIR"}
 STATE
+}
+
+run_install_scan_background() {
+  log_event "install_scan_background"
+  "$(python_bin)" "$RESOURCE_DIR/bridgedeck.py" --install-scan --write-install-state >> "$LOG_FILE" 2>&1 &
 }
 
 first_install_scan_prompt() {
@@ -159,19 +185,17 @@ first_install_scan_prompt() {
     return 0
   fi
   choice="$(/usr/bin/osascript <<'APPLESCRIPT' 2>/dev/null || true
-button returned of (display dialog "首次打开 BridgeDeck。建议先运行安装扫描：Python 编译检查、打包脚本语法检查、/Applications 版本检查。" buttons {"取消", "直接打开 UI", "运行扫描并打开 UI"} default button "运行扫描并打开 UI" cancel button "取消" with title "BridgeDeck 安装扫描")
+button returned of (display dialog "首次打开 BridgeDeck。建议先运行安装扫描：Python 编译检查、打包脚本语法检查、/Applications 版本检查。" buttons {"取消", "后台扫描并打开 UI", "直接打开 UI"} default button "直接打开 UI" cancel button "取消" with title "BridgeDeck 安装扫描")
 APPLESCRIPT
 )"
   log_event "first_install_choice=${choice:-<empty>}"
   case "$choice" in
-    "运行扫描并打开 UI")
-      "$(python_bin)" "$RESOURCE_DIR/bridgedeck.py" --install-scan --write-install-state >> "$LOG_FILE" 2>&1 || {
-        /usr/bin/osascript -e 'display dialog "BridgeDeck 安装扫描失败。请查看 ~/Library/Logs/bridgedeck-app.log。" buttons {"OK"} with title "BridgeDeck"' >/dev/null 2>&1 || true
-        exit 2
-      }
+    "后台扫描并打开 UI")
+      write_install_state "pending" "true"
+      run_install_scan_background
       ;;
     "直接打开 UI"|"")
-      write_install_skipped
+      write_install_state "skipped" "true"
       ;;
     *)
       exit 0

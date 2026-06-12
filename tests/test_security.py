@@ -3996,8 +3996,13 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertIn("install-state.json", launcher)
         self.assertIn("--install-scan", launcher)
         self.assertIn("首次打开 BridgeDeck", launcher)
+        self.assertIn("uiPortOwnerCommands", launcher)
+        self.assertIn("后台扫描并打开 UI", launcher)
+        self.assertIn("runInstallScanInBackground", launcher)
         self.assertIn("run_preflight", packager)
         self.assertIn("python3 -m py_compile", packager)
+        self.assertIn("ui_port_owner_commands", packager)
+        self.assertIn("run_install_scan_background", packager)
         self.assertIn("BRIDGEDECK_PACKAGE_TESTS", packager)
         self.assertIn("--install-scan --write-install-state", packager)
 
