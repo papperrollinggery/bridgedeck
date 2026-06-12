@@ -836,6 +836,47 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.addCleanup(server.shutdown)
         return server
 
+    def test_auth_store_reloads_newer_snapshot_over_cached_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshots = root / ".codex" / "accounts" / "snapshots"
+            snapshots.mkdir(parents=True)
+            auth_path = root / ".cc-switch" / "bridgedeck-auth.json"
+            auth_path.parent.mkdir(parents=True)
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "default_account_id": "acct-1",
+                        "accounts": {
+                            "acct-1": {
+                                "account_id": "acct-1",
+                                "email": "person@example.com",
+                                "refresh_token": "refresh-token",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            old_access = fake_jwt({"exp": int(time.time() + 86400), "version": "old"})
+            new_access = fake_jwt({"exp": int(time.time() + 86400), "version": "new"})
+            snapshot_path = snapshots / "user-test__acct-1.json"
+            snapshot_path.write_text(json.dumps({"tokens": {"account_id": "acct-1", "access_token": old_access}}), encoding="utf-8")
+            os.utime(snapshot_path, (1000, 1000))
+            store = local_codex_bridge.AuthStore(auth_path)
+
+            with mock.patch.object(local_codex_bridge, "CODEX_SNAPSHOT_DIR", snapshots), mock.patch.object(
+                store, "_refresh_token", side_effect=AssertionError("refresh should not run")
+            ):
+                _, first_token = store.get_access_token("acct-1")
+                snapshot_path.write_text(json.dumps({"tokens": {"account_id": "acct-1", "access_token": new_access}}), encoding="utf-8")
+                os.utime(snapshot_path, (2000, 2000))
+                _, second_token = store.get_access_token("acct-1")
+
+        self.assertEqual(first_token, old_access)
+        self.assertEqual(second_token, new_access)
+
     def post_local_bridge_json(
         self,
         server: local_codex_bridge.CodexBridgeServer,
@@ -3174,7 +3215,7 @@ class ServerCase(unittest.TestCase):
                 payload = json.loads(exc.read().decode("utf-8"))
                 return exc.code, payload
 
-    def test_aimami_status_requires_csrf_and_redacts_remote_payload(self) -> None:
+    def test_aimami_status_requires_csrf_and_is_disabled(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
 
         status, payload = self.request(
@@ -3191,24 +3232,26 @@ class ServerCase(unittest.TestCase):
             headers={"Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"},
         )
         encoded = json.dumps(payload)
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 410)
+        self.assertTrue(payload["disabled"])
         self.assertNotIn("person@example.com", encoded)
         self.assertNotIn(str(Path.home()), encoded)
-        self.assertEqual(payload["summary"]["importable"], 1)
+        self.assertEqual(payload["summary"]["importable"], 0)
 
-    def test_aimami_export_and_inject_preview_redact_remote_payloads(self) -> None:
+    def test_aimami_export_and_inject_preview_are_disabled(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)
         headers = {"Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"}
 
         for path in ("/api/aimami-sync/export-preview", "/api/aimami-sync/inject-preview"):
             status, payload = self.request(server, path, headers=headers)
             encoded = json.dumps(payload)
-            self.assertEqual(status, 200)
+            self.assertEqual(status, 410)
+            self.assertTrue(payload["disabled"])
             self.assertNotIn("person@example.com", encoded)
             self.assertNotIn(str(Path.home()), encoded)
-            self.assertIn("01234567...cdef", encoded)
+            self.assertNotIn("01234567-89ab-cdef-0123-456789abcdef", encoded)
 
-    def test_aimami_import_post_calls_manager(self) -> None:
+    def test_aimami_import_post_is_disabled(self) -> None:
         server, _ = self.start_server()
 
         status, payload = self.request(
@@ -3219,11 +3262,11 @@ class ServerCase(unittest.TestCase):
             headers={"Origin": f"http://127.0.0.1:{server.server_port}", "Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"},
         )
 
-        self.assertEqual(status, 200)
-        self.assertEqual(len(payload["imported"]), 1)
-        self.assertIn("bridge_providers", payload)
+        self.assertEqual(status, 410)
+        self.assertTrue(payload["disabled"])
+        self.assertEqual(payload["imported"], [])
 
-    def test_aimami_follow_post_endpoints_call_manager(self) -> None:
+    def test_aimami_follow_post_endpoints_are_disabled(self) -> None:
         server, _ = self.start_server()
         headers = {"Origin": f"http://127.0.0.1:{server.server_port}", "Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"}
 
@@ -3234,8 +3277,9 @@ class ServerCase(unittest.TestCase):
             body={"enabled": True},
             headers=headers,
         )
-        self.assertEqual(status, 200)
-        self.assertTrue(payload["aimami_follow"]["enabled"])
+        self.assertEqual(status, 410)
+        self.assertTrue(payload["disabled"])
+        self.assertFalse(payload["aimami_follow"]["enabled"])
 
         status, payload = self.request(
             server,
@@ -3244,11 +3288,12 @@ class ServerCase(unittest.TestCase):
             body={"force": True},
             headers=headers,
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["action"], "unchanged")
+        self.assertEqual(status, 410)
+        self.assertTrue(payload["disabled"])
+        self.assertEqual(payload["action"], "disabled")
         self.assertTrue(payload["force"])
 
-    def test_aimami_export_endpoints_preview_and_export(self) -> None:
+    def test_aimami_export_endpoints_are_disabled(self) -> None:
         server, _ = self.start_server()
         headers = {"Origin": f"http://127.0.0.1:{server.server_port}", "Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"}
 
@@ -3257,8 +3302,9 @@ class ServerCase(unittest.TestCase):
             "/api/aimami-sync/export-preview",
             headers={"Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"},
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(len(payload["missing_in_aimami"]), 1)
+        self.assertEqual(status, 410)
+        self.assertTrue(payload["disabled"])
+        self.assertEqual(payload["missing_in_aimami"], [])
 
         status, payload = self.request(
             server,
@@ -3267,11 +3313,12 @@ class ServerCase(unittest.TestCase):
             body={"account_ids": ["01234567-89ab-cdef-0123-456789abcdef"]},
             headers=headers,
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["count"], 1)
+        self.assertEqual(status, 410)
+        self.assertTrue(payload["disabled"])
+        self.assertEqual(payload["count"], 0)
         self.assertNotIn("refresh_token", json.dumps(payload))
 
-    def test_aimami_inject_endpoints_preview_and_gate(self) -> None:
+    def test_aimami_inject_endpoints_are_disabled(self) -> None:
         server, _ = self.start_server()
         headers = {"Origin": f"http://127.0.0.1:{server.server_port}", "Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"}
 
@@ -3280,7 +3327,8 @@ class ServerCase(unittest.TestCase):
             "/api/aimami-sync/inject-preview",
             headers={"Sec-Fetch-Site": "same-origin", "X-CCSBT-Token": "test-token"},
         )
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 410)
+        self.assertTrue(payload["disabled"])
         self.assertFalse(payload["can_apply"])
 
         status, payload = self.request(
@@ -3290,8 +3338,8 @@ class ServerCase(unittest.TestCase):
             body={"mode": "codex_snapshot", "account_ids": ["01234567-89ab-cdef-0123-456789abcdef"]},
             headers=headers,
         )
-        self.assertEqual(status, 409)
-        self.assertEqual(payload["reason"], "injection_verification_required")
+        self.assertEqual(status, 410)
+        self.assertTrue(payload["disabled"])
 
 
 class CodexDesktopDoctorCase(ServerCase):
@@ -5864,6 +5912,7 @@ class LauncherCase(unittest.TestCase):
         self.assertIn("fedcba...4321", encoded)
 
     def test_aimami_inject_ui_renders_409_gate_payload(self) -> None:
+        self.assertIn('class="card guideSection hidden" id="aimamiSyncPanel"', bridgedeck.INDEX_HTML)
         self.assertIn("e.status === 409", bridgedeck.INDEX_HTML)
         self.assertIn("AiMaMi inject blocked", bridgedeck.INDEX_HTML)
         self.assertIn("verification required", bridgedeck.INDEX_HTML)
@@ -6097,7 +6146,10 @@ class LauncherCase(unittest.TestCase):
             launcher = Path(result["launcher"])
             body = launcher.read_text(encoding="utf-8")
             self.assertIn('export OPENAI_API_KEY="local-bridge"', body)
-            self.assertIn('base_url="http://127.0.0.1:8876/accounts/acct-1/v1"', body)
+            self.assertIn('-c \'model_provider="bridgedeck"\'', body)
+            self.assertIn('-c \'model_providers.bridgedeck.base_url="http://127.0.0.1:8876/accounts/acct-1/v1"\'', body)
+            self.assertIn('-c \'model_providers.bridgedeck.wire_api="responses"\'', body)
+            self.assertIn('-c \'model_providers.bridgedeck.env_key="OPENAI_API_KEY"\'', body)
             self.assertNotIn("secret-refresh-token", body)
             self.assertNotIn("secret-access-token", body)
             self.assertNotIn("secret-id-token", body)
@@ -7413,7 +7465,10 @@ class LauncherCase(unittest.TestCase):
             self.assertFalse(result["desktop_affected"])
             self.assertEqual(result["current_launcher"], str(launcher))
             self.assertIn('export OPENAI_API_KEY="local-bridge"', launcher_body)
-            self.assertIn('base_url="http://127.0.0.1:8876/accounts/acct-1/v1"', launcher_body)
+            self.assertIn('-c \'model_provider="bridgedeck"\'', launcher_body)
+            self.assertIn('-c \'model_providers.bridgedeck.base_url="http://127.0.0.1:8876/accounts/acct-1/v1"\'', launcher_body)
+            self.assertIn('-c \'model_providers.bridgedeck.wire_api="responses"\'', launcher_body)
+            self.assertIn('-c \'model_providers.bridgedeck.env_key="OPENAI_API_KEY"\'', launcher_body)
             self.assertIn('exec "/opt/homebrew/bin/codex"', launcher_body)
             self.assertNotIn("CODEX_HOME", launcher_body)
             self.assertNotIn("secret-refresh-token", launcher_body)
@@ -7587,6 +7642,10 @@ class LauncherCase(unittest.TestCase):
         self.assertEqual(
             bridgedeck.classify_error_text('{"error":"refresh_token_reused"}'),
             "refresh_token_reused",
+        )
+        self.assertEqual(
+            bridgedeck.classify_error_text('{"code":"token_revoked","message":"Encountered invalidated oauth token"}'),
+            "token_invalidated",
         )
         self.assertEqual(
             bridgedeck.classify_error_text("unsupported_country_region_territory"),

@@ -16,6 +16,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -48,6 +49,8 @@ DEFAULT_AIMAMI_SNAPSHOTS_DIR = DEFAULT_CODEX_HOME / "accounts" / "snapshots"
 DEFAULT_AIMAMI_EXPORT_DIR = Path.home() / "Downloads"
 DEFAULT_AIMAMI_INJECT_VERIFICATION_PATH = Path.home() / ".cc-switch" / "bridgedeck-aimami-inject-verification.json"
 DEFAULT_AIMAMI_APP_PATH = Path("/Applications/AiMaMi.app")
+AIMAMI_SYNC_ENABLED = False
+AIMAMI_SYNC_DISABLED_REASON = "AiMaMi 新版本已移除登录转换，BridgeDeck 已暂时关闭 AiMaMi 同步入口。"
 CODEX_APP_DYNAMIC_TOOLS = (
     "automation_update",
     "read_thread_terminal",
@@ -249,6 +252,47 @@ CODEX_DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
 CODEX_DEVICE_CODE_VERIFIER = "cc-switch-codex-oauth"
 CODEX_DEVICE_USER_AGENT = "cc-switch-codex-oauth"
 CODEX_OAUTH_FLOW_TTL_SECS = 10 * 60
+
+
+def aimami_sync_disabled_payload(**extra: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": False,
+        "enabled": False,
+        "disabled": True,
+        "detected": False,
+        "reason": AIMAMI_SYNC_DISABLED_REASON,
+        "message": AIMAMI_SYNC_DISABLED_REASON,
+        "summary": {"importable": 0, "new": 0, "updated": 0, "unchanged": 0, "skipped": 0},
+        "candidates": [],
+        "imported": [],
+        "skipped": [],
+        "missing_in_aimami": [],
+        "conflicts": [],
+        "exported": [],
+        "errors": [],
+        "verification": {"verified": False, "disabled": True},
+        "aimami_running": False,
+        "can_apply": False,
+        "count": 0,
+    }
+    payload.update(extra)
+    return payload
+
+
+def aimami_follow_disabled_payload() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "disabled": True,
+        "reason": AIMAMI_SYNC_DISABLED_REASON,
+        "last_seen_active_account_key": "",
+        "last_synced_account_id": "",
+        "last_result": {
+            "ok": False,
+            "disabled": True,
+            "action": "disabled",
+            "reason": AIMAMI_SYNC_DISABLED_REASON,
+        },
+    }
 
 
 
@@ -757,6 +801,20 @@ def current_codex_launcher_path() -> Path:
     return DEFAULT_CLI_LAUNCHER_DIR / "codex-current.command"
 
 
+def codex_bridge_config_args(base_url: str) -> list[str]:
+    return [
+        'model_provider="bridgedeck"',
+        'model_providers.bridgedeck.name="BridgeDeck"',
+        f'model_providers.bridgedeck.base_url="{base_url}"',
+        'model_providers.bridgedeck.wire_api="responses"',
+        'model_providers.bridgedeck.env_key="OPENAI_API_KEY"',
+    ]
+
+
+def codex_bridge_config_flags(base_url: str) -> str:
+    return " ".join(f"-c {shlex.quote(item)}" for item in codex_bridge_config_args(base_url))
+
+
 def write_executable_file(path: Path, body: str) -> None:
     if path.is_symlink():
         raise ValueError(f"{path} 不能是符号链接")
@@ -1050,7 +1108,12 @@ def classify_error_text(text: str | None) -> str:
     value = (text or "").lower()
     if "refresh_token_reused" in value or "refresh token reused" in value:
         return "refresh_token_reused"
-    if "token_invalidated" in value or "invalid_grant" in value:
+    if (
+        "token_invalidated" in value
+        or "token_revoked" in value
+        or "invalidated oauth token" in value
+        or "invalid_grant" in value
+    ):
         return "token_invalidated"
     if "unsupported_country_region_territory" in value or "country, region, or territory not supported" in value:
         return "unsupported_region"
@@ -6778,8 +6841,8 @@ class BridgeManager:
             "account_matrix": [],
             "current_provider_from_settings": self._current_provider_from_settings(),
             "auto_switch": self._load_auto_switch_config(),
-            "aimami_sync": self.aimami_import_preview(),
-            "aimami_follow": self._load_aimami_follow_config(),
+            "aimami_sync": aimami_sync_disabled_payload(),
+            "aimami_follow": aimami_follow_disabled_payload(),
             "plugin_sync": plugin_sync,
             "plugin_status": plugin_status,
             "claude_attribution_header": self.claude_attribution_header_status(),
@@ -7702,13 +7765,13 @@ class BridgeManager:
             launcher_path = launcher_dir / f"codex-{launcher_name}.command"
             codex_bin = codex_binary_path()
             base_url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1"
-            config_arg = f'base_url="{base_url}"'
+            config_flags = codex_bridge_config_flags(base_url)
             write_executable_file(
                 launcher_path,
                 "#!/bin/zsh\n"
                 f"export CODEX_HOME={json.dumps(str(target))}\n"
                 'export OPENAI_API_KEY="local-bridge"\n'
-                f"exec {json.dumps(codex_bin)} -c '{config_arg}' \"$@\"\n",
+                f"exec {json.dumps(codex_bin)} {config_flags} \"$@\"\n",
             )
 
             return {
@@ -7716,7 +7779,7 @@ class BridgeManager:
                 "message": "CLI 启动器已创建",
                 "account_id": account_id,
                 "target_dir": str(target),
-                "run_command": f"CODEX_HOME={target} OPENAI_API_KEY=local-bridge codex -c 'base_url=\"{base_url}\"'",
+                "run_command": f"CODEX_HOME={target} OPENAI_API_KEY=local-bridge codex {config_flags}",
                 "launcher": str(launcher_path),
                 "base_url": base_url,
                 "launcher_only": True,
@@ -7739,12 +7802,12 @@ class BridgeManager:
 
         launcher_path = current_codex_launcher_path()
         base_url = f"{LOCAL_BRIDGE_BASE_URL}/accounts/{account_id}/v1"
-        config_arg = f'base_url="{base_url}"'
+        config_flags = codex_bridge_config_flags(base_url)
         write_executable_file(
             launcher_path,
             "#!/bin/zsh\n"
             'export OPENAI_API_KEY="local-bridge"\n'
-            f"exec {json.dumps(codex_binary_path())} -c '{config_arg}' \"$@\"\n",
+            f"exec {json.dumps(codex_binary_path())} {config_flags} \"$@\"\n",
         )
         return {
             "ok": True,
@@ -9476,7 +9539,7 @@ INDEX_HTML = """<!doctype html>
                 <button class="miniBtn" data-action="save-rl-thresholds">保存阈值</button>
               </div>
             </div>
-            <div class="card guideSection" id="aimamiSyncPanel" data-guide="aimamiSync">
+            <div class="card guideSection hidden" id="aimamiSyncPanel" data-guide="aimamiSync">
               <h2>AiMaMi 同步</h2>
 
               <div class="compactPanel">
@@ -13123,6 +13186,9 @@ def build_handler(
                     if not self._valid_csrf():
                         json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
                         return
+                    if not AIMAMI_SYNC_ENABLED:
+                        json_response(self, 410, aimami_sync_disabled_payload())
+                        return
                     payload = manager.aimami_import_preview()
                     if not allow_sensitive:
                         payload = redact_snapshot({"aimami_sync": payload})["aimami_sync"]
@@ -13138,6 +13204,9 @@ def build_handler(
                     if not self._valid_csrf():
                         json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
                         return
+                    if not AIMAMI_SYNC_ENABLED:
+                        json_response(self, 410, aimami_sync_disabled_payload())
+                        return
                     payload = manager.aimami_export_preview()
                     if not allow_sensitive:
                         payload = redact_snapshot(payload)
@@ -13152,6 +13221,9 @@ def build_handler(
                         return
                     if not self._valid_csrf():
                         json_response(self, 403, {"ok": False, "error": "Invalid CSRF token"})
+                        return
+                    if not AIMAMI_SYNC_ENABLED:
+                        json_response(self, 410, aimami_sync_disabled_payload())
                         return
                     payload = manager.aimami_inject_preview()
                     if not allow_sensitive:
@@ -13425,6 +13497,10 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/aimami-follow-config":
+                    if not AIMAMI_SYNC_ENABLED:
+                        result = aimami_sync_disabled_payload(aimami_follow=aimami_follow_disabled_payload())
+                        json_response(self, 410, result)
+                        return
                     if len(payload) > _MAX_DICT_KEYS:
                         json_response(self, 400, {"ok": False, "error": f"输入验证失败: payload 键数量超出限制 ({len(payload)} > {_MAX_DICT_KEYS})"})
                         return
@@ -13432,6 +13508,14 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/aimami-follow-run":
+                    if not AIMAMI_SYNC_ENABLED:
+                        result = aimami_sync_disabled_payload(
+                            aimami_follow=aimami_follow_disabled_payload(),
+                            action="disabled",
+                            force=bool(payload.get("force", False)),
+                        )
+                        json_response(self, 410, result)
+                        return
                     result = manager.run_aimami_follow(force=bool(payload.get("force", False)))
                     json_response(self, 200, result)
                     return
@@ -13440,10 +13524,16 @@ def build_handler(
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/aimami-sync/import":
+                    if not AIMAMI_SYNC_ENABLED:
+                        json_response(self, 410, aimami_sync_disabled_payload())
+                        return
                     result = manager.import_aimami_accounts(create_missing=bool(payload.get("create_missing", False)))
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/aimami-sync/export":
+                    if not AIMAMI_SYNC_ENABLED:
+                        json_response(self, 410, aimami_sync_disabled_payload())
+                        return
                     err = _validate_list_field(payload, "account_ids")
                     if err:
                         json_response(self, 400, {"ok": False, "error": err})
@@ -13453,6 +13543,9 @@ def build_handler(
                     json_response(self, 200 if result.get("ok", True) else 409, result)
                     return
                 if self.path == "/api/aimami-sync/inject":
+                    if not AIMAMI_SYNC_ENABLED:
+                        json_response(self, 410, aimami_sync_disabled_payload())
+                        return
                     err = _validate_list_field(payload, "account_ids")
                     if err:
                         json_response(self, 400, {"ok": False, "error": err})

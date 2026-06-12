@@ -115,6 +115,7 @@ class AccountRecord:
 class CachedToken:
     token: str
     expires_at: float
+    source_mtime: float | None = None
 
     def is_expiring_soon(self) -> bool:
         return (self.expires_at - time.time()) < TOKEN_REFRESH_BUFFER_SECS
@@ -1872,8 +1873,27 @@ class AuthStore:
             expires_at = AuthStore._jwt_exp(access_token)
             if not expires_at or (expires_at - time.time()) < TOKEN_REFRESH_BUFFER_SECS:
                 continue
-            return CachedToken(token=access_token, expires_at=expires_at)
+            try:
+                source_mtime = entry.stat().st_mtime
+            except OSError:
+                source_mtime = None
+            return CachedToken(token=access_token, expires_at=expires_at, source_mtime=source_mtime)
         return None
+
+    @staticmethod
+    def _codex_snapshot_newer_than_cache(account_id: str, cached: CachedToken) -> bool:
+        if not CODEX_SNAPSHOT_DIR.is_dir():
+            return False
+        cached_mtime = cached.source_mtime or 0.0
+        for entry in CODEX_SNAPSHOT_DIR.iterdir():
+            if not entry.name.endswith(f"__{account_id}.json"):
+                continue
+            try:
+                if entry.stat().st_mtime > cached_mtime:
+                    return True
+            except OSError:
+                continue
+        return False
 
     def get_access_token(self, requested_account_id: str | None) -> tuple[str, str]:
         lock_path = self.path.with_suffix(".lock")
@@ -1888,7 +1908,11 @@ class AuthStore:
                     raise RuntimeError(f"account not found: {requested_account_id or 'default'}")
 
                 cached = self._token_cache.get(account_id)
-                if cached and not cached.is_expiring_soon():
+                if (
+                    cached
+                    and not cached.is_expiring_soon()
+                    and not self._codex_snapshot_newer_than_cache(account_id, cached)
+                ):
                     return account_id, cached.token
 
                 # Try AiMaMi/Codex snapshot before triggering our own refresh
