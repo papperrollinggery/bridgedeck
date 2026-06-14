@@ -102,6 +102,12 @@ python3 bridgedeck.py --local-bridge stop
 
 BridgeDeck stores only the refresh token in the CC Switch-compatible OAuth account store. It does not return the access token to the page.
 
+### Refresh Quota After Reauthorization
+
+After reauthorizing an account, click `Refresh quota` on the quota board or restart the Local Codex Bridge. BridgeDeck treats a newer `~/.cc-switch/bridgedeck-auth.json` as authoritative, invalidates older in-memory access tokens, and ignores Codex/AiMaMi account snapshots from `~/.codex/accounts/snapshots/` when those snapshots are older than the BridgeDeck auth store.
+
+This is why an account can briefly show both `authorized` and `needs reauthorization`: the UI may have a fresh refresh token while the already running bridge process still has an old access token or an older snapshot. Refreshing quota now forces the bridge to re-check the newer auth store. If an account still shows `network_error` with an upstream `403` or HTML usage response, retry later or check the active proxy; that response is not always an invalid authorization.
+
 ### Route Claude Code Through a Selected ChatGPT Account
 
 1. Make sure the target account exists in CC Switch or authorize it through BridgeDeck.
@@ -255,6 +261,7 @@ logs containing tokens, account IDs, emails, local paths, or proxy credentials
 | Proxy returns `503` | Check the active proxy, CC Switch service, and Local Codex Bridge status. Temporary upstream service errors can also appear as `503`. |
 | Desktop client rejects model names | Use the model aliases shown by BridgeDeck and confirm the UI displays the actual routed model. |
 | Quota/account mismatch | Use the status matrix and provider mismatch panel, then re-authorize or update the provider binding. |
+| Quota does not update after reauthorization | Click `Refresh quota` or restart the Local Codex Bridge so the running bridge reloads the newer `bridgedeck-auth.json`; reopen BridgeDeck after upgrading the app. |
 
 ## CLI Options
 

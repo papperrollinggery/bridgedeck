@@ -859,6 +859,7 @@ class LocalCodexBridgeCase(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            os.utime(auth_path, (500, 500))
             old_access = fake_jwt({"exp": int(time.time() + 86400), "version": "old"})
             new_access = fake_jwt({"exp": int(time.time() + 86400), "version": "new"})
             snapshot_path = snapshots / "user-test__acct-1.json"
@@ -876,6 +877,109 @@ class LocalCodexBridgeCase(unittest.TestCase):
 
         self.assertEqual(first_token, old_access)
         self.assertEqual(second_token, new_access)
+
+    def test_auth_store_refreshes_cached_token_after_auth_store_reauthorized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshots = root / ".codex" / "accounts" / "snapshots"
+            snapshots.mkdir(parents=True)
+            auth_path = root / ".cc-switch" / "bridgedeck-auth.json"
+            auth_path.parent.mkdir(parents=True)
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "default_account_id": "acct-1",
+                        "accounts": {
+                            "acct-1": {
+                                "account_id": "acct-1",
+                                "email": "person@example.com",
+                                "refresh_token": "refresh-old",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(auth_path, (1000, 1000))
+            old_access = fake_jwt({"exp": int(time.time() + 86400), "version": "old"})
+            new_access = fake_jwt({"exp": int(time.time() + 86400), "version": "new"})
+            store = local_codex_bridge.AuthStore(auth_path)
+
+            def refresh(refresh_token: str) -> dict[str, Any]:
+                return {
+                    "access_token": old_access if refresh_token == "refresh-old" else new_access,
+                    "expires_in": 86400,
+                }
+
+            with mock.patch.object(local_codex_bridge, "CODEX_SNAPSHOT_DIR", snapshots), mock.patch.object(
+                store, "_refresh_token", side_effect=refresh
+            ) as refresh_mock:
+                _, first_token = store.get_access_token("acct-1")
+                auth_path.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "default_account_id": "acct-1",
+                            "accounts": {
+                                "acct-1": {
+                                    "account_id": "acct-1",
+                                    "email": "person@example.com",
+                                    "refresh_token": "refresh-new",
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                os.utime(auth_path, (2000, 2000))
+                _, second_token = store.get_access_token("acct-1")
+
+        self.assertEqual(first_token, old_access)
+        self.assertEqual(second_token, new_access)
+        self.assertEqual([call.args[0] for call in refresh_mock.call_args_list], ["refresh-old", "refresh-new"])
+
+    def test_auth_store_ignores_snapshot_older_than_reauthorized_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshots = root / ".codex" / "accounts" / "snapshots"
+            snapshots.mkdir(parents=True)
+            auth_path = root / ".cc-switch" / "bridgedeck-auth.json"
+            auth_path.parent.mkdir(parents=True)
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "default_account_id": "acct-1",
+                        "accounts": {
+                            "acct-1": {
+                                "account_id": "acct-1",
+                                "email": "person@example.com",
+                                "refresh_token": "refresh-new",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(auth_path, (2000, 2000))
+            stale_snapshot_access = fake_jwt({"exp": int(time.time() + 86400), "version": "stale-snapshot"})
+            refreshed_access = fake_jwt({"exp": int(time.time() + 86400), "version": "refreshed"})
+            snapshot_path = snapshots / "user-test__acct-1.json"
+            snapshot_path.write_text(
+                json.dumps({"tokens": {"account_id": "acct-1", "access_token": stale_snapshot_access}}),
+                encoding="utf-8",
+            )
+            os.utime(snapshot_path, (1000, 1000))
+            store = local_codex_bridge.AuthStore(auth_path)
+
+            with mock.patch.object(local_codex_bridge, "CODEX_SNAPSHOT_DIR", snapshots), mock.patch.object(
+                store, "_refresh_token", return_value={"access_token": refreshed_access, "expires_in": 86400}
+            ) as refresh_mock:
+                _, token = store.get_access_token("acct-1")
+
+        self.assertEqual(token, refreshed_access)
+        refresh_mock.assert_called_once_with("refresh-new")
 
     def post_local_bridge_json(
         self,
@@ -4363,6 +4467,44 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertTrue(result["requires_force"])
         self.assertIn("正在被客户端使用", result["message"])
         kill.assert_not_called()
+
+    def test_start_local_bridge_child_disables_bind_failure_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = bridgedeck.BridgeManager(
+                bridgedeck.ManagerPaths(
+                    db=root / "cc-switch.db",
+                    settings=root / "settings.json",
+                    auth_store=root / "auth.json",
+                )
+            )
+            script = root / "local_codex_bridge.py"
+            captured: dict[str, Any] = {}
+            calls = {"tcp_open": 0}
+
+            def fake_tcp_open(*_: Any) -> bool:
+                calls["tcp_open"] += 1
+                return calls["tcp_open"] > 1
+
+            def fake_popen(*args: Any, **kwargs: Any) -> object:
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+                return object()
+
+            with (
+                mock.patch.object(bridgedeck, "tcp_open", side_effect=fake_tcp_open),
+                mock.patch.object(bridgedeck, "port_processes", return_value=[]),
+                mock.patch.object(bridgedeck, "port_active_connections", return_value=[]),
+                mock.patch.object(bridgedeck, "detect_upstream_proxy", return_value=""),
+                mock.patch.object(bridgedeck, "find_local_bridge_script", return_value=script),
+                mock.patch.object(bridgedeck, "find_local_bridge_python", return_value=sys.executable),
+                mock.patch.object(bridgedeck, "read_local_bridge_state", return_value={}),
+                mock.patch.object(bridgedeck.subprocess, "Popen", side_effect=fake_popen),
+            ):
+                result = manager._start_local_bridge()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(captured["kwargs"]["env"]["CODEX_BRIDGE_BIND_FAILURE_SLEEP_SECS"], "0")
 
     def test_remote_mode_blocks_secret_reveal(self) -> None:
         server, _ = self.start_server(allow_sensitive=False, allow_remote_access=True)

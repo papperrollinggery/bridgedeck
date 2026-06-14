@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.25
+
+- Fixed Local Codex Bridge token selection after reauthorization so a newer `bridgedeck-auth.json` invalidates stale in-memory access tokens.
+- Ignored Codex/AiMaMi account snapshots older than the BridgeDeck auth store when checking quota or serving account-scoped local API traffic.
+- Made BridgeDeck-started Local Codex Bridge children exit immediately on bind failure, preventing duplicate 8876 startup backoff processes.
+- Documented quota refresh and reauthorization behavior in English and Chinese README files.
+
 ## 0.2.24
 
 - Fixed Local Codex Bridge Responses normalization so `system` and `developer` input messages are moved into `instructions` before forwarding to the Codex upstream.

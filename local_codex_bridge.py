@@ -116,6 +116,7 @@ class CachedToken:
     token: str
     expires_at: float
     source_mtime: float | None = None
+    auth_store_mtime: float | None = None
 
     def is_expiring_soon(self) -> bool:
         return (self.expires_at - time.time()) < TOKEN_REFRESH_BUFFER_SECS
@@ -1842,6 +1843,12 @@ class AuthStore:
             if tmp.exists():
                 tmp.unlink()
 
+    def _auth_store_mtime(self) -> float | None:
+        try:
+            return self.path.stat().st_mtime
+        except OSError:
+            return None
+
     @staticmethod
     def _jwt_exp(token: str) -> float | None:
         """Extract expiry timestamp from JWT access_token without verification."""
@@ -1855,7 +1862,7 @@ class AuthStore:
             return None
 
     @staticmethod
-    def _try_load_codex_snapshot(account_id: str) -> CachedToken | None:
+    def _try_load_codex_snapshot(account_id: str, *, min_source_mtime: float | None = None) -> CachedToken | None:
         """Try to load a fresh access_token from AiMaMi/Codex snapshot files."""
         if not CODEX_SNAPSHOT_DIR.is_dir():
             return None
@@ -1877,8 +1884,21 @@ class AuthStore:
                 source_mtime = entry.stat().st_mtime
             except OSError:
                 source_mtime = None
+            if (
+                min_source_mtime is not None
+                and source_mtime is not None
+                and source_mtime < min_source_mtime
+            ):
+                continue
             return CachedToken(token=access_token, expires_at=expires_at, source_mtime=source_mtime)
         return None
+
+    @staticmethod
+    def _auth_store_newer_than_cache(auth_store_mtime: float | None, cached: CachedToken) -> bool:
+        return (
+            auth_store_mtime is not None
+            and (cached.auth_store_mtime is None or auth_store_mtime > cached.auth_store_mtime)
+        )
 
     @staticmethod
     def _codex_snapshot_newer_than_cache(account_id: str, cached: CachedToken) -> bool:
@@ -1903,6 +1923,7 @@ class AuthStore:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             with self._lock:
                 accounts, default_account_id = self.load()
+                auth_store_mtime = self._auth_store_mtime()
                 account_id = requested_account_id or default_account_id
                 if not account_id or account_id not in accounts:
                     raise RuntimeError(f"account not found: {requested_account_id or 'default'}")
@@ -1911,13 +1932,15 @@ class AuthStore:
                 if (
                     cached
                     and not cached.is_expiring_soon()
+                    and not self._auth_store_newer_than_cache(auth_store_mtime, cached)
                     and not self._codex_snapshot_newer_than_cache(account_id, cached)
                 ):
                     return account_id, cached.token
 
                 # Try AiMaMi/Codex snapshot before triggering our own refresh
-                snapshot_token = self._try_load_codex_snapshot(account_id)
+                snapshot_token = self._try_load_codex_snapshot(account_id, min_source_mtime=auth_store_mtime)
                 if snapshot_token:
+                    snapshot_token.auth_store_mtime = auth_store_mtime
                     self._token_cache[account_id] = snapshot_token
                     return account_id, snapshot_token.token
 
@@ -1935,10 +1958,12 @@ class AuthStore:
                     record.refresh_token = new_refresh
                     accounts[account_id] = record
                     self.save(accounts, default_account_id)
+                    auth_store_mtime = self._auth_store_mtime()
 
                 self._token_cache[account_id] = CachedToken(
                     token=access_token,
                     expires_at=time.time() + expires_in,
+                    auth_store_mtime=auth_store_mtime,
                 )
                 return account_id, access_token
         finally:

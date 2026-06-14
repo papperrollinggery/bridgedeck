@@ -89,7 +89,7 @@ DEFAULT_AIMAMI_FOLLOW_PATH = Path.home() / ".cc-switch" / "bridgedeck-aimami-fol
 DEFAULT_API_KEYS_PATH = Path.home() / ".cc-switch" / "bridgedeck-keys.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.24"
+APP_VERSION = "0.2.25"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -5861,6 +5861,7 @@ class BridgeManager:
         env = os.environ.copy()
         env["CODEX_BRIDGE_HOST"] = "127.0.0.1"
         env["CODEX_BRIDGE_PORT"] = str(LOCAL_BRIDGE_PORT)
+        env["CODEX_BRIDGE_BIND_FAILURE_SLEEP_SECS"] = "0"
         no_proxy = "127.0.0.1,localhost,::1"
         env["NO_PROXY"] = ",".join(filter(None, [env.get("NO_PROXY", ""), no_proxy]))
         env["no_proxy"] = ",".join(filter(None, [env.get("no_proxy", ""), no_proxy]))

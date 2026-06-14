@@ -102,6 +102,12 @@ python3 bridgedeck.py --local-bridge stop
 
 BridgeDeck 只把 refresh token 写入 CC Switch 兼容的 OAuth 账号池，不会把 access token 返回给页面。
 
+### 重新授权后刷新额度
+
+账号重新授权后，在额度面板点击 `刷新额度`，或重启 Local Codex Bridge。BridgeDeck 会把更新后的 `~/.cc-switch/bridgedeck-auth.json` 视为权威来源，使旧的内存 access token 失效；如果 `~/.codex/accounts/snapshots/` 里的 Codex/AiMaMi 账号快照比 BridgeDeck 授权文件更旧，也会被忽略。
+
+这就是为什么账号可能短时间同时显示“授权有效”和“需要重新授权”：UI 已经拿到了新的 refresh token，但正在运行的 bridge 进程可能还持有旧 access token，或读到了更旧的账号快照。现在点击刷新额度会强制 bridge 重新检查更新后的授权文件。如果账号仍显示上游 `403`、HTML 用量页或 `network_error`，先重试或检查当前代理；这类返回不一定表示授权失效。
+
 ### 让 Claude Code 使用指定 ChatGPT 账号
 
 1. 确认目标账号已在 CC Switch 里存在，或先通过 BridgeDeck 授权。
@@ -255,6 +261,7 @@ BridgeDeck 会根据你点击的操作读取或写入这些本机文件：
 | 代理返回 `503` | 检查当前代理、CC Switch 服务和 Local Codex Bridge 状态；上游临时错误也可能表现为 `503`。 |
 | Desktop 客户端拒绝模型名 | 使用 BridgeDeck 页面显示的模型别名，并确认实际路由模型正确。 |
 | 额度或账号不一致 | 看状态矩阵和 Provider 不一致面板，然后重新授权或更新 Provider 绑定。 |
+| 重新授权后额度不更新 | 点击 `刷新额度` 或重启 Local Codex Bridge，让运行中的 bridge 重新读取更新后的 `bridgedeck-auth.json`；升级 App 后重新打开 BridgeDeck。 |
 
 ## 命令行参数
 
