@@ -79,8 +79,6 @@ http://127.0.0.1:8899
 python3 bridgedeck.py --install-scan
 ```
 
-Windows/WSL 源码运行可参考：[Windows 系统配置指南](docs/windows-configuration.zh-CN.md)。仓库同时提供 `scripts/windows/` 启动、代理 relay 和可选 auth 初始化脚本。
-
 只操作 Local Codex Bridge：
 
 ```bash
