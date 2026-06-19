@@ -64,6 +64,34 @@ function Get-RelayProcesses([string]$ListenHost, [int]$ListenPort, [string]$Targ
   return @($processes)
 }
 
+function Test-TcpPort([string]$HostName, [int]$Port, [int]$TimeoutMilliseconds = 1000) {
+  $client = New-Object System.Net.Sockets.TcpClient
+  try {
+    $async = $client.BeginConnect($HostName, $Port, $null, $null)
+    if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMilliseconds, $false)) {
+      return $false
+    }
+    $client.EndConnect($async)
+    return $true
+  } catch {
+    return $false
+  } finally {
+    $client.Close()
+  }
+}
+
+function Wait-RelayReady([string]$ListenHost, [int]$ListenPort, [string]$TargetHost, [int]$TargetPort) {
+  for ($attempt = 0; $attempt -lt 10; $attempt++) {
+    $process = Get-RelayProcesses -ListenHost $ListenHost -ListenPort $ListenPort -TargetHost $TargetHost -TargetPort $TargetPort |
+      Select-Object -First 1
+    if ($process -and (Test-TcpPort -HostName $ListenHost -Port $ListenPort -TimeoutMilliseconds 500)) {
+      return $process
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  return $null
+}
+
 function Invoke-WslText([string]$Command) {
   $args = @()
   if (-not [string]::IsNullOrWhiteSpace($WslDistro)) {
@@ -98,6 +126,9 @@ if (-not $SkipRelay) {
   }
 
   $relayScript = Join-Path $BridgeDeckDir "scripts\windows\windows-proxy-relay.py"
+  if (-not (Test-TcpPort -HostName $ProxyTargetHost -Port $ProxyTargetPort -TimeoutMilliseconds 1000)) {
+    throw "Proxy target is not reachable: $ProxyTargetHost`:$ProxyTargetPort. Start the Windows proxy or pass the correct -ProxyTargetHost/-ProxyTargetPort."
+  }
   $relayProcesses = Get-RelayProcesses -ListenHost $RelayListenHost -ListenPort $RelayListenPort
   $relayProcess = Get-RelayProcesses -ListenHost $RelayListenHost -ListenPort $RelayListenPort -TargetHost $ProxyTargetHost -TargetPort $ProxyTargetPort |
     Select-Object -First 1
@@ -129,11 +160,10 @@ if (-not $SkipRelay) {
     }
     Start-Process -FilePath $PythonExe -ArgumentList (($relayArgs | ForEach-Object { Quote-WindowsArgument $_ }) -join " ") -WindowStyle Hidden
     Start-Sleep -Seconds 1
-    $relayProcess = Get-RelayProcesses -ListenHost $RelayListenHost -ListenPort $RelayListenPort -TargetHost $ProxyTargetHost -TargetPort $ProxyTargetPort |
-      Select-Object -First 1
-    if (-not $relayProcess) {
-      throw "Proxy relay failed to start: $RelayListenHost`:$RelayListenPort -> $ProxyTargetHost`:$ProxyTargetPort. Check Python, bind permissions, and whether another process owns the listen port."
-    }
+  }
+  $relayProcess = Wait-RelayReady -ListenHost $RelayListenHost -ListenPort $RelayListenPort -TargetHost $ProxyTargetHost -TargetPort $ProxyTargetPort
+  if (-not $relayProcess) {
+    throw "Proxy relay is not reachable: $RelayListenHost`:$RelayListenPort -> $ProxyTargetHost`:$ProxyTargetPort. Check Python, bind permissions, and whether another process owns the listen port."
   }
 }
 
