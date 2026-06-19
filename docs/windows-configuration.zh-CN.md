@@ -153,7 +153,7 @@ C:\Users\<Windows用户名>\.cc-switch\bridgedeck-auth.json
 powershell -ExecutionPolicy Bypass -File C:\Users\<Windows用户名>\tools\bridgedeck\scripts\windows\Import-BridgeDeckCodexAuth.ps1 -ConfirmRefreshTokenCopy
 ```
 
-脚本不会打印 token；如果目标 auth store 已存在，会先创建 `bridgedeck-auth.json.backup-<timestamp>`。
+脚本不会打印 token；如果目标 auth store 已存在，会先创建 `bridgedeck-auth.json.backup-<timestamp>`。默认不会覆盖已有 `default_account_id`；如果要把导入账号设为默认账号，额外传入 `-SetDefault`。
 
 ## 4. 启动 Local Bridge
 
@@ -256,7 +256,7 @@ C:\Users\<Windows用户名>\.cc-switch\bridgedeck-local-bridge.log
 Unexpected UTF-8 BOM
 ```
 
-用 UTF-8 无 BOM 重写 `bridgedeck-auth.json`，或重新运行 `Import-BridgeDeckCodexAuth.ps1 -ConfirmRefreshTokenCopy`。
+用 UTF-8 无 BOM 重写 `bridgedeck-auth.json`，或重新运行 `Import-BridgeDeckCodexAuth.ps1 -ConfirmRefreshTokenCopy`。如果要切换默认账号，额外传入 `-SetDefault`。
 
 ### WSL 里连不上 Windows 代理
 

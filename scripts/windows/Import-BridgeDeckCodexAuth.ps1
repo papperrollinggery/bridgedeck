@@ -2,7 +2,8 @@
 param(
   [string]$CodexAuthPath = (Join-Path $env:USERPROFILE ".codex\auth.json"),
   [string]$BridgeAuthPath = (Join-Path $env:USERPROFILE ".cc-switch\bridgedeck-auth.json"),
-  [switch]$ConfirmRefreshTokenCopy
+  [switch]$ConfirmRefreshTokenCopy,
+  [switch]$SetDefault
 )
 
 $ErrorActionPreference = "Stop"
@@ -110,16 +111,26 @@ if ($PSCmdlet.ShouldProcess($BridgeAuthPath, "copy Codex refresh_token into Brid
     $outAccounts[$key] = $accounts[$key]
   }
 
+  $defaultAccountId = [string]$existing.default_account_id
+  if ($SetDefault -or [string]::IsNullOrWhiteSpace($defaultAccountId)) {
+    $defaultAccountId = $accountId
+  }
+
   $out = [ordered]@{
     version = 1
     accounts = $outAccounts
-    default_account_id = $accountId
+    default_account_id = $defaultAccountId
   }
 
   $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllText($BridgeAuthPath, ($out | ConvertTo-Json -Depth 8), $utf8NoBom)
 
   "BridgeDeck auth store initialized without printing tokens."
+  if ($defaultAccountId -eq $accountId) {
+    "Imported account is the default account."
+  } else {
+    "Existing default account preserved. Re-run with -SetDefault to switch defaults."
+  }
   if ($backup) {
     "Backup written: $backup"
   }
