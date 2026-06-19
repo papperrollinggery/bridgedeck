@@ -125,12 +125,16 @@ function Invoke-WslText([string]$Command) {
   if (-not [string]::IsNullOrWhiteSpace($WslDistro)) {
     $args += @("-d", $WslDistro)
   }
-  $args += @("sh", "-lc", $Command)
+  $args += @("sh", "-c", $Command)
   $output = & $WslExe @args
   if ($LASTEXITCODE -ne 0) {
     throw "wsl.exe failed while running: $Command"
   }
-  return (($output -join "`n").Trim())
+  $lines = @($output | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  if ($lines.Count -eq 0) {
+    return ""
+  }
+  return $lines[-1]
 }
 
 if (-not (Test-Path -LiteralPath (Join-Path $BridgeDeckDir "bridgedeck.py"))) {
