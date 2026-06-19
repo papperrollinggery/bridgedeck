@@ -217,6 +217,7 @@ CODEX_DESKTOP_BRIDGE_DISABLED_MESSAGE = (
 PROXY_DIAG_OPENAI_URL = "https://api.openai.com/v1/models"
 PROXY_DIAG_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_PROXY_LOOKUP_KEYS = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy")
+CODEX_BRIDGE_UPSTREAM_PROXY_ENV = "CODEX_BRIDGE_UPSTREAM_PROXY"
 CODEX_NATIVE_PROXY_REQUIRED_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -1167,6 +1168,9 @@ def proxy_url_from_env_values(values: dict[str, str]) -> str:
 
 
 def detect_codex_proxy_url() -> tuple[str, str]:
+    bridge_proxy = str(os.environ.get(CODEX_BRIDGE_UPSTREAM_PROXY_ENV) or "").strip()
+    if bridge_proxy:
+        return bridge_proxy, f"env:{CODEX_BRIDGE_UPSTREAM_PROXY_ENV}"
     env_file = load_env_file(DEFAULT_CODEX_HOME / ".env")
     env_proxy = proxy_url_from_env_values(env_file)
     if env_proxy:
@@ -2715,12 +2719,12 @@ def find_local_bridge_python() -> str | None:
 
 
 def detect_upstream_proxy(processes: list[dict[str, Any]] | None = None) -> str:
-    value = os.environ.get("CODEX_BRIDGE_UPSTREAM_PROXY", "").strip()
+    value = os.environ.get(CODEX_BRIDGE_UPSTREAM_PROXY_ENV, "").strip()
     if value:
         return value
     for proc in processes or []:
         env_text = process_environment_text(int(proc.get("pid") or 0))
-        match = re.search(r"CODEX_BRIDGE_UPSTREAM_PROXY=([^ \n]+)", env_text)
+        match = re.search(rf"{re.escape(CODEX_BRIDGE_UPSTREAM_PROXY_ENV)}=([^ \n]+)", env_text)
         if match:
             return match.group(1)
     for port in COMMON_UPSTREAM_PROXY_PORTS:

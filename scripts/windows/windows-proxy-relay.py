@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import socket
 import threading
 import time
@@ -100,9 +101,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def is_wildcard_listen_host(host: str) -> bool:
+    if host in WILDCARD_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, 0, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        try:
+            if ipaddress.ip_address(info[4][0]).is_unspecified:
+                return True
+        except (IndexError, ValueError):
+            continue
+    return False
+
+
 def main() -> None:
     args = parse_args()
-    if args.listen_host in WILDCARD_HOSTS and not args.allow_lan:
+    if is_wildcard_listen_host(args.listen_host) and not args.allow_lan:
         raise SystemExit(
             "Refusing to listen on all interfaces without --allow-lan. "
             "Use the WSL gateway host or pass --allow-lan intentionally."
