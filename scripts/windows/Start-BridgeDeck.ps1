@@ -45,6 +45,25 @@ function Test-CommandLineArgument([string]$CommandLine, [string]$Name, [string]$
   return $CommandLine -match "(^|\s)$escapedName\s+(`"$escapedValue`"|$escapedValue)(?=\s|$)"
 }
 
+function Get-RelayProcesses([string]$ListenHost, [int]$ListenPort, [string]$TargetHost = "", [int]$TargetPort = 0) {
+  $processes = Get-CimInstance Win32_Process |
+    Where-Object {
+      $_.CommandLine -like "*windows-proxy-relay.py*" -and
+      (Test-CommandLineArgument $_.CommandLine "--listen-host" $ListenHost) -and
+      (Test-CommandLineArgument $_.CommandLine "--listen-port" ([string]$ListenPort))
+    }
+
+  if (-not [string]::IsNullOrWhiteSpace($TargetHost)) {
+    $processes = $processes |
+      Where-Object {
+        (Test-CommandLineArgument $_.CommandLine "--target-host" $TargetHost) -and
+        (Test-CommandLineArgument $_.CommandLine "--target-port" ([string]$TargetPort))
+      }
+  }
+
+  return @($processes)
+}
+
 function Invoke-WslText([string]$Command) {
   $args = @()
   if (-not [string]::IsNullOrWhiteSpace($WslDistro)) {
@@ -79,17 +98,8 @@ if (-not $SkipRelay) {
   }
 
   $relayScript = Join-Path $BridgeDeckDir "scripts\windows\windows-proxy-relay.py"
-  $relayProcesses = Get-CimInstance Win32_Process |
-    Where-Object {
-      $_.CommandLine -like "*windows-proxy-relay.py*" -and
-      (Test-CommandLineArgument $_.CommandLine "--listen-host" $RelayListenHost) -and
-      (Test-CommandLineArgument $_.CommandLine "--listen-port" ([string]$RelayListenPort))
-    }
-  $relayProcess = $relayProcesses |
-    Where-Object {
-      (Test-CommandLineArgument $_.CommandLine "--target-host" $ProxyTargetHost) -and
-      (Test-CommandLineArgument $_.CommandLine "--target-port" ([string]$ProxyTargetPort))
-    } |
+  $relayProcesses = Get-RelayProcesses -ListenHost $RelayListenHost -ListenPort $RelayListenPort
+  $relayProcess = Get-RelayProcesses -ListenHost $RelayListenHost -ListenPort $RelayListenPort -TargetHost $ProxyTargetHost -TargetPort $ProxyTargetPort |
     Select-Object -First 1
   $staleRelayProcesses = @($relayProcesses |
     Where-Object {
@@ -119,6 +129,11 @@ if (-not $SkipRelay) {
     }
     Start-Process -FilePath $PythonExe -ArgumentList (($relayArgs | ForEach-Object { Quote-WindowsArgument $_ }) -join " ") -WindowStyle Hidden
     Start-Sleep -Seconds 1
+    $relayProcess = Get-RelayProcesses -ListenHost $RelayListenHost -ListenPort $RelayListenPort -TargetHost $ProxyTargetHost -TargetPort $ProxyTargetPort |
+      Select-Object -First 1
+    if (-not $relayProcess) {
+      throw "Proxy relay failed to start: $RelayListenHost`:$RelayListenPort -> $ProxyTargetHost`:$ProxyTargetPort. Check Python, bind permissions, and whether another process owns the listen port."
+    }
   }
 }
 
