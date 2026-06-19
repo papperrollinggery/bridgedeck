@@ -80,6 +80,33 @@ function Test-TcpPort([string]$HostName, [int]$Port, [int]$TimeoutMilliseconds =
   }
 }
 
+function Test-WildcardHost([string]$HostName) {
+  return @("0", "0.0.0.0", "::") -contains $HostName
+}
+
+function Test-LoopbackHost([string]$HostName) {
+  if ([string]::IsNullOrWhiteSpace($HostName)) {
+    return $false
+  }
+  if ($HostName -eq "localhost") {
+    return $true
+  }
+  try {
+    $addresses = [System.Net.Dns]::GetHostAddresses($HostName)
+  } catch {
+    return $false
+  }
+  if ($addresses.Count -eq 0) {
+    return $false
+  }
+  foreach ($address in $addresses) {
+    if (-not [System.Net.IPAddress]::IsLoopback($address)) {
+      return $false
+    }
+  }
+  return $true
+}
+
 function Wait-RelayReady([string]$ListenHost, [int]$ListenPort, [string]$TargetHost, [int]$TargetPort) {
   for ($attempt = 0; $attempt -lt 10; $attempt++) {
     $process = Get-RelayProcesses -ListenHost $ListenHost -ListenPort $ListenPort -TargetHost $TargetHost -TargetPort $TargetPort |
@@ -114,15 +141,30 @@ $wslHome = Convert-ToWslPath $env:USERPROFILE
 $wslScript = "$wslBridgeDir/scripts/windows/start-bridgedeck-wsl.sh"
 
 if (-not $SkipRelay) {
+  $relayListenHostWasAutoDetected = $false
+  $detectedGatewayHost = ""
+  $gatewayCommand = "ip route show default | awk '{print `$3; exit}'"
+  try {
+    $detectedGatewayHost = Invoke-WslText $gatewayCommand
+  } catch {
+    $detectedGatewayHost = ""
+  }
   if ([string]::IsNullOrWhiteSpace($RelayListenHost)) {
-    $gatewayCommand = "ip route show default | awk '{print `$3; exit}'"
-    $RelayListenHost = Invoke-WslText $gatewayCommand
+    $RelayListenHost = $detectedGatewayHost
+    $relayListenHostWasAutoDetected = $true
   }
   if ([string]::IsNullOrWhiteSpace($RelayListenHost)) {
     throw "Could not detect the WSL gateway host. Pass -RelayListenHost explicitly."
   }
-  if (($RelayListenHost -eq "0.0.0.0" -or $RelayListenHost -eq "::") -and -not $AllowLanRelay) {
+  $relayListenHostIsDetectedGateway = (
+    -not [string]::IsNullOrWhiteSpace($detectedGatewayHost) -and
+    $RelayListenHost -eq $detectedGatewayHost
+  )
+  if ((Test-WildcardHost $RelayListenHost) -and -not $AllowLanRelay) {
     throw "Refusing wildcard relay listener without -AllowLanRelay."
+  }
+  if (-not $AllowLanRelay -and -not $relayListenHostIsDetectedGateway -and -not (Test-LoopbackHost $RelayListenHost)) {
+    throw "Refusing non-loopback relay listener without -AllowLanRelay unless it matches the detected WSL gateway."
   }
 
   $relayScript = Join-Path $BridgeDeckDir "scripts\windows\windows-proxy-relay.py"
@@ -157,6 +199,8 @@ if (-not $SkipRelay) {
     )
     if ($AllowLanRelay) {
       $relayArgs += "--allow-lan"
+    } elseif ($relayListenHostWasAutoDetected -or $relayListenHostIsDetectedGateway) {
+      $relayArgs += @("--allow-host", $RelayListenHost)
     }
     Start-Process -FilePath $PythonExe -ArgumentList (($relayArgs | ForEach-Object { Quote-WindowsArgument $_ }) -join " ") -WindowStyle Hidden
     Start-Sleep -Seconds 1

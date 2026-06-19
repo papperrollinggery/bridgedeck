@@ -5021,6 +5021,9 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertTrue(module.is_wildcard_listen_host("0"))
         self.assertTrue(module.is_wildcard_listen_host("0.0.0.0"))
         self.assertFalse(module.is_wildcard_listen_host("127.0.0.1"))
+        self.assertTrue(module.is_allowed_listen_host("127.0.0.1", []))
+        self.assertFalse(module.is_allowed_listen_host("192.168.1.10", []))
+        self.assertTrue(module.is_allowed_listen_host("192.168.1.10", ["192.168.1.10"]))
 
     def test_codex_native_proxy_status_marks_missing_websocket_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

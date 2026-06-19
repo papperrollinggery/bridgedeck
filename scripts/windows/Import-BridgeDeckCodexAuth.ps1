@@ -62,15 +62,18 @@ if (-not (Test-Path -LiteralPath $CodexAuthPath)) {
 $codexAuth = Get-Content -LiteralPath $CodexAuthPath -Encoding UTF8 -Raw | ConvertFrom-Json
 $accountId = [string]$codexAuth.tokens.account_id
 $refresh = [string]$codexAuth.tokens.refresh_token
-$jwt = [string]$codexAuth.tokens.id_token
-if ([string]::IsNullOrWhiteSpace($jwt)) {
-  $jwt = [string]$codexAuth.tokens.access_token
-}
-$jwtPayload = Get-JwtPayload $jwt
+$idTokenPayload = Get-JwtPayload ([string]$codexAuth.tokens.id_token)
+$accessTokenPayload = Get-JwtPayload ([string]$codexAuth.tokens.access_token)
 if ([string]::IsNullOrWhiteSpace($accountId)) {
-  $accountId = Get-JwtAccountId $jwtPayload
+  $accountId = Get-JwtAccountId $idTokenPayload
 }
-$email = Get-JwtEmail $jwtPayload
+if ([string]::IsNullOrWhiteSpace($accountId)) {
+  $accountId = Get-JwtAccountId $accessTokenPayload
+}
+$email = Get-JwtEmail $idTokenPayload
+if ([string]::IsNullOrWhiteSpace($email)) {
+  $email = Get-JwtEmail $accessTokenPayload
+}
 
 if ([string]::IsNullOrWhiteSpace($accountId) -or [string]::IsNullOrWhiteSpace($refresh)) {
   throw "Codex auth.json lacks account_id or refresh_token."
