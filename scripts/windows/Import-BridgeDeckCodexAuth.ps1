@@ -85,48 +85,68 @@ if ($PSCmdlet.ShouldProcess($BridgeAuthPath, "copy Codex refresh_token into Brid
     New-Item -ItemType Directory -Force -Path $bridgeDir | Out-Null
   }
 
-  if (Test-Path -LiteralPath $BridgeAuthPath) {
-    $backup = Join-Path $bridgeDir ("bridgedeck-auth.json.backup-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
-    Copy-Item -LiteralPath $BridgeAuthPath -Destination $backup -Force
-    $existing = Get-Content -LiteralPath $BridgeAuthPath -Encoding UTF8 -Raw | ConvertFrom-Json
-  } else {
-    $backup = ""
-    $existing = [pscustomobject]@{ version = 1; accounts = [pscustomobject]@{}; default_account_id = "" }
-  }
+  $lockPath = [System.IO.Path]::ChangeExtension($BridgeAuthPath, ".lock")
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  $lockStream = $null
+  $tmpPath = ""
+  try {
+    $lockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
 
-  $accounts = @{}
-  if ($existing.accounts) {
-    foreach ($prop in $existing.accounts.PSObject.Properties) {
-      $accounts[$prop.Name] = $prop.Value
+    if (Test-Path -LiteralPath $BridgeAuthPath) {
+      $backup = Join-Path $bridgeDir ("bridgedeck-auth.json.backup-" + (Get-Date -Format "yyyyMMdd-HHmmss") + "-" + [guid]::NewGuid().ToString("N"))
+      Copy-Item -LiteralPath $BridgeAuthPath -Destination $backup -Force
+      $existing = Get-Content -LiteralPath $BridgeAuthPath -Encoding UTF8 -Raw | ConvertFrom-Json
+    } else {
+      $backup = ""
+      $existing = [pscustomobject]@{ version = 1; accounts = [pscustomobject]@{}; default_account_id = "" }
+    }
+
+    $accounts = @{}
+    if ($existing.accounts) {
+      foreach ($prop in $existing.accounts.PSObject.Properties) {
+        $accounts[$prop.Name] = $prop.Value
+      }
+    }
+
+    $accounts[$accountId] = [ordered]@{
+      account_id = $accountId
+      email = $email
+      refresh_token = $refresh
+      authenticated_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+      source = "codex_auth_import"
+    }
+
+    $outAccounts = [ordered]@{}
+    foreach ($key in ($accounts.Keys | Sort-Object)) {
+      $outAccounts[$key] = $accounts[$key]
+    }
+
+    $defaultAccountId = [string]$existing.default_account_id
+    if ($SetDefault -or [string]::IsNullOrWhiteSpace($defaultAccountId)) {
+      $defaultAccountId = $accountId
+    }
+
+    $out = [ordered]@{
+      version = 1
+      accounts = $outAccounts
+      default_account_id = $defaultAccountId
+    }
+
+    $tmpPath = Join-Path $bridgeDir (".bridgedeck-auth.json.tmp-" + [guid]::NewGuid().ToString("N"))
+    [System.IO.File]::WriteAllText($tmpPath, (($out | ConvertTo-Json -Depth 8) + "`n"), $utf8NoBom)
+    if (Test-Path -LiteralPath $BridgeAuthPath) {
+      [System.IO.File]::Replace($tmpPath, $BridgeAuthPath, $null)
+    } else {
+      [System.IO.File]::Move($tmpPath, $BridgeAuthPath)
+    }
+  } finally {
+    if ($lockStream) {
+      $lockStream.Dispose()
+    }
+    if (-not [string]::IsNullOrWhiteSpace($tmpPath) -and (Test-Path -LiteralPath $tmpPath)) {
+      Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
     }
   }
-
-  $accounts[$accountId] = [ordered]@{
-    account_id = $accountId
-    email = $email
-    refresh_token = $refresh
-    authenticated_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    source = "codex_auth_import"
-  }
-
-  $outAccounts = [ordered]@{}
-  foreach ($key in ($accounts.Keys | Sort-Object)) {
-    $outAccounts[$key] = $accounts[$key]
-  }
-
-  $defaultAccountId = [string]$existing.default_account_id
-  if ($SetDefault -or [string]::IsNullOrWhiteSpace($defaultAccountId)) {
-    $defaultAccountId = $accountId
-  }
-
-  $out = [ordered]@{
-    version = 1
-    accounts = $outAccounts
-    default_account_id = $defaultAccountId
-  }
-
-  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-  [System.IO.File]::WriteAllText($BridgeAuthPath, ($out | ConvertTo-Json -Depth 8), $utf8NoBom)
 
   "BridgeDeck auth store initialized without printing tokens."
   if ($defaultAccountId -eq $accountId) {

@@ -114,10 +114,11 @@ http://127.0.0.1:8899/
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\Users\<Windows用户名>\tools\bridgedeck\scripts\windows\Start-BridgeDeck.ps1 `
   -ProxyTargetPort 7897 `
-  -RelayListenHost 172.xx.xx.1
+  -RelayListenHost 172.xx.xx.1 `
+  -AllowWslGatewayRelayHost
 ```
 
-不要把 `-RelayListenHost` 设成 `0.0.0.0`。如果明确要暴露到局域网，必须同时传 `-AllowLanRelay`，并先配置 Windows 防火墙只允许可信来源。
+`-AllowWslGatewayRelayHost` 只用于 WSL gateway 自动检测失败时确认这个显式地址。不要把 `-RelayListenHost` 设成 `0.0.0.0`。如果明确要暴露到局域网，必须同时传 `-AllowLanRelay`，并先配置 Windows 防火墙只允许可信来源。
 
 ## 3. 初始化 BridgeDeck 账号
 
@@ -153,7 +154,7 @@ C:\Users\<Windows用户名>\.cc-switch\bridgedeck-auth.json
 powershell -ExecutionPolicy Bypass -File C:\Users\<Windows用户名>\tools\bridgedeck\scripts\windows\Import-BridgeDeckCodexAuth.ps1 -ConfirmRefreshTokenCopy
 ```
 
-脚本不会打印 token；如果目标 auth store 已存在，会先创建 `bridgedeck-auth.json.backup-<timestamp>`。默认不会覆盖已有 `default_account_id`；如果要把导入账号设为默认账号，额外传入 `-SetDefault`。
+脚本不会打印 token；如果目标 auth store 已存在，会先创建 `bridgedeck-auth.json.backup-<timestamp>-<id>`。默认不会覆盖已有 `default_account_id`；如果要把导入账号设为默认账号，额外传入 `-SetDefault`。
 
 ## 4. 启动 Local Bridge
 
@@ -169,7 +170,10 @@ http://127.0.0.1:8899/
 
 ```bash
 cd "/mnt/c/Users/<Windows用户名>/tools/bridgedeck"
-HOME="/mnt/c/Users/<Windows用户名>" python3 bridgedeck.py --local-bridge start --force-local-bridge
+gateway_host="$(ip route show default | awk '{print $3; exit}')"
+CODEX_BRIDGE_UPSTREAM_PROXY="http://${gateway_host}:17897" \
+  HOME="/mnt/c/Users/<Windows用户名>" \
+  python3 bridgedeck.py --local-bridge start --force-local-bridge
 ```
 
 ## 5. 验证接口

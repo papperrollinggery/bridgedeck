@@ -10,6 +10,7 @@ param(
   [int]$RelayListenPort = 17897,
   [int]$BridgeDeckPort = 8899,
   [switch]$SkipRelay,
+  [switch]$AllowWslGatewayRelayHost,
   [switch]$AllowLanRelay
 )
 
@@ -160,11 +161,16 @@ if (-not $SkipRelay) {
     -not [string]::IsNullOrWhiteSpace($detectedGatewayHost) -and
     $RelayListenHost -eq $detectedGatewayHost
   )
+  $relayListenHostIsExplicitGateway = (
+    $AllowWslGatewayRelayHost -and
+    -not $relayListenHostWasAutoDetected -and
+    -not (Test-WildcardHost $RelayListenHost)
+  )
   if ((Test-WildcardHost $RelayListenHost) -and -not $AllowLanRelay) {
     throw "Refusing wildcard relay listener without -AllowLanRelay."
   }
-  if (-not $AllowLanRelay -and -not $relayListenHostIsDetectedGateway -and -not (Test-LoopbackHost $RelayListenHost)) {
-    throw "Refusing non-loopback relay listener without -AllowLanRelay unless it matches the detected WSL gateway."
+  if (-not $AllowLanRelay -and -not $relayListenHostIsDetectedGateway -and -not $relayListenHostIsExplicitGateway -and -not (Test-LoopbackHost $RelayListenHost)) {
+    throw "Refusing non-loopback relay listener without -AllowLanRelay unless it matches the detected WSL gateway. Pass -AllowWslGatewayRelayHost for a manual WSL gateway override."
   }
 
   $relayScript = Join-Path $BridgeDeckDir "scripts\windows\windows-proxy-relay.py"
@@ -199,7 +205,7 @@ if (-not $SkipRelay) {
     )
     if ($AllowLanRelay) {
       $relayArgs += "--allow-lan"
-    } elseif ($relayListenHostWasAutoDetected -or $relayListenHostIsDetectedGateway) {
+    } elseif ($relayListenHostWasAutoDetected -or $relayListenHostIsDetectedGateway -or $relayListenHostIsExplicitGateway) {
       $relayArgs += @("--allow-host", $RelayListenHost)
     }
     Start-Process -FilePath $PythonExe -ArgumentList (($relayArgs | ForEach-Object { Quote-WindowsArgument $_ }) -join " ") -WindowStyle Hidden
