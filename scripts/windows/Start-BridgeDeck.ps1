@@ -36,6 +36,15 @@ function Quote-WindowsArgument([string]$Value) {
   return '"' + $Value.Replace('\', '\\').Replace('"', '\"') + '"'
 }
 
+function Test-CommandLineArgument([string]$CommandLine, [string]$Name, [string]$Value) {
+  if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+    return $false
+  }
+  $escapedName = [regex]::Escape($Name)
+  $escapedValue = [regex]::Escape($Value)
+  return $CommandLine -match "(^|\s)$escapedName\s+(`"$escapedValue`"|$escapedValue)(?=\s|$)"
+}
+
 function Invoke-WslText([string]$Command) {
   $args = @()
   if (-not [string]::IsNullOrWhiteSpace($WslDistro)) {
@@ -70,12 +79,32 @@ if (-not $SkipRelay) {
   }
 
   $relayScript = Join-Path $BridgeDeckDir "scripts\windows\windows-proxy-relay.py"
-  $relayProcess = Get-CimInstance Win32_Process |
+  $relayProcesses = Get-CimInstance Win32_Process |
     Where-Object {
       $_.CommandLine -like "*windows-proxy-relay.py*" -and
-      $_.CommandLine -like "*--listen-host $RelayListenHost*" -and
-      $_.CommandLine -like "*--listen-port $RelayListenPort*"
+      (Test-CommandLineArgument $_.CommandLine "--listen-host" $RelayListenHost) -and
+      (Test-CommandLineArgument $_.CommandLine "--listen-port" ([string]$RelayListenPort))
     }
+  $relayProcess = $relayProcesses |
+    Where-Object {
+      (Test-CommandLineArgument $_.CommandLine "--target-host" $ProxyTargetHost) -and
+      (Test-CommandLineArgument $_.CommandLine "--target-port" ([string]$ProxyTargetPort))
+    } |
+    Select-Object -First 1
+  $staleRelayProcesses = @($relayProcesses |
+    Where-Object {
+      -not (
+        (Test-CommandLineArgument $_.CommandLine "--target-host" $ProxyTargetHost) -and
+        (Test-CommandLineArgument $_.CommandLine "--target-port" ([string]$ProxyTargetPort))
+      )
+    })
+
+  if ($staleRelayProcesses.Count -gt 0) {
+    foreach ($process in $staleRelayProcesses) {
+      Stop-Process -Id $process.ProcessId -Force
+    }
+    Start-Sleep -Seconds 1
+  }
 
   if (-not $relayProcess) {
     $relayArgs = @(

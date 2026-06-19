@@ -11,24 +11,47 @@ if (-not $ConfirmRefreshTokenCopy) {
   throw "Refusing to copy a refresh_token without -ConfirmRefreshTokenCopy."
 }
 
-function Get-JwtEmail([string]$Jwt) {
+function Get-JwtPayload([string]$Jwt) {
   if ([string]::IsNullOrWhiteSpace($Jwt)) {
-    return ""
+    return [pscustomobject]@{}
   }
   try {
     $parts = $Jwt.Split(".")
     if ($parts.Length -lt 2) {
-      return ""
+      return [pscustomobject]@{}
     }
     $payload = $parts[1].Replace("-", "+").Replace("_", "/")
     while (($payload.Length % 4) -ne 0) {
       $payload += "="
     }
-    $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
-    return [string]$json.email
+    return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
   } catch {
-    return ""
+    return [pscustomobject]@{}
   }
+}
+
+function Get-JwtAccountId([object]$Payload) {
+  $auth = $Payload."https://api.openai.com/auth"
+  $accountId = ""
+  if ($auth) {
+    $accountId = [string]$auth.chatgpt_account_id
+  }
+  if ([string]::IsNullOrWhiteSpace($accountId)) {
+    $accountId = [string]$Payload.chatgpt_account_id
+  }
+  return $accountId
+}
+
+function Get-JwtEmail([object]$Payload) {
+  $profile = $Payload."https://api.openai.com/profile"
+  $email = ""
+  if ($profile) {
+    $email = [string]$profile.email
+  }
+  if ([string]::IsNullOrWhiteSpace($email)) {
+    $email = [string]$Payload.email
+  }
+  return $email
 }
 
 if (-not (Test-Path -LiteralPath $CodexAuthPath)) {
@@ -38,16 +61,19 @@ if (-not (Test-Path -LiteralPath $CodexAuthPath)) {
 $codexAuth = Get-Content -LiteralPath $CodexAuthPath -Encoding UTF8 -Raw | ConvertFrom-Json
 $accountId = [string]$codexAuth.tokens.account_id
 $refresh = [string]$codexAuth.tokens.refresh_token
-
-if ([string]::IsNullOrWhiteSpace($accountId) -or [string]::IsNullOrWhiteSpace($refresh)) {
-  throw "Codex auth.json lacks account_id or refresh_token."
-}
-
 $jwt = [string]$codexAuth.tokens.id_token
 if ([string]::IsNullOrWhiteSpace($jwt)) {
   $jwt = [string]$codexAuth.tokens.access_token
 }
-$email = Get-JwtEmail $jwt
+$jwtPayload = Get-JwtPayload $jwt
+if ([string]::IsNullOrWhiteSpace($accountId)) {
+  $accountId = Get-JwtAccountId $jwtPayload
+}
+$email = Get-JwtEmail $jwtPayload
+
+if ([string]::IsNullOrWhiteSpace($accountId) -or [string]::IsNullOrWhiteSpace($refresh)) {
+  throw "Codex auth.json lacks account_id or refresh_token."
+}
 
 if ($PSCmdlet.ShouldProcess($BridgeAuthPath, "copy Codex refresh_token into BridgeDeck auth store")) {
   $bridgeDir = Split-Path -Parent $BridgeAuthPath

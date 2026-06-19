@@ -42,6 +42,8 @@ def handle(client: socket.socket, target_host: str, target_port: int, connect_ti
     upstream: socket.socket | None = None
     try:
         upstream = socket.create_connection((target_host, target_port), timeout=connect_timeout)
+        client.settimeout(None)
+        upstream.settimeout(None)
         for sock in (client, upstream):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         left = threading.Thread(target=pipe, args=(client, upstream), daemon=True)
