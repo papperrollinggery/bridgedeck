@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import http.client
+import importlib.util
 import io
 import base64
 import os
@@ -4978,12 +4979,51 @@ class CodexDesktopDoctorCase(ServerCase):
 
             with (
                 mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
-                mock.patch.dict(bridgedeck.os.environ, {"HTTPS_PROXY": "http://127.0.0.1:9999"}, clear=False),
+                mock.patch.dict(
+                    bridgedeck.os.environ,
+                    {"HTTPS_PROXY": "http://127.0.0.1:9999", "CODEX_BRIDGE_UPSTREAM_PROXY": ""},
+                    clear=False,
+                ),
             ):
                 value, source = bridgedeck.detect_codex_proxy_url()
 
         self.assertEqual(value, "http://127.0.0.1:1087")
         self.assertEqual(source, str(codex_home / ".env"))
+
+    def test_detect_codex_proxy_url_prefers_bridge_upstream_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir(parents=True)
+            (codex_home / ".env").write_text('HTTPS_PROXY="http://127.0.0.1:1087"\n', encoding="utf-8")
+
+            with (
+                mock.patch.object(bridgedeck, "DEFAULT_CODEX_HOME", codex_home),
+                mock.patch.dict(
+                    bridgedeck.os.environ,
+                    {"CODEX_BRIDGE_UPSTREAM_PROXY": "http://172.20.1.1:17897"},
+                    clear=False,
+                ),
+            ):
+                value, source = bridgedeck.detect_codex_proxy_url()
+
+        self.assertEqual(value, "http://172.20.1.1:17897")
+        self.assertEqual(source, "env:CODEX_BRIDGE_UPSTREAM_PROXY")
+
+    def test_windows_proxy_relay_rejects_resolved_wildcard_host(self) -> None:
+        relay_path = Path(__file__).resolve().parents[1] / "scripts" / "windows" / "windows-proxy-relay.py"
+        spec = importlib.util.spec_from_file_location("windows_proxy_relay", relay_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertTrue(module.is_wildcard_listen_host("0"))
+        self.assertTrue(module.is_wildcard_listen_host("0.0.0.0"))
+        self.assertFalse(module.is_wildcard_listen_host("127.0.0.1"))
+        self.assertTrue(module.is_allowed_listen_host("127.0.0.1", []))
+        self.assertFalse(module.is_allowed_listen_host("192.168.1.10", []))
+        self.assertTrue(module.is_allowed_listen_host("192.168.1.10", ["192.168.1.10"]))
 
     def test_codex_native_proxy_status_marks_missing_websocket_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
