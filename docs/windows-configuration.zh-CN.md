@@ -57,7 +57,7 @@ scripts/windows/Import-BridgeDeckCodexAuth.ps1
 | `windows-proxy-relay.py` | 把 WSL 到 Windows gateway 的请求转发到 Windows 本机代理端口。 |
 | `Import-BridgeDeckCodexAuth.ps1` | 高级兜底：显式确认后从 Codex auth 缓存初始化 BridgeDeck auth store。 |
 
-`windows-proxy-relay.py` 默认拒绝 `0.0.0.0` 监听。正常路径由 `Start-BridgeDeck.ps1` 自动检测 WSL gateway 并绑定该地址，不需要开启 Clash/Mihomo 的 allow-lan。
+`windows-proxy-relay.py` 默认拒绝 `0.0.0.0` 监听。正常路径由 `Start-BridgeDeck.ps1` 自动检测并校验 WSL gateway，再绑定该地址，不需要开启 Clash/Mihomo 的 allow-lan。
 
 ## 1. 安装 BridgeDeck
 

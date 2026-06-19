@@ -194,22 +194,25 @@ if (-not $SkipRelay) {
     -not [string]::IsNullOrWhiteSpace($detectedGatewayHost) -and
     $RelayListenHost -eq $detectedGatewayHost
   )
-  $relayListenHostIsVerifiedWslGateway = (
-    $AllowWslGatewayRelayHost -and
-    -not $relayListenHostWasAutoDetected -and
+  $relayListenHostIsWslInterfaceHost = (
     -not (Test-WildcardHost $RelayListenHost) -and
+    (Test-WslGatewayInterfaceHost $RelayListenHost)
+  )
+  $relayListenHostCanUseWslGatewayRelay = (
+    $relayListenHostIsWslInterfaceHost -and
     (
       $relayListenHostIsDetectedGateway -or
       (
-        [string]::IsNullOrWhiteSpace($detectedGatewayHost) -and
-        (Test-WslGatewayInterfaceHost $RelayListenHost)
+        $AllowWslGatewayRelayHost -and
+        -not $relayListenHostWasAutoDetected -and
+        [string]::IsNullOrWhiteSpace($detectedGatewayHost)
       )
     )
   )
   if ((Test-WildcardHost $RelayListenHost) -and -not $AllowLanRelay) {
     throw "Refusing wildcard relay listener without -AllowLanRelay."
   }
-  if (-not $AllowLanRelay -and -not $relayListenHostIsDetectedGateway -and -not $relayListenHostIsVerifiedWslGateway -and -not (Test-LoopbackHost $RelayListenHost)) {
+  if (-not $AllowLanRelay -and -not $relayListenHostCanUseWslGatewayRelay -and -not (Test-LoopbackHost $RelayListenHost)) {
     throw "Refusing non-loopback relay listener without -AllowLanRelay unless it matches the detected WSL gateway or -AllowWslGatewayRelayHost verifies it against the WSL interface."
   }
 
@@ -245,7 +248,7 @@ if (-not $SkipRelay) {
     )
     if ($AllowLanRelay) {
       $relayArgs += "--allow-lan"
-    } elseif ($relayListenHostWasAutoDetected -or $relayListenHostIsDetectedGateway -or $relayListenHostIsVerifiedWslGateway) {
+    } elseif ($relayListenHostCanUseWslGatewayRelay) {
       $relayArgs += @("--allow-host", $RelayListenHost)
     }
     Start-Process -FilePath $PythonExe -ArgumentList (($relayArgs | ForEach-Object { Quote-WindowsArgument $_ }) -join " ") -WindowStyle Hidden
