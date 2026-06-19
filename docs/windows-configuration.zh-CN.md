@@ -118,7 +118,7 @@ powershell -ExecutionPolicy Bypass -File C:\Users\<Windows用户名>\tools\bridg
   -AllowWslGatewayRelayHost
 ```
 
-`-AllowWslGatewayRelayHost` 只用于 WSL gateway 自动检测失败时确认这个显式地址。不要把 `-RelayListenHost` 设成 `0.0.0.0`。如果明确要暴露到局域网，必须同时传 `-AllowLanRelay`，并先配置 Windows 防火墙只允许可信来源。
+`-AllowWslGatewayRelayHost` 只用于 WSL gateway 自动检测失败时确认这个显式地址；脚本仍会校验该地址属于 Windows 的 WSL 虚拟网卡。不要把 `-RelayListenHost` 设成 `0.0.0.0`。如果明确要暴露到局域网，必须同时传 `-AllowLanRelay`，并先配置 Windows 防火墙只允许可信来源。
 
 ## 3. 初始化 BridgeDeck 账号
 
