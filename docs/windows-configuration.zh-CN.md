@@ -2,7 +2,7 @@
 
 本文档用于在 Windows 上通过 WSL 运行 BridgeDeck，并暴露本地 OpenAI/Anthropic 兼容接口。它只记录 BridgeDeck 相关配置，不包含任何浏览器扩展、第三方产品、个人账号、邮箱、token、API key 或订阅信息。
 
-所有示例里的 `<Windows用户名>`、`<WSL用户名>`、`<代理端口>` 都需要按本机环境替换。
+示例里的 `<Windows用户名>`、`<代理端口>`、`<account_id>` 都需要按本机环境替换。
 
 ## 目标结果
 
@@ -24,7 +24,7 @@ OpenAI/Anthropic-compatible client
 -> OpenAI/Codex 后端
 ```
 
-Windows 上的 BridgeDeck Python 脚本依赖 Unix-only `fcntl`，建议通过 WSL 运行 BridgeDeck。WSL 访问 Windows 的 `127.0.0.1` 代理经常不通，因此推荐使用一个 Windows 侧轻量 TCP relay，让 WSL 通过默认网关访问 Windows 代理。
+Windows 上的 BridgeDeck Python 脚本依赖 Unix-only `fcntl`，建议通过 WSL 运行 BridgeDeck。WSL 访问 Windows 的 `127.0.0.1` 代理经常不通，因此仓库提供了 Windows 侧 TCP relay 和 WSL 启动脚本。
 
 ## 前置条件
 
@@ -32,26 +32,32 @@ Windows 上的 BridgeDeck Python 脚本依赖 Unix-only `fcntl`，建议通过 W
 
 - Windows 10/11。
 - 已安装 WSL，例如 Ubuntu。
-- WSL 内有 `python3`，并能导入 BridgeDeck 依赖。
+- WSL 内有 `python3`。
 - Windows 内有 Python，用于运行本地 TCP relay。
 - 已安装并可用的本机代理工具，例如 Clash Verge Rev 或 Mihomo。
-- 已能正常使用 Codex Desktop 或 Codex CLI，且本机存在 `.codex/auth.json` 登录缓存。
+- 已能正常使用 Codex Desktop 或 Codex CLI，或准备通过 BridgeDeck 设备授权登录。
 
-## 目录约定
+## 仓库脚本
 
-建议使用以下目录。实际用户名请替换为本机用户名。
-
-```text
-C:\Users\<Windows用户名>\tools\bridgedeck
-C:\Users\<Windows用户名>\.codex\auth.json
-C:\Users\<Windows用户名>\.cc-switch\bridgedeck-auth.json
-```
-
-在 WSL 中，Windows 用户目录一般映射为：
+Windows/WSL 支持脚本位于：
 
 ```text
-/mnt/c/Users/<Windows用户名>
+scripts/windows/Start-BridgeDeck.ps1
+scripts/windows/start-bridgedeck-wsl.sh
+scripts/windows/windows-proxy-relay.py
+scripts/windows/Import-BridgeDeckCodexAuth.ps1
 ```
+
+用途：
+
+| 脚本 | 作用 |
+| --- | --- |
+| `Start-BridgeDeck.ps1` | Windows 一键启动入口：检测 WSL gateway、启动 relay、启动 BridgeDeck UI。 |
+| `start-bridgedeck-wsl.sh` | WSL 内启动 BridgeDeck，设置 Windows HOME 和代理环境变量。 |
+| `windows-proxy-relay.py` | 把 WSL 到 Windows gateway 的请求转发到 Windows 本机代理端口。 |
+| `Import-BridgeDeckCodexAuth.ps1` | 高级兜底：显式确认后从 Codex auth 缓存初始化 BridgeDeck auth store。 |
+
+`windows-proxy-relay.py` 默认拒绝 `0.0.0.0` 监听。正常路径由 `Start-BridgeDeck.ps1` 自动检测 WSL gateway 并绑定该地址，不需要开启 Clash/Mihomo 的 allow-lan。
 
 ## 1. 安装 BridgeDeck
 
@@ -61,128 +67,21 @@ C:\Users\<Windows用户名>\.cc-switch\bridgedeck-auth.json
 C:\Users\<Windows用户名>\tools\bridgedeck
 ```
 
-至少需要以下文件：
-
-```text
-bridgedeck.py
-local_codex_bridge.py
-README.md
-README.zh-CN.md
-AGENTS.md
-LICENSE
-```
-
-在 WSL 中验证 Python 能编译：
+在 WSL 中准备依赖并验证 Python 能编译：
 
 ```bash
 cd "/mnt/c/Users/<Windows用户名>/tools/bridgedeck"
-python3 -m py_compile bridgedeck.py local_codex_bridge.py
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install httpx
+python3 -m py_compile bridgedeck.py local_codex_bridge.py scripts/windows/windows-proxy-relay.py
 ```
 
-如果缺少依赖，按 BridgeDeck README 安装。常见依赖包括 `httpx`。
+如果已用系统 Python 管理依赖，可以不建 `.venv`；`start-bridgedeck-wsl.sh` 会在存在 `.venv/bin/activate` 时自动加载它。
 
-## 2. 不修改 Clash Verge 设置的代理方案
+## 2. 启动 BridgeDeck
 
-如果代理工具只监听 Windows 的 `127.0.0.1:<代理端口>`，WSL 里直接访问 `127.0.0.1:<代理端口>` 通常不通。
-
-推荐做法：不改 Clash Verge 设置，在 Windows 侧启动一个 TCP relay：
-
-```text
-WSL -> http://<WSL默认网关>:17897 -> Windows 127.0.0.1:<代理端口>
-```
-
-常见 Clash/Mihomo mixed port 是 `7897`、`7890` 或 `7899`。以 `7897` 为例。
-
-在 `C:\Users\<Windows用户名>\tools\bridgedeck\windows-proxy-relay.py` 创建：
-
-```python
-#!/usr/bin/env python3
-"""Tiny TCP relay for WSL -> Windows loopback proxy access."""
-from __future__ import annotations
-
-import argparse
-import socket
-import threading
-import time
-
-BUFFER_SIZE = 65536
-
-
-def pipe(src: socket.socket, dst: socket.socket) -> None:
-    try:
-        while True:
-            data = src.recv(BUFFER_SIZE)
-            if not data:
-                break
-            dst.sendall(data)
-    except OSError:
-        pass
-    finally:
-        for sock in (src, dst):
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-
-
-def handle(client: socket.socket, target_host: str, target_port: int) -> None:
-    upstream: socket.socket | None = None
-    try:
-        upstream = socket.create_connection((target_host, target_port), timeout=10)
-        for sock in (client, upstream):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        left = threading.Thread(target=pipe, args=(client, upstream), daemon=True)
-        right = threading.Thread(target=pipe, args=(upstream, client), daemon=True)
-        left.start()
-        right.start()
-        left.join()
-        right.join()
-    except OSError:
-        pass
-    finally:
-        for sock in (client, upstream):
-            if sock is None:
-                continue
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-
-def serve(listen_host: str, listen_port: int, target_host: str, target_port: int) -> None:
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((listen_host, listen_port))
-    server.listen(128)
-    print(
-        f"BridgeDeck proxy relay listening on {listen_host}:{listen_port} "
-        f"-> {target_host}:{target_port}",
-        flush=True,
-    )
-    while True:
-        try:
-            client, _addr = server.accept()
-        except OSError:
-            time.sleep(0.2)
-            continue
-        threading.Thread(target=handle, args=(client, target_host, target_port), daemon=True).start()
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--listen-host", default="0.0.0.0")
-    parser.add_argument("--listen-port", type=int, default=17897)
-    parser.add_argument("--target-host", default="127.0.0.1")
-    parser.add_argument("--target-port", type=int, default=7897)
-    args = parser.parse_args()
-    serve(args.listen_host, args.listen_port, args.target_host, args.target_port)
-
-
-if __name__ == "__main__":
-    main()
-```
-
-如果你的代理端口不是 `7897`，把 `--target-port` 换成本机实际端口。
+先确认 Windows 代理工具正在监听，例如 Clash/Mihomo mixed port `7897`、`7890` 或 `7899`。
 
 查看当前代理监听端口：
 
@@ -192,84 +91,10 @@ Get-NetTCPConnection -State Listen |
   Select-Object LocalAddress,LocalPort,OwningProcess
 ```
 
-## 3. 创建 BridgeDeck WSL 启动脚本
-
-在 `C:\Users\<Windows用户名>\tools\bridgedeck\start-bridgedeck-wsl.sh` 创建：
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-cd "/mnt/c/Users/<Windows用户名>/tools/bridgedeck"
-export HOME="/mnt/c/Users/<Windows用户名>"
-
-# 如果 httpx 等依赖装在用户 site-packages，可按实际 WSL 用户名调整。
-# 不需要时可以删掉这一行。
-export PYTHONPATH="/home/<WSL用户名>/.local/lib/python3.14/site-packages${PYTHONPATH:+:$PYTHONPATH}"
-
-proxy_host="$(ip route show default | awk '{print $3; exit}')"
-if [[ -n "${proxy_host}" ]]; then
-  proxy_port="${BRIDGEDECK_WINDOWS_PROXY_RELAY_PORT:-17897}"
-  proxy_url="http://${proxy_host}:${proxy_port}"
-  export HTTP_PROXY="${proxy_url}"
-  export HTTPS_PROXY="${proxy_url}"
-  export ALL_PROXY="${proxy_url}"
-  export http_proxy="${proxy_url}"
-  export https_proxy="${proxy_url}"
-  export all_proxy="${proxy_url}"
-  export CODEX_BRIDGE_UPSTREAM_PROXY="${proxy_url}"
-  export NO_PROXY="127.0.0.1,localhost,::1"
-  export no_proxy="${NO_PROXY}"
-fi
-
-exec python3 bridgedeck.py --host 127.0.0.1 --port 8899
-```
-
-要点：
-
-- `HOME` 必须指向 Windows 用户目录的 WSL 路径，这样 BridgeDeck 才会读写 Windows 下的 `.codex`、`.cc-switch`。
-- `proxy_host` 使用 WSL 默认网关，不要写死 `127.0.0.1`。
-- `CODEX_BRIDGE_UPSTREAM_PROXY` 让 Local Bridge 也走同一条代理链路。
-
-## 4. 创建 Windows 一键启动脚本
-
-在 `C:\Users\<Windows用户名>\tools\bridgedeck\Start-BridgeDeck.ps1` 创建：
+以目标代理端口 `7897` 为例启动：
 
 ```powershell
-$ErrorActionPreference = "Stop"
-
-$relayScript = "C:\Users\<Windows用户名>\tools\bridgedeck\windows-proxy-relay.py"
-$relayProcess = Get-CimInstance Win32_Process |
-  Where-Object { $_.CommandLine -like "*windows-proxy-relay.py*" }
-
-if (-not $relayProcess) {
-  Start-Process -FilePath "python" -ArgumentList @(
-    $relayScript,
-    "--listen-host", "0.0.0.0",
-    "--listen-port", "17897",
-    "--target-host", "127.0.0.1",
-    "--target-port", "7897"
-  ) -WindowStyle Hidden
-  Start-Sleep -Seconds 1
-}
-
-$script = "/mnt/c/Users/<Windows用户名>/tools/bridgedeck/start-bridgedeck-wsl.sh"
-Start-Process -FilePath "wsl.exe" -ArgumentList @("bash", $script) -WindowStyle Hidden
-Start-Sleep -Seconds 5
-
-try {
-  $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:8899/" -TimeoutSec 8
-  "BridgeDeck UI is running: http://127.0.0.1:8899/ (HTTP $($response.StatusCode))"
-} catch {
-  "BridgeDeck UI did not respond on http://127.0.0.1:8899/. Check WSL and BridgeDeck logs."
-  throw
-}
-```
-
-启动：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File C:\Users\<Windows用户名>\tools\bridgedeck\Start-BridgeDeck.ps1
+powershell -ExecutionPolicy Bypass -File C:\Users\<Windows用户名>\tools\bridgedeck\scripts\windows\Start-BridgeDeck.ps1 -ProxyTargetPort 7897
 ```
 
 成功后访问：
@@ -278,9 +103,25 @@ powershell -ExecutionPolicy Bypass -File C:\Users\<Windows用户名>\tools\bridg
 http://127.0.0.1:8899/
 ```
 
-## 5. 初始化 BridgeDeck 账号
+该脚本会做三件事：
 
-有两种方式。
+1. 从 WSL 读取默认网关地址。
+2. 在 Windows 侧启动 relay：`http://<WSL默认网关>:17897 -> Windows 127.0.0.1:<代理端口>`。
+3. 在 WSL 内启动 BridgeDeck，并让 UI 与 Local Bridge 使用同一条代理链路。
+
+如果必须手动指定 WSL gateway：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Users\<Windows用户名>\tools\bridgedeck\scripts\windows\Start-BridgeDeck.ps1 `
+  -ProxyTargetPort 7897 `
+  -RelayListenHost 172.xx.xx.1
+```
+
+不要把 `-RelayListenHost` 设成 `0.0.0.0`。如果明确要暴露到局域网，必须同时传 `-AllowLanRelay`，并先配置 Windows 防火墙只允许可信来源。
+
+## 3. 初始化 BridgeDeck 账号
+
+推荐使用方式 A。方式 B 只适合作为迁移或设备授权不可用时的本机兜底。
 
 ### 方式 A：BridgeDeck 设备授权
 
@@ -294,86 +135,27 @@ http://127.0.0.1:8899/
 
 ### 方式 B：从本机 Codex 登录缓存初始化
 
-如果本机已经能使用 Codex Desktop 或 Codex CLI，通常会存在：
+该方式会读取：
 
 ```text
 C:\Users\<Windows用户名>\.codex\auth.json
 ```
 
-可以从该文件初始化 BridgeDeck 的 auth store。以下脚本不会打印 token，但会在本机读取并复制 refresh token 到 BridgeDeck 自己的 auth store。只在可信本机运行。
+并把 refresh token 写入：
 
-```powershell
-$ErrorActionPreference = 'Stop'
-
-$codexAuthPath = 'C:\Users\<Windows用户名>\.codex\auth.json'
-$bridgeAuthPath = 'C:\Users\<Windows用户名>\.cc-switch\bridgedeck-auth.json'
-
-$codexAuth = Get-Content -LiteralPath $codexAuthPath -Encoding UTF8 -Raw | ConvertFrom-Json
-$accountId = [string]$codexAuth.tokens.account_id
-$refresh = [string]$codexAuth.tokens.refresh_token
-
-if ([string]::IsNullOrWhiteSpace($accountId) -or [string]::IsNullOrWhiteSpace($refresh)) {
-  throw 'Codex auth.json lacks account_id or refresh_token'
-}
-
-$email = ''
-try {
-  $jwt = [string]$codexAuth.tokens.id_token
-  if ([string]::IsNullOrWhiteSpace($jwt)) { $jwt = [string]$codexAuth.tokens.access_token }
-  $parts = $jwt.Split('.')
-  if ($parts.Length -ge 2) {
-    $payload = $parts[1].Replace('-', '+').Replace('_', '/')
-    while (($payload.Length % 4) -ne 0) { $payload += '=' }
-    $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
-    $email = [string]$json.email
-  }
-} catch {
-  $email = ''
-}
-
-if (Test-Path -LiteralPath $bridgeAuthPath) {
-  $backup = Join-Path (Split-Path -Parent $bridgeAuthPath) ('bridgedeck-auth.json.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
-  Copy-Item -LiteralPath $bridgeAuthPath -Destination $backup -Force
-  $existing = Get-Content -LiteralPath $bridgeAuthPath -Encoding UTF8 -Raw | ConvertFrom-Json
-} else {
-  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $bridgeAuthPath) | Out-Null
-  $existing = [pscustomobject]@{ version = 1; accounts = [pscustomobject]@{}; default_account_id = '' }
-}
-
-$accounts = @{}
-if ($existing.accounts) {
-  foreach ($prop in $existing.accounts.PSObject.Properties) {
-    $accounts[$prop.Name] = $prop.Value
-  }
-}
-
-$accounts[$accountId] = [ordered]@{
-  account_id = $accountId
-  email = $email
-  refresh_token = $refresh
-  authenticated_at = [int][double]::Parse((Get-Date -UFormat %s))
-  source = 'codex_auth_import'
-}
-
-$outAccounts = [ordered]@{}
-foreach ($key in $accounts.Keys) {
-  $outAccounts[$key] = $accounts[$key]
-}
-
-$out = [ordered]@{
-  version = 1
-  accounts = $outAccounts
-  default_account_id = $accountId
-}
-
-# PowerShell 5 的 UTF8 默认带 BOM；Local Bridge 不接受 BOM，所以必须无 BOM 写入。
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllText($bridgeAuthPath, ($out | ConvertTo-Json -Depth 8), $utf8NoBom)
-
-'BridgeDeck auth store initialized without printing tokens.'
+```text
+C:\Users\<Windows用户名>\.cc-switch\bridgedeck-auth.json
 ```
 
-## 6. 启动 Local Bridge
+这会让 BridgeDeck 拥有自己的 refresh fallback。OpenAI refresh token 会轮换；如果 Codex Desktop、AiMaMi 和 BridgeDeck 同时刷新同一账号，可能触发 `refresh_token_reused`。只在可信本机、明确接受该风险时运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Users\<Windows用户名>\tools\bridgedeck\scripts\windows\Import-BridgeDeckCodexAuth.ps1 -ConfirmRefreshTokenCopy
+```
+
+脚本不会打印 token；如果目标 auth store 已存在，会先创建 `bridgedeck-auth.json.backup-<timestamp>`。
+
+## 4. 启动 Local Bridge
 
 打开 BridgeDeck UI：
 
@@ -390,7 +172,7 @@ cd "/mnt/c/Users/<Windows用户名>/tools/bridgedeck"
 HOME="/mnt/c/Users/<Windows用户名>" python3 bridgedeck.py --local-bridge start --force-local-bridge
 ```
 
-## 7. 验证接口
+## 5. 验证接口
 
 验证 UI：
 
@@ -441,55 +223,6 @@ Invoke-WebRequest -UseBasicParsing `
 
 期望返回 JSON，内容里有 assistant 回复。
 
-验证图片调用：
-
-```powershell
-@'
-import base64, json, struct, zlib, urllib.request, urllib.error
-
-def chunk(tag, data):
-    return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff)
-
-raw = b'\x00\xff\x00\x00'
-png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b'')
-data_url = 'data:image/png;base64,' + base64.b64encode(png).decode()
-
-body = {
-    'model': 'gpt-5.5',
-    'messages': [{
-        'role': 'user',
-        'content': [
-            {'type': 'text', 'text': 'What is the dominant color in this image? Reply with one word.'},
-            {'type': 'image_url', 'image_url': {'url': data_url}},
-        ],
-    }],
-    'max_tokens': 20,
-    'stream': False,
-}
-
-req = urllib.request.Request(
-    'http://127.0.0.1:8876/v1/chat/completions',
-    data=json.dumps(body).encode('utf-8'),
-    headers={'Authorization': 'Bearer local-bridge', 'Content-Type': 'application/json'},
-    method='POST',
-)
-
-try:
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        print(resp.status)
-        print(resp.read().decode('utf-8'))
-except urllib.error.HTTPError as exc:
-    print(exc.code)
-    print(exc.read().decode('utf-8', 'replace'))
-'@ | python -
-```
-
-期望第一行是：
-
-```text
-200
-```
-
 ## 常见问题
 
 ### about:blank 没跳到授权页
@@ -523,7 +256,7 @@ C:\Users\<Windows用户名>\.cc-switch\bridgedeck-local-bridge.log
 Unexpected UTF-8 BOM
 ```
 
-用 UTF-8 无 BOM 重写 `bridgedeck-auth.json`。
+用 UTF-8 无 BOM 重写 `bridgedeck-auth.json`，或重新运行 `Import-BridgeDeckCodexAuth.ps1 -ConfirmRefreshTokenCopy`。
 
 ### WSL 里连不上 Windows 代理
 
@@ -545,11 +278,11 @@ default via 172.xx.xx.1 dev eth0
 http://172.xx.xx.1:17897
 ```
 
-访问 Windows 侧 relay。
+访问 Windows 侧 relay。`Start-BridgeDeck.ps1` 会自动设置 `CODEX_BRIDGE_UPSTREAM_PROXY` 指向这个地址。
 
 ### 不想修改 Clash Verge 设置
 
-使用本文的 `windows-proxy-relay.py` 方案即可。它不要求把 Clash/Mihomo 改成 allow-lan 或 `0.0.0.0` 监听。
+使用仓库里的 `scripts/windows/windows-proxy-relay.py` 方案即可。它不要求把 Clash/Mihomo 改成 allow-lan 或 `0.0.0.0` 监听。
 
 ## 重启后的恢复步骤
 
@@ -559,7 +292,7 @@ http://172.xx.xx.1:17897
 2. 启动 BridgeDeck：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Users\<Windows用户名>\tools\bridgedeck\Start-BridgeDeck.ps1
+powershell -ExecutionPolicy Bypass -File C:\Users\<Windows用户名>\tools\bridgedeck\scripts\windows\Start-BridgeDeck.ps1 -ProxyTargetPort <代理端口>
 ```
 
 3. 打开：
