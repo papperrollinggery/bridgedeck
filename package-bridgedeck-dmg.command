@@ -27,7 +27,7 @@ PY
 
 run_preflight() {
   echo "BridgeDeck package preflight"
-  /usr/bin/env python3 -m py_compile "$ROOT/bridgedeck.py" "$ROOT/local_codex_bridge.py"
+  /usr/bin/env python3 -m py_compile "$ROOT/bridgedeck.py" "$ROOT/local_codex_bridge.py" "$ROOT/model_catalog.py"
   /bin/zsh -n "$ROOT/package-bridgedeck-dmg.command"
   if [[ "${BRIDGEDECK_PACKAGE_TESTS:-0}" == "1" ]]; then
     /usr/bin/env python3 -m unittest discover -s "$ROOT/tests"
@@ -41,6 +41,7 @@ mkdir -p "$MACOS" "$RESOURCES"
 
 cp "$ROOT/bridgedeck.py" "$RESOURCES/bridgedeck.py"
 cp "$ROOT/local_codex_bridge.py" "$RESOURCES/local_codex_bridge.py"
+cp "$ROOT/model_catalog.py" "$RESOURCES/model_catalog.py"
 cp "$ROOT/README.md" "$RESOURCES/README.md"
 cp "$ROOT/README.zh-CN.md" "$RESOURCES/README.zh-CN.md"
 cp "$ROOT/SECURITY.md" "$RESOURCES/SECURITY.md"

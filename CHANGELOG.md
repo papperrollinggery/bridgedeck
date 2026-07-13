@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.27
+
+- Fixed GPT-5.6 Luna requests from Claude Code and CC Switch by forwarding the current Codex CLI `originator`, `User-Agent`, and `Version` identity headers to the ChatGPT Codex backend.
+- Restricted reasoning-effort fallback retries to explicit unsupported/invalid effort rejections; unrelated HTTP 400/403 responses are no longer retried.
+- Kept the existing Haiku to Luna, Sonnet to Terra, and Opus/Fable to Sol provider routing unchanged while removing the Luna-only `404 Model not found` failure mode.
+
+## 0.2.26
+
+- Added a shared Codex model catalog backed by `~/.codex/models_cache.json`, with safe GPT-5.6 Sol, Terra, and Luna fallbacks.
+- Added model-aware reasoning support through `max` and `ultra`, including Luna `ultra` to `max` and legacy-model upper-bound clamping.
+- Added Claude Code and Claude Desktop provider reasoning policies with preview, confirmation, database backup, and non-destructive header merging.
+- Added the optional GPT-5.6 auto-routing preset: Haiku to Luna, Sonnet to Terra, and Opus/Fable to Sol.
+- Added current CC Switch Claude model roles while retaining Sonnet 4.6 and Opus 4.7 compatibility aliases.
+- Isolated Local Bridge routing from inherited `ANTHROPIC_DEFAULT_*` process variables and packaged the new model catalog module.
+
 ## 0.2.25
 
 - Fixed Local Codex Bridge token selection after reauthorization so a newer `bridgedeck-auth.json` invalidates stale in-memory access tokens.

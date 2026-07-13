@@ -1965,6 +1965,45 @@ class LocalCodexBridgeCase(unittest.TestCase):
         self.assertEqual(with_meta["cache_key_source"], "session_identity")
         self.assertEqual(with_session["input"][0]["arguments"], '{"a":1,"b":2}')
 
+    def test_upstream_headers_identify_as_current_codex_cli(self) -> None:
+        handler = self.make_handler()
+        handler.headers = {"Accept": "text/event-stream", "anthropic-beta": "test-beta"}
+
+        with (
+            mock.patch.object(local_codex_bridge, "CODEX_CLIENT_VERSION", "0.144.3"),
+            mock.patch.object(local_codex_bridge, "CODEX_USER_AGENT", "codex_cli_rs/0.144.3"),
+        ):
+            headers = handler._build_upstream_headers("acct-1", "access-token")
+
+        self.assertEqual(headers["Originator"], "codex_cli_rs")
+        self.assertEqual(headers["User-Agent"], "codex_cli_rs/0.144.3")
+        self.assertEqual(headers["Version"], "0.144.3")
+        self.assertEqual(headers["Accept"], "text/event-stream")
+        self.assertEqual(headers["anthropic-beta"], "test-beta")
+
+    def test_codex_client_version_prefers_newer_installed_cli_over_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "models_cache.json"
+            cache_path.write_text('{"client_version":"0.144.2"}', encoding="utf-8")
+            with (
+                mock.patch.dict(os.environ, {}, clear=False),
+                mock.patch.object(local_codex_bridge, "CODEX_MODELS_CACHE_PATH", cache_path),
+                mock.patch.object(local_codex_bridge, "_probe_codex_cli_version", return_value="0.144.3"),
+            ):
+                os.environ.pop("CODEX_BRIDGE_CODEX_CLIENT_VERSION", None)
+                self.assertEqual(local_codex_bridge.load_codex_client_version(), "0.144.3")
+
+    def test_codex_client_version_uses_minimum_when_sources_are_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "models_cache.json"
+            cache_path.write_text('{"client_version":"invalid"}', encoding="utf-8")
+            with (
+                mock.patch.dict(os.environ, {"CODEX_BRIDGE_CODEX_CLIENT_VERSION": "0.143.9"}),
+                mock.patch.object(local_codex_bridge, "CODEX_MODELS_CACHE_PATH", cache_path),
+                mock.patch.object(local_codex_bridge, "_probe_codex_cli_version", return_value="broken"),
+            ):
+                self.assertEqual(local_codex_bridge.load_codex_client_version(), "0.144.0")
+
     def test_normalize_moves_responses_system_input_to_instructions(self) -> None:
         body = local_codex_bridge.normalize_request_body(
             {
@@ -2171,6 +2210,92 @@ class LocalCodexBridgeCase(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(payload["type"], "message")
         self.assertEqual(payload["content"][0], {"type": "text", "text": "hello"})
+
+    def test_messages_provider_reasoning_header_clamps_and_reports_effective(self) -> None:
+        server = self.start_local_bridge_server()
+        client = FakeForwardClient(
+            [
+                FakeForwardResponse(
+                    200,
+                    body=(
+                        b"event: response.output_text.delta\n"
+                        b'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+                    ),
+                )
+            ]
+        )
+        with mock.patch.object(local_codex_bridge, "build_upstream_http_client", return_value=client):
+            status, _body, headers = self.post_local_bridge_json(
+                server,
+                "/accounts/acct-1/v1/messages",
+                {
+                    "model": "gpt-5.6-luna",
+                    "max_tokens": 100,
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={"X-BridgeDeck-Reasoning-Effort": "ultra"},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(client.calls[0]["kwargs"]["json"]["reasoning"]["effort"], "max")
+        self.assertEqual(headers["X-BridgeDeck-Reasoning-Requested"], "ultra")
+        self.assertEqual(headers["X-BridgeDeck-Reasoning-Effective"], "max")
+        self.assertEqual(headers["X-BridgeDeck-Reasoning-Source"], "provider_header_clamped")
+        self.assertNotIn("X-BridgeDeck-Reasoning-Effort", client.calls[0]["kwargs"]["headers"])
+
+    def test_reasoning_rejection_retries_once_at_next_lower_effort(self) -> None:
+        server = self.start_local_bridge_server()
+        client = FakeForwardClient(
+            [
+                FakeForwardResponse(400, body=b'{"error":"reasoning effort max is not allowed"}'),
+                FakeForwardResponse(
+                    200,
+                    body=(
+                        b"event: response.output_text.delta\n"
+                        b'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+                    ),
+                ),
+            ]
+        )
+        with mock.patch.object(local_codex_bridge, "build_upstream_http_client", return_value=client):
+            status, _body, headers = self.post_local_bridge_json(
+                server,
+                "/accounts/acct-1/v1/messages",
+                {
+                    "model": "gpt-5.6-luna",
+                    "max_tokens": 100,
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={"X-BridgeDeck-Reasoning-Effort": "max"},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[1]["kwargs"]["json"]["reasoning"]["effort"], "xhigh")
+        self.assertEqual(headers["X-BridgeDeck-Reasoning-Effective"], "xhigh")
+        self.assertEqual(headers["X-BridgeDeck-Reasoning-Source"], "provider_header_clamped")
+
+    def test_generic_reasoning_effort_403_is_not_retried(self) -> None:
+        server = self.start_local_bridge_server()
+        client = FakeForwardClient(
+            [FakeForwardResponse(403, body=b'{"error":"reasoning effort request blocked by account policy"}')]
+        )
+        with mock.patch.object(local_codex_bridge, "build_upstream_http_client", return_value=client):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self.post_local_bridge_json(
+                    server,
+                    "/accounts/acct-1/v1/messages",
+                    {
+                        "model": "gpt-5.6-luna",
+                        "max_tokens": 100,
+                        "stream": False,
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                    headers={"X-BridgeDeck-Reasoning-Effort": "max"},
+                )
+        self.assertEqual(raised.exception.code, 403)
+        raised.exception.close()
+        self.assertEqual(len(client.calls), 1)
 
     def test_messages_endpoint_maps_claude_desktop_safe_model_to_gpt(self) -> None:
         server = self.start_local_bridge_server()
@@ -4183,22 +4308,24 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertIn("sk-bridgedeck-local-placeholder", html)
         self.assertIn("ANTHROPIC_BASE_URL", html)
         self.assertNotIn("ANTHROPIC_MODEL=gpt-5.5", html)
-        self.assertIn("ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark", html)
+        self.assertIn("ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.6-luna", html)
         self.assertIn("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME=Haiku 4.5", html)
-        self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex", html)
-        self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME=Sonnet 4.6", html)
-        self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5", html)
-        self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME=Opus 4.7", html)
+        self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra", html)
+        self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME=Sonnet 5", html)
+        self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.6-sol", html)
+        self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME=Opus 4.8 / Fable 5", html)
+        self.assertIn("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1", html)
         self.assertIn("CLAUDE_CODE_ATTRIBUTION_HEADER=0", html)
         self.assertIn("repair-claude-attribution-header", html)
         self.assertIn("Claude 自动路由", html)
         self.assertIn("强制主模型", html)
         self.assertIn("copy-anthropic-forced-env", html)
         self.assertIn("claude-haiku-4-5", html)
-        self.assertIn("claude-sonnet-4-6", html)
-        self.assertIn("claude-opus-4-7", html)
+        self.assertIn("claude-sonnet-5", html)
+        self.assertIn("claude-opus-4-8", html)
+        self.assertIn("claude-fable-5", html)
         self.assertIn("Desktop Gateway", html)
-        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000", html)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000", html)
         self.assertIn("272k context / 128k max output", html)
         self.assertIn('"id": "gpt-5.4"', html)
         self.assertIn('"context_tokens": 220000', html)
@@ -5709,6 +5836,27 @@ class LauncherCase(unittest.TestCase):
             )
         )
 
+    def test_backup_file_captures_committed_wal_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+            writer = sqlite3.connect(manager.paths.db)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE providers (id TEXT PRIMARY KEY, value TEXT)")
+                writer.execute("INSERT INTO providers VALUES ('provider-1', 'from-wal')")
+                writer.commit()
+                self.assertTrue(Path(str(manager.paths.db) + "-wal").exists())
+                backup = manager._backup_file(manager.paths.db, "wal-test")
+                self.assertTrue(backup)
+                with sqlite3.connect(str(backup)) as restored:
+                    row = restored.execute("SELECT id, value FROM providers").fetchone()
+                    integrity = restored.execute("PRAGMA integrity_check").fetchone()[0]
+                self.assertEqual(row, ("provider-1", "from-wal"))
+                self.assertEqual(integrity, "ok")
+            finally:
+                writer.close()
+
     def test_codex_oauth_authorize_url_uses_pkce_and_fixed_callback(self) -> None:
         url = bridgedeck.codex_oauth_authorize_url("state-1", "challenge-1")
         parsed = urllib.parse.urlsplit(url)
@@ -6309,10 +6457,11 @@ class LauncherCase(unittest.TestCase):
         self.assertEqual(routes["claude-haiku-4-5"]["model"], "gpt-5.3-codex-spark")
         self.assertEqual(routes["claude-haiku-4-5"]["labelOverride"], "Haiku 4.5")
         self.assertEqual(routes["claude-sonnet-4-6"]["model"], "gpt-5.3-codex")
-        self.assertEqual(routes["claude-sonnet-4-6"]["labelOverride"], "Sonnet 4.6")
+        self.assertEqual(routes["claude-sonnet-4-6"]["labelOverride"], "Sonnet 5")
         self.assertEqual(routes["claude-opus-4-7"]["model"], "gpt-5.5")
-        self.assertEqual(routes["claude-opus-4-7"]["labelOverride"], "Opus 4.7")
+        self.assertEqual(routes["claude-opus-4-7"]["labelOverride"], "Opus 4.8")
         self.assertFalse(routes["claude-opus-4-7"]["supports1m"])
+        self.assertEqual(routes["claude-fable-5"]["labelOverride"], "Fable 5")
 
     def test_create_cli_launcher_does_not_refresh_or_write_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6486,9 +6635,9 @@ class LauncherCase(unittest.TestCase):
             self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gpt-5.3-codex-spark")
             self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"], "Haiku 4.5")
             self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-5.3-codex")
-            self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"], "Sonnet 4.6")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"], "Sonnet 5")
             self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gpt-5.5")
-            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "Opus 4.7")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "Opus 4.8")
             self.assertEqual(env["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0")
             self.assertEqual(meta["apiFormat"], "openai_responses")
             self.assertEqual(meta["codexOauthTransport"], "local_bridge")
@@ -6518,7 +6667,7 @@ class LauncherCase(unittest.TestCase):
             env = settings["env"]
             self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"], "Haiku 4.5")
             self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"], "Team Sonnet")
-            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "Opus 4.7")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "Opus 4.8")
 
     def test_provider_payload_applies_adjustable_compact_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7838,6 +7987,93 @@ class LauncherCase(unittest.TestCase):
             bridgedeck.classify_error_text("unsupported_country_region_territory"),
             "unsupported_region",
         )
+
+    def test_provider_reasoning_preview_apply_and_clear_preserves_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self.make_manager(root)
+            with sqlite3.connect(manager.paths.db) as conn:
+                conn.execute(
+                    "CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, settings_config TEXT, meta TEXT)"
+                )
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?)",
+                    (
+                        "claude-1",
+                        "claude",
+                        "Bridge",
+                        json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-1/v1", "ANTHROPIC_CUSTOM_HEADERS": "X-User: keep"}}),
+                        json.dumps({}),
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?)",
+                    (
+                        "desktop-1",
+                        "claude-desktop",
+                        "Desktop Bridge",
+                        json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-1/v1"}}),
+                        json.dumps({"localProxyRequestOverrides": {"headers": {"X-User": "keep"}}}),
+                    ),
+                )
+            preview = manager.update_provider_reasoning_policy(
+                "claude-1", surface="claude_code", effort="ultra", apply=False
+            )
+            self.assertTrue(preview["changed"])
+            self.assertEqual(preview["effective_by_model"]["gpt-5.6-luna"]["effective"], "max")
+            self.assertEqual(preview["backups"], [])
+            applied = manager.update_provider_reasoning_policy(
+                "claude-1", surface="claude_code", effort="ultra", apply=True
+            )
+            self.assertEqual(len(applied["backups"]), 1)
+            desktop = manager.update_provider_reasoning_policy(
+                "desktop-1", surface="claude_desktop", effort="max", apply=True
+            )
+            self.assertTrue(desktop["changed"])
+            with sqlite3.connect(manager.paths.db) as conn:
+                code_settings = json.loads(conn.execute("SELECT settings_config FROM providers WHERE id='claude-1'").fetchone()[0])
+                desktop_meta = json.loads(conn.execute("SELECT meta FROM providers WHERE id='desktop-1'").fetchone()[0])
+            self.assertIn("X-User: keep", code_settings["env"]["ANTHROPIC_CUSTOM_HEADERS"])
+            self.assertIn("X-BridgeDeck-Reasoning-Effort: ultra", code_settings["env"]["ANTHROPIC_CUSTOM_HEADERS"])
+            self.assertEqual(desktop_meta["localProxyRequestOverrides"]["headers"]["X-User"], "keep")
+            self.assertEqual(desktop_meta["localProxyRequestOverrides"]["headers"]["X-BridgeDeck-Reasoning-Effort"], "max")
+            manager.update_provider_reasoning_policy(
+                "claude-1", surface="claude_code", effort="inherit", apply=True
+            )
+            with sqlite3.connect(manager.paths.db) as conn:
+                cleared = json.loads(conn.execute("SELECT settings_config FROM providers WHERE id='claude-1'").fetchone()[0])
+            self.assertEqual(cleared["env"]["ANTHROPIC_CUSTOM_HEADERS"], "X-User: keep")
+
+    def test_gpt56_routing_preview_then_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self.make_manager(Path(tmp))
+            with sqlite3.connect(manager.paths.db) as conn:
+                conn.execute("CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, settings_config TEXT, meta TEXT)")
+                conn.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?)",
+                    (
+                        "claude-1",
+                        "claude",
+                        "Bridge",
+                        json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8876/accounts/acct-1/v1", "ANTHROPIC_MODEL": "gpt-5.5"}}),
+                        json.dumps({}),
+                    ),
+                )
+            preview = manager.apply_gpt56_routing_preset("claude-1", surface="claude_code", apply=False)
+            self.assertTrue(preview["changed"])
+            with sqlite3.connect(manager.paths.db) as conn:
+                untouched = json.loads(conn.execute("SELECT settings_config FROM providers").fetchone()[0])
+            self.assertEqual(untouched["env"]["ANTHROPIC_MODEL"], "gpt-5.5")
+            applied = manager.apply_gpt56_routing_preset("claude-1", surface="claude_code", apply=True)
+            self.assertEqual(len(applied["backups"]), 1)
+            with sqlite3.connect(manager.paths.db) as conn:
+                settings = json.loads(conn.execute("SELECT settings_config FROM providers").fetchone()[0])
+            env = settings["env"]
+            self.assertNotIn("ANTHROPIC_MODEL", env)
+            self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gpt-5.6-luna")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-5.6-terra")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gpt-5.6-sol")
+            self.assertEqual(env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], "1")
 
 
 if __name__ == "__main__":

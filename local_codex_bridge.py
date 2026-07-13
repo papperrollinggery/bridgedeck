@@ -12,6 +12,7 @@ import os
 import queue
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -26,6 +27,14 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+sys.dont_write_bytecode = True
+
+from model_catalog import REASONING_LEVEL_DESCRIPTIONS
+from model_catalog import model_by_id as catalog_model_by_id
+from model_catalog import model_options as catalog_model_options
+from model_catalog import normalize_model_id as catalog_normalize_model_id
+from model_catalog import normalize_reasoning_effort as catalog_normalize_reasoning_effort
 
 try:
     from compression import zstd
@@ -42,7 +51,63 @@ CC_SWITCH_DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
 DEFAULT_API_KEYS_PATH = Path.home() / ".cc-switch" / "bridgedeck-keys.json"
 OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-CODEX_USER_AGENT = "codex-local-bridge"
+CODEX_MODELS_CACHE_PATH = Path.home() / ".codex" / "models_cache.json"
+CODEX_MINIMUM_CLIENT_VERSION = "0.144.0"
+CODEX_ORIGINATOR = "codex_cli_rs"
+CODEX_CLI_PATHS = (
+    Path("/opt/homebrew/bin/codex"),
+    Path("/usr/local/bin/codex"),
+    Path.home() / ".local" / "bin" / "codex",
+)
+
+
+def _parse_codex_client_version(value: str) -> tuple[tuple[int, int, int], str] | None:
+    match = re.search(r"(?<![0-9.])(\d+)\.(\d+)\.(\d+)(?:[-+][A-Za-z0-9.-]+)?(?![0-9.])", value)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups()), match.group(0)
+
+
+def _probe_codex_cli_version() -> str:
+    for executable in CODEX_CLI_PATHS:
+        if not executable.is_file():
+            continue
+        try:
+            result = subprocess.run(
+                [str(executable), "--version"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        parsed = _parse_codex_client_version(f"{result.stdout}\n{result.stderr}")
+        if result.returncode == 0 and parsed:
+            return parsed[1]
+    return ""
+
+
+def load_codex_client_version() -> str:
+    configured = str(os.environ.get("CODEX_BRIDGE_CODEX_CLIENT_VERSION") or "").strip()
+    minimum = _parse_codex_client_version(CODEX_MINIMUM_CLIENT_VERSION)
+    configured_version = _parse_codex_client_version(configured)
+    if configured_version and minimum and configured_version[0] >= minimum[0]:
+        return configured_version[1]
+
+    candidates = [CODEX_MINIMUM_CLIENT_VERSION]
+    try:
+        cache = json.loads(CODEX_MODELS_CACHE_PATH.read_text(encoding="utf-8"))
+        candidates.append(str(cache.get("client_version") or "").strip())
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    candidates.append(_probe_codex_cli_version())
+    parsed_candidates = [parsed for candidate in candidates if (parsed := _parse_codex_client_version(candidate))]
+    return max(parsed_candidates, key=lambda item: item[0])[1]
+
+
+CODEX_CLIENT_VERSION = load_codex_client_version()
+CODEX_USER_AGENT = f"{CODEX_ORIGINATOR}/{CODEX_CLIENT_VERSION}"
 UPSTREAM_BASE_URL = "https://chatgpt.com/backend-api/codex"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -72,11 +137,21 @@ ANTHROPIC_TOOL_ARGS_MODE_ENV = "CODEX_BRIDGE_ANTHROPIC_TOOL_ARGS_MODE"
 ANTHROPIC_TOOL_ARG_PING_SECS = float(os.environ.get("CODEX_BRIDGE_ANTHROPIC_TOOL_ARG_PING_SECS", "5"))
 STREAM_STATE_UPDATE_SECS = float(os.environ.get("CODEX_BRIDGE_STREAM_STATE_UPDATE_SECS", "5"))
 STRIP_CLAUDE_ATTRIBUTION_HEADER_ENV = "CODEX_BRIDGE_STRIP_CLAUDE_CODE_ATTRIBUTION_HEADER"
+BRIDGE_REASONING_HEADER = "X-BridgeDeck-Reasoning-Effort"
 CLAUDE_ATTRIBUTION_HEADER_RE = re.compile(
     r"^\s*x-anthropic-billing-header\s*:[^\r\n]*(?:\r?\n){0,2}",
     re.IGNORECASE,
 )
 RETRYABLE_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+REASONING_EFFORT_REJECTION_MARKERS = (
+    "not allowed",
+    "not supported",
+    "unsupported",
+    "invalid effort",
+    "invalid reasoning effort",
+    "must be one of",
+    "supported values",
+)
 CHATGPT_ACCOUNT_MODEL_UNSUPPORTED_MARKER = "not supported when using codex with a chatgpt account"
 MAX_REQUEST_BODY_BYTES = 50 * 1024 * 1024  # 50 MB – refuse before reading
 MAX_DECOMPRESSED_BODY_BYTES = 10 * 1024 * 1024  # 10 MB – refuse after decompression
@@ -200,26 +275,24 @@ class RetryableStreamBootstrapError(Exception):
     pass
 
 
-BRIDGE_MODELS: tuple[BridgeModel, ...] = (
-    BridgeModel(
-        id="gpt-5.5",
-        display_name="GPT 5.5",
-        context_length=272000,
-        max_completion_tokens=128000,
-        thinking_levels=("low", "medium", "high", "xhigh"),
-    ),
-    BridgeModel(id="gpt-5.4", display_name="GPT 5.4", context_length=220000, thinking_levels=("low", "medium", "high", "xhigh")),
-    BridgeModel(id="gpt-5.4-mini", display_name="GPT 5.4 Mini", context_length=220000, thinking_levels=("low", "medium", "high", "xhigh")),
-    BridgeModel(id="gpt-5.3-codex", display_name="GPT 5.3 Codex", context_length=220000),
-    BridgeModel(id="gpt-5.3-codex-spark", display_name="GPT 5.3 Codex Spark", context_length=220000),
-)
+class UnsupportedReasoningEffort(ValueError):
+    pass
 
-REASONING_LEVEL_DESCRIPTIONS = {
-    "low": "Fast responses with lighter reasoning",
-    "medium": "Balances speed and reasoning depth for everyday tasks",
-    "high": "Greater reasoning depth for complex problems",
-    "xhigh": "Extra high reasoning depth for complex problems",
-}
+
+def bridge_models() -> tuple[BridgeModel, ...]:
+    return tuple(
+        BridgeModel(
+            id=str(item["id"]),
+            display_name=str(item.get("name") or item["id"]),
+            context_length=item.get("context_tokens"),
+            max_completion_tokens=item.get("max_output_tokens"),
+            thinking_levels=tuple(item.get("thinking_levels") or ()),
+        )
+        for item in catalog_model_options()
+    )
+
+
+BRIDGE_MODELS: tuple[BridgeModel, ...] = bridge_models()
 
 CODEX_MODEL_BASE_INSTRUCTIONS = (
     "You are Codex, a coding agent. Follow the user's instructions and use the workspace safely."
@@ -230,21 +303,42 @@ CLAUDE_DESKTOP_MODEL_ROUTES: tuple[dict[str, Any], ...] = (
         "id": "claude-haiku-4-5",
         "aliases": ("haiku",),
         "display_name": "Claude Haiku 4.5",
-        "env": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "env": "CODEX_BRIDGE_HAIKU_MODEL",
         "default": "gpt-5.3-codex-spark",
     },
     {
+        "id": "claude-sonnet-5",
+        "aliases": ("sonnet", "claude-sonnet-4-6"),
+        "display_name": "Claude Sonnet 5",
+        "env": "CODEX_BRIDGE_SONNET_MODEL",
+        "default": "gpt-5.3-codex",
+    },
+    {
+        "id": "claude-opus-4-8",
+        "aliases": ("opus", "claude-opus-4-7"),
+        "display_name": "Claude Opus 4.8",
+        "env": "CODEX_BRIDGE_OPUS_MODEL",
+        "default": "gpt-5.5",
+    },
+    {
+        "id": "claude-fable-5",
+        "aliases": ("fable",),
+        "display_name": "Claude Fable 5",
+        "env": "CODEX_BRIDGE_FABLE_MODEL",
+        "default": "gpt-5.5",
+    },
+    {
         "id": "claude-sonnet-4-6",
-        "aliases": ("sonnet",),
-        "display_name": "Claude Sonnet 4.6",
-        "env": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "aliases": (),
+        "display_name": "Claude Sonnet 4.6 (legacy alias)",
+        "env": "CODEX_BRIDGE_SONNET_MODEL",
         "default": "gpt-5.3-codex",
     },
     {
         "id": "claude-opus-4-7",
-        "aliases": ("opus",),
-        "display_name": "Claude Opus 4.7",
-        "env": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "aliases": (),
+        "display_name": "Claude Opus 4.7 (legacy alias)",
+        "env": "CODEX_BRIDGE_OPUS_MODEL",
         "default": "gpt-5.5",
     },
 )
@@ -742,13 +836,13 @@ def redact_log_text(value: str | None) -> str | None:
 def normalize_bridge_model_id(value: Any) -> str:
     model = str(value or "").strip()
     if re.match(r"(?i)^gpt-", model):
-        return model.lower()
+        return catalog_normalize_model_id(model)
     return model
 
 
 def bridge_model_by_id(model_id: str | None) -> BridgeModel | None:
     normalized = normalize_bridge_model_id(model_id)
-    for model in BRIDGE_MODELS:
+    for model in bridge_models():
         if model.id == normalized:
             return model
     return None
@@ -757,7 +851,13 @@ def bridge_model_by_id(model_id: str | None) -> BridgeModel | None:
 def claude_desktop_model_route_map() -> dict[str, str]:
     routes: dict[str, str] = {}
     for route in CLAUDE_DESKTOP_MODEL_ROUTES:
-        source_model = normalize_bridge_model_id(os.environ.get(route["env"]) or route["default"])
+        configured = normalize_bridge_model_id(os.environ.get(route["env"]) or route["default"])
+        source_model = configured if configured.startswith("gpt-") and catalog_model_by_id(configured) else route["default"]
+        if configured != source_model:
+            print(
+                f"[bridge-config] ignored invalid {route['env']} target; using {source_model}",
+                file=sys.stderr,
+            )
         if source_model:
             routes[route["id"]] = source_model
             for alias in route.get("aliases", ()):
@@ -853,7 +953,7 @@ def build_models_payload(
 ) -> dict[str, Any]:
     unsupported = {normalize_bridge_model_id(model_id) for model_id in (unsupported_model_ids or set())}
     data: list[dict[str, Any]] = []
-    for model in BRIDGE_MODELS:
+    for model in bridge_models():
         supported = model.id not in unsupported
         data.append(
             model_payload_item(
@@ -1134,6 +1234,15 @@ def extract_reasoning_effort(payload: dict[str, Any]) -> str | None:
         return None
     effort = reasoning.get("effort")
     return effort if isinstance(effort, str) and effort else None
+
+
+def is_reasoning_effort_rejection(detail: str | None) -> bool:
+    text = str(detail or "").lower()
+    return (
+        "reasoning" in text
+        and "effort" in text
+        and any(marker in text for marker in REASONING_EFFORT_REJECTION_MARKERS)
+    )
 
 
 def build_visible_model_hint(
@@ -2087,7 +2196,9 @@ def normalize_request_body(body: dict[str, Any]) -> dict[str, Any]:
             )
             normalized["model"] = routed_model
             model = routed_model
-        normalized_model, default_effort = normalize_codex_model_and_effort(model)
+        normalized_model, default_effort = normalize_codex_model_and_effort(
+            catalog_normalize_model_id(model)
+        )
         if normalized_model != model:
             print(
                 f"[bridge-normalize] model {model} -> {normalized_model}",
@@ -2103,15 +2214,25 @@ def normalize_request_body(body: dict[str, Any]) -> dict[str, Any]:
 
     reasoning = normalized.get("reasoning")
     if isinstance(reasoning, dict):
+        reasoning = dict(reasoning)
+        normalized["reasoning"] = reasoning
         effort = reasoning.get("effort")
         model_name = str(normalized.get("model") or "").strip().lower()
-        if isinstance(effort, str) and effort.strip().lower() == "minimal" and model_name == "gpt-5.4":
-            reasoning["effort"] = "low"
-            effort = "low"
-            print(
-                "[bridge-normalize] reasoning.effort minimal -> low (model=gpt-5.4)",
-                file=sys.stderr,
-            )
+        if isinstance(effort, str):
+            try:
+                decision = catalog_normalize_reasoning_effort(model_name, effort)
+            except ValueError as exc:
+                model = catalog_model_by_id(model_name)
+                supported = list(model.get("thinking_levels") or ()) if model else []
+                suffix = f"; supported values: {', '.join(supported)}" if supported else ""
+                raise UnsupportedReasoningEffort(f"{exc}{suffix}") from exc
+            reasoning["effort"] = decision["effective"]
+            effort = decision["effective"]
+            if decision["clamped"]:
+                print(
+                    f"[bridge-normalize] reasoning.effort {decision['requested']} -> {decision['effective']} (model={model_name}, clamped=true)",
+                    file=sys.stderr,
+                )
         if not supports_reasoning_summary_model(model_name):
             reasoning.pop("summary", None)
         summary_mode = reasoning_summary_mode()
@@ -3475,6 +3596,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 if key == "content-type" and not is_stream:
                     continue
                 self.send_header(key, value)
+        self._send_reasoning_headers()
         if not is_stream:
             self.send_header("Content-Type", "application/json; charset=utf-8")
         if content_length is not None:
@@ -3482,6 +3604,17 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.close_connection = True
         self.end_headers()
+
+    def _send_reasoning_headers(self) -> None:
+        requested = getattr(self, "_bridge_reasoning_requested", None)
+        effective = getattr(self, "_bridge_reasoning_effective", None)
+        source = getattr(self, "_bridge_reasoning_source", None)
+        if requested:
+            self.send_header("X-BridgeDeck-Reasoning-Requested", str(requested))
+        if effective:
+            self.send_header("X-BridgeDeck-Reasoning-Effective", str(effective))
+        if source:
+            self.send_header("X-BridgeDeck-Reasoning-Source", str(source))
 
     def do_POST(self) -> None:
         route_account_id, route_path = self._resolve_account_route()
@@ -3525,7 +3658,8 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             "Content-Type": "application/json",
             "Accept": self.headers.get("Accept", "application/json"),
             "User-Agent": CODEX_USER_AGENT,
-            "Originator": "cc-switch-local-bridge",
+            "Originator": CODEX_ORIGINATOR,
+            "Version": CODEX_CLIENT_VERSION,
         }
         if self.headers.get("anthropic-beta"):
             headers["anthropic-beta"] = self.headers["anthropic-beta"]
@@ -3613,6 +3747,8 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 actual_effort=actual_effort,
                 output_format="responses",
             )
+        except UnsupportedReasoningEffort as exc:
+            self._write_json_error(400, str(exc))
         except httpx.HTTPStatusError as exc:
             self._write_json_error(exc.response.status_code, exc.response.text)
         except Exception as exc:  # noqa: BLE001
@@ -3641,6 +3777,9 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             requested_account_id = route_account_id or self.headers.get("chatgpt-account-id")
             candidate_account_ids, session_key = self._account_candidates(requested_account_id, request_body)
             responses_body = anthropic_messages_to_responses(request_body)
+            provider_effort = str(self.headers.get(BRIDGE_REASONING_HEADER) or "").strip().lower()
+            if provider_effort and provider_effort != "inherit":
+                responses_body["reasoning"] = {"effort": provider_effort}
             requested_effort = extract_reasoning_effort(responses_body)
             normalized_body = normalize_request_body(responses_body)
             is_stream = bool(request_body.get("stream", False))
@@ -3664,6 +3803,8 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 actual_effort=actual_effort,
                 output_format="messages",
             )
+        except UnsupportedReasoningEffort as exc:
+            self._write_json_error(400, str(exc))
         except httpx.HTTPStatusError as exc:
             self._write_json_error(exc.response.status_code, exc.response.text)
         except Exception as exc:  # noqa: BLE001
@@ -3715,6 +3856,8 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                 actual_effort=actual_effort,
                 output_format="chat",
             )
+        except UnsupportedReasoningEffort as exc:
+            self._write_json_error(400, str(exc))
         except httpx.HTTPStatusError as exc:
             self._write_json_error(exc.response.status_code, exc.response.text)
         except Exception as exc:  # noqa: BLE001
@@ -3742,8 +3885,21 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
         output_format: str,
         actual_effort: str | None = None,
     ) -> None:
+        self._bridge_reasoning_requested = requested_effort
+        self._bridge_reasoning_effective = actual_effort
+        provider_effort = str(self.headers.get(BRIDGE_REASONING_HEADER) or "").strip().lower()
+        base_source = (
+            "provider_header" if provider_effort and provider_effort != "inherit" else
+            "client" if requested_effort else "upstream_default"
+        )
+        self._bridge_reasoning_source = (
+            f"{base_source}_clamped"
+            if requested_effort and actual_effort and requested_effort != actual_effort
+            else base_source
+        )
         upstream_url = f"{UPSTREAM_BASE_URL}/responses"
-        max_attempts = stream_max_retries() + 1 if is_stream else 1
+        normal_attempt_limit = stream_max_retries() + 1 if is_stream else 1
+        max_attempts = normal_attempt_limit + 1
         started_at = time.monotonic()
         usage_context = self._usage_context(
             request_type=request_type,
@@ -3756,6 +3912,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
             normalized_body,
             session_key=session_key,
         )
+        effort_fallback_used = False
         usage_context.update(cache_context)
 
         if self._is_passthrough_request():
@@ -3847,6 +4004,29 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                                 normalized_shape=summarize_request_shape(normalized_body),
                                 error_detail=error_detail,
                             )
+                            if (
+                                not effort_fallback_used
+                                and response.status_code in {400, 403}
+                                and actual_effort
+                                and is_reasoning_effort_rejection(error_detail)
+                            ):
+                                levels = list((catalog_model_by_id(requested_model) or {}).get("thinking_levels") or ())
+                                if actual_effort in levels and levels.index(actual_effort) > 0:
+                                    lower_effort = levels[levels.index(actual_effort) - 1]
+                                    upstream_body["reasoning"] = {
+                                        **(upstream_body.get("reasoning") if isinstance(upstream_body.get("reasoning"), dict) else {}),
+                                        "effort": lower_effort,
+                                    }
+                                    self._bridge_reasoning_effective = lower_effort
+                                    if not str(self._bridge_reasoning_source).endswith("_clamped"):
+                                        self._bridge_reasoning_source = f"{self._bridge_reasoning_source}_clamped"
+                                    actual_effort = lower_effort
+                                    effort_fallback_used = True
+                                    print(
+                                        f"{log_timestamp()} [bridge-reasoning-fallback] request_id={request_id} effort={lower_effort} status={response.status_code}",
+                                        file=sys.stderr,
+                                    )
+                                    continue
                             if is_model_unsupported_for_chatgpt_account(
                                 response.status_code,
                                 error_detail,
@@ -3862,13 +4042,13 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                                     )
                                     break
                             if is_retryable_http_status(response.status_code):
-                                if is_stream and attempt < max_attempts:
+                                if is_stream and attempt < normal_attempt_limit:
                                     log_bridge_stream_retry(
                                         request_id=request_id,
                                         account_id=account_id,
                                         requested_model=requested_model,
                                         attempt=attempt,
-                                        max_attempts=max_attempts,
+                                        max_attempts=normal_attempt_limit,
                                         reason=f"HTTP {response.status_code}",
                                     )
                                     continue
@@ -3963,13 +4143,13 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         except StopIteration:
                             first_chunk = b""
                         except RetryableStreamBootstrapError as exc:
-                            if attempt < max_attempts:
+                            if attempt < normal_attempt_limit:
                                 log_bridge_stream_retry(
                                     request_id=request_id,
                                     account_id=account_id,
                                     requested_model=requested_model,
                                     attempt=attempt,
-                                    max_attempts=max_attempts,
+                                    max_attempts=normal_attempt_limit,
                                     reason=str(exc),
                                 )
                                 continue
@@ -3987,6 +4167,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             self.send_header("Cache-Control", "no-cache, no-store")
                             self.send_header("X-Accel-Buffering", "no")
                             self.send_header("Connection", "close")
+                            self._send_reasoning_headers()
                             self.close_connection = True
                             self.end_headers()
                         elif output_format == "chat":
@@ -3995,6 +4176,7 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                             self.send_header("Cache-Control", "no-cache, no-store")
                             self.send_header("X-Accel-Buffering", "no")
                             self.send_header("Connection", "close")
+                            self._send_reasoning_headers()
                             self.close_connection = True
                             self.end_headers()
                         else:
@@ -4042,13 +4224,13 @@ class CodexBridgeHandler(BaseHTTPRequestHandler):
                         return
                 except Exception as exc:
                     if is_stream and (isinstance(exc, BridgeStreamRetryableError) or is_retryable_stream_exception(exc)):
-                        if attempt < max_attempts:
+                        if attempt < normal_attempt_limit:
                             log_bridge_stream_retry(
                                 request_id=request_id,
                                 account_id=account_id,
                                 requested_model=requested_model,
                                 attempt=attempt,
-                                max_attempts=max_attempts,
+                                max_attempts=normal_attempt_limit,
                                 reason=f"{type(exc).__name__}: {exc}",
                             )
                             continue

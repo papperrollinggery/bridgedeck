@@ -168,16 +168,19 @@ Example Anthropic-style environment:
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8876/accounts/<account_id>/v1
 ANTHROPIC_AUTH_TOKEN=local-bridge
-ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark
-ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex
-ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5
+ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.6-luna
+ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra
+ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.6-sol
+CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 CLAUDE_CODE_ATTRIBUTION_HEADER=0
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000
 ```
 
 Do not set `ANTHROPIC_MODEL` unless you intentionally want to force every main Claude Code request to one model. Leaving it unset keeps Claude's `haiku` / `sonnet` / `opus` slot routing meaningful.
 
 BridgeDeck also exposes desktop-safe Claude-style model aliases so clients with model-name restrictions can route to the intended GPT model while the UI still shows both the requested model and actual routed model.
+
+GPT-5.6 reasoning is model-aware: Sol and Terra support `low` through `ultra`; Luna supports `low` through `max`. Requests above a model's supported ceiling are clamped transparently (`Luna ultra -> max`, older GPT models `max/ultra -> xhigh`). Provider policies use `X-BridgeDeck-Reasoning-Effort` locally; the header is consumed by BridgeDeck and is not forwarded upstream.
 
 ### Claude Code Attribution Header
 

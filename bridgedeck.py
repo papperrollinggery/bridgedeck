@@ -35,6 +35,14 @@ from pathlib import Path
 from shutil import copy2, which
 from typing import Any
 
+sys.dont_write_bytecode = True
+
+from model_catalog import model_by_id as catalog_model_by_id
+from model_catalog import model_options as catalog_model_options
+from model_catalog import normalize_model_id as catalog_normalize_model_id
+from model_catalog import normalize_reasoning_effort as catalog_normalize_reasoning_effort
+from model_catalog import public_catalog
+
 
 DEFAULT_DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
 DEFAULT_SETTINGS_PATH = Path.home() / ".cc-switch" / "settings.json"
@@ -89,7 +97,7 @@ DEFAULT_AIMAMI_FOLLOW_PATH = Path.home() / ".cc-switch" / "bridgedeck-aimami-fol
 DEFAULT_API_KEYS_PATH = Path.home() / ".cc-switch" / "bridgedeck-keys.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.25"
+APP_VERSION = "0.2.27"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -117,19 +125,9 @@ CLAUDE_CODE_ATTRIBUTION_DISABLED_VALUE = "0"
 DEFAULT_COMPACT_WINDOW_TOKENS = 220_000
 DEFAULT_COMPACT_THRESHOLD_PERCENT = 80
 DEFAULT_BRIDGE_PROVIDER_MODEL = "gpt-5.5"
-BRIDGE_MODEL_OPTIONS = (
-    {
-        "id": "gpt-5.5",
-        "name": "gpt-5.5",
-        "context_tokens": 272_000,
-        "max_output_tokens": 128_000,
-        "thinking_levels": ("low", "medium", "high", "xhigh"),
-    },
-    {"id": "gpt-5.4", "name": "gpt-5.4", "context_tokens": 220_000, "thinking_levels": ("low", "medium", "high", "xhigh")},
-    {"id": "gpt-5.4-mini", "name": "gpt-5.4 Mini", "context_tokens": 220_000, "thinking_levels": ("low", "medium", "high", "xhigh")},
-    {"id": "gpt-5.3-codex", "name": "gpt-5.3-codex", "context_tokens": 220_000},
-    {"id": "gpt-5.3-codex-spark", "name": "gpt-5.3-codex-spark", "context_tokens": 220_000},
-)
+BRIDGE_REASONING_HEADER = "X-BridgeDeck-Reasoning-Effort"
+ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
+GATEWAY_MODEL_DISCOVERY_ENV = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"
 MODEL_ENV_KEYS = (
     "ANTHROPIC_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -164,6 +162,8 @@ PROVIDER_SCOPED_ENV_KEYS = {
     COMPACT_WINDOW_ENV,
     COMPACT_THRESHOLD_ENV,
     MAX_CONTEXT_TOKENS_ENV,
+    ANTHROPIC_CUSTOM_HEADERS_ENV,
+    GATEWAY_MODEL_DISCOVERY_ENV,
 }
 CODEX_GLOBAL_ENV_CONFLICT_KEYS = (
     "ANTHROPIC_AUTH_TOKEN",
@@ -189,8 +189,32 @@ CLAUDE_DESKTOP_ROUTE_SPECS = (
         "default_model": "gpt-5.3-codex-spark",
     },
     {
-        "alias": "claude-sonnet-4-6",
+        "alias": "claude-sonnet-5",
         "slot": "sonnet",
+        "env": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "display_env": "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+        "display_name": "Sonnet 5",
+        "default_model": "gpt-5.3-codex",
+    },
+    {
+        "alias": "claude-opus-4-8",
+        "slot": "opus",
+        "env": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "display_env": "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+        "display_name": "Opus 4.8",
+        "default_model": "gpt-5.5",
+    },
+    {
+        "alias": "claude-fable-5",
+        "slot": "fable",
+        "env": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "display_env": "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+        "display_name": "Fable 5",
+        "default_model": "gpt-5.5",
+    },
+    {
+        "alias": "claude-sonnet-4-6",
+        "slot": "sonnet_legacy",
         "env": "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "display_env": "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
         "display_name": "Sonnet 4.6",
@@ -198,7 +222,7 @@ CLAUDE_DESKTOP_ROUTE_SPECS = (
     },
     {
         "alias": "claude-opus-4-7",
-        "slot": "opus",
+        "slot": "opus_legacy",
         "env": "ANTHROPIC_DEFAULT_OPUS_MODEL",
         "display_env": "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
         "display_name": "Opus 4.7",
@@ -458,7 +482,7 @@ def apply_compact_config_to_env(env: dict[str, Any], compact_config: dict[str, A
 def normalize_openai_model_id(value: Any) -> str:
     model = str(value or "").strip()
     if re.match(r"(?i)^gpt-", model):
-        return model.lower()
+        return catalog_normalize_model_id(model)
     return model
 
 
@@ -481,10 +505,77 @@ def apply_bridge_safe_model_display_names(env: dict[str, Any]) -> None:
 
 def bridge_model_option(model_id: str | None) -> dict[str, Any] | None:
     normalized = normalize_openai_model_id(model_id)
-    for item in BRIDGE_MODEL_OPTIONS:
-        if item["id"] == normalized:
-            return item
-    return None
+    return catalog_model_by_id(normalized)
+
+
+def normalize_reasoning_policy(value: Any) -> str:
+    effort = str(value or "inherit").strip().lower()
+    allowed = {"inherit", "low", "medium", "high", "xhigh", "max", "ultra"}
+    if effort not in allowed:
+        raise ValueError(f"不支持的推理等级: {effort}")
+    return effort
+
+
+def merge_anthropic_custom_header(raw: Any, header_name: str, value: str | None) -> str:
+    lines = str(raw or "").splitlines()
+    prefix = header_name.lower() + ":"
+    kept = [line for line in lines if not line.strip().lower().startswith(prefix)]
+    if value:
+        kept.append(f"{header_name}: {value}")
+    return "\n".join(line for line in kept if line.strip())
+
+
+def reasoning_policy_from_provider(settings: dict[str, Any], meta: dict[str, Any], app_type: str) -> str:
+    if app_type == "claude-desktop":
+        overrides = meta.get("localProxyRequestOverrides")
+        headers = overrides.get("headers") if isinstance(overrides, dict) else None
+        if isinstance(headers, dict):
+            for key, value in headers.items():
+                if str(key).lower() == BRIDGE_REASONING_HEADER.lower():
+                    return normalize_reasoning_policy(value)
+        return "inherit"
+    env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+    for line in str(env.get(ANTHROPIC_CUSTOM_HEADERS_ENV) or "").splitlines():
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() == BRIDGE_REASONING_HEADER.lower():
+            return normalize_reasoning_policy(value)
+    return "inherit"
+
+
+def apply_reasoning_policy_to_provider(
+    settings: dict[str, Any], meta: dict[str, Any], app_type: str, effort: Any
+) -> str:
+    normalized = normalize_reasoning_policy(effort)
+    value = None if normalized == "inherit" else normalized
+    if app_type == "claude-desktop":
+        overrides = meta.get("localProxyRequestOverrides")
+        if not isinstance(overrides, dict):
+            overrides = {}
+        headers = overrides.get("headers")
+        if not isinstance(headers, dict):
+            headers = {}
+        headers = {key: item for key, item in headers.items() if str(key).lower() != BRIDGE_REASONING_HEADER.lower()}
+        if value:
+            headers[BRIDGE_REASONING_HEADER] = value
+        if headers:
+            overrides["headers"] = headers
+        else:
+            overrides.pop("headers", None)
+        if overrides:
+            meta["localProxyRequestOverrides"] = overrides
+        else:
+            meta.pop("localProxyRequestOverrides", None)
+    else:
+        env = settings.get("env")
+        if not isinstance(env, dict):
+            env = {}
+        merged = merge_anthropic_custom_header(env.get(ANTHROPIC_CUSTOM_HEADERS_ENV), BRIDGE_REASONING_HEADER, value)
+        if merged:
+            env[ANTHROPIC_CUSTOM_HEADERS_ENV] = merged
+        else:
+            env.pop(ANTHROPIC_CUSTOM_HEADERS_ENV, None)
+        settings["env"] = env
+    return normalized
 
 
 def normalize_bridge_model_config(config: dict[str, Any] | None) -> dict[str, str]:
@@ -564,6 +655,8 @@ def claude_desktop_routes_from_env(env: dict[str, Any]) -> dict[str, dict[str, A
     for spec in CLAUDE_DESKTOP_ROUTE_SPECS:
         model = normalize_openai_model_id(env.get(spec["env"]) or spec["default_model"])
         display_name = env.get(spec["display_env"])
+        if spec.get("slot") == "fable":
+            display_name = spec["display_name"]
         if not isinstance(display_name, str) or not display_name.strip() or re.match(r"(?i)^gpt-", display_name.strip()):
             display_name = spec["display_name"]
         routes[spec["alias"]] = {
@@ -2841,7 +2934,17 @@ class BridgeManager:
         backup_dir.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(path.expanduser()).strip("/"))
         target = backup_dir / f"{safe_name}.toolbak-{label}-{now_ts()}-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
-        copy2(path, target)
+        if path.resolve() == self.paths.db.resolve():
+            source = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            destination = sqlite3.connect(str(target))
+            try:
+                source.backup(destination)
+                destination.execute("PRAGMA integrity_check")
+            finally:
+                destination.close()
+                source.close()
+        else:
+            copy2(path, target)
         os.chmod(target, 0o600)
         return str(target)
 
@@ -4960,6 +5063,7 @@ class BridgeManager:
             "base_url": base_url,
             "model": forced_model,
             "routing_mode": "forced" if forced_model else "claude_auto",
+            "reasoning_policy": reasoning_policy_from_provider(settings, meta, app_type),
             "model_is_legacy_default": forced_model == DEFAULT_BRIDGE_PROVIDER_MODEL,
             "haiku_model": env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), str) else "",
             "sonnet_model": env.get("ANTHROPIC_DEFAULT_SONNET_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"), str) else "",
@@ -6458,6 +6562,7 @@ class BridgeManager:
         compact_config: dict[str, Any] | None = None,
         context_config: dict[str, Any] | None = None,
         model_config: dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
         clear_forced_model: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         settings = copy.deepcopy(settings_config) if isinstance(settings_config, dict) else {}
@@ -6468,6 +6573,7 @@ class BridgeManager:
             env = {}
         env["ANTHROPIC_BASE_URL"] = f"{LOCAL_BRIDGE_BASE_URL}/v1"
         env["ANTHROPIC_AUTH_TOKEN"] = "local-bridge"
+        env.setdefault(GATEWAY_MODEL_DISCOVERY_ENV, "1")
         if clear_forced_model:
             clear_forced_bridge_model_from_env(env)
         if model_config is not None:
@@ -6501,6 +6607,9 @@ class BridgeManager:
         binding["authProvider"] = "codex_oauth"
         binding["accountId"] = account_id
         m["authBinding"] = binding
+
+        if reasoning_effort is not None:
+            apply_reasoning_policy_to_provider(settings, m, "claude", reasoning_effort)
 
         return settings, m
 
@@ -6853,6 +6962,7 @@ class BridgeManager:
             "claude_attribution_header": self.claude_attribution_header_status(),
             "ccswitch_315": {},
             "coding_tools": self._detect_coding_tools(),
+            "model_catalog": public_catalog(),
         }
 
         if not self.paths.db.exists():
@@ -6926,6 +7036,7 @@ class BridgeManager:
         compact_config: dict[str, Any] | None = None,
         context_config: dict[str, Any] | None = None,
         model_config: dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         logger.info("Provider switch: account=%s provider=%s set_current=%s", account_id, provider_name, set_current)
         if not account_id.strip():
@@ -6968,6 +7079,7 @@ class BridgeManager:
                     compact_config=compact_config,
                     context_config=context_config,
                     model_config=model_config,
+                    reasoning_effort=reasoning_effort,
                     clear_forced_model=clear_forced_model,
                 )
                 settings_text = json.dumps(new_settings, ensure_ascii=False)
@@ -7415,6 +7527,131 @@ class BridgeManager:
                 "removed_model": removed_model,
                 "backups": [db_bak] if db_bak else [],
             }
+
+    def update_provider_reasoning_policy(
+        self,
+        provider_id: str,
+        *,
+        surface: str,
+        effort: str,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        if not provider_id.strip():
+            raise ValueError("provider_id 不能为空")
+        app_type = provider_surface_app_type(surface)
+        normalized_effort = normalize_reasoning_policy(effort)
+        with self._lock:
+            with self._managed_connect() as conn:
+                columns = self._provider_columns(conn)
+                required = {"settings_config", "meta"}
+                if not required.issubset(columns):
+                    raise RuntimeError("providers 表缺少 settings_config/meta 字段")
+                row = conn.execute(
+                    "SELECT id, settings_config, meta FROM providers WHERE app_type = ? AND id = ? LIMIT 1",
+                    (app_type, provider_id),
+                ).fetchone()
+                if not row:
+                    raise ValueError(f"provider 不存在: {provider_id}")
+                settings = self._extract_json(row["settings_config"])
+                meta = self._extract_json(row["meta"])
+                env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+                base_url = str(env.get("ANTHROPIC_BASE_URL") or "")
+                if not base_url.startswith(LOCAL_BRIDGE_BASE_URL):
+                    raise ValueError("仅支持 Local Codex Bridge provider")
+                previous = reasoning_policy_from_provider(settings, meta, app_type)
+                apply_reasoning_policy_to_provider(settings, meta, app_type, normalized_effort)
+                changed = previous != normalized_effort
+                db_bak = None
+                if apply and changed:
+                    db_bak = self._backup_file(self.paths.db, "provider-reasoning")
+                    conn.execute(
+                        "UPDATE providers SET settings_config = ?, meta = ? WHERE id = ? AND app_type = ?",
+                        (
+                            json.dumps(settings, ensure_ascii=False),
+                            json.dumps(meta, ensure_ascii=False),
+                            provider_id,
+                            app_type,
+                        ),
+                    )
+                    conn.commit()
+        effective_by_model: dict[str, dict[str, Any]] = {}
+        if normalized_effort != "inherit":
+            for model in catalog_model_options():
+                effective_by_model[str(model["id"])] = catalog_normalize_reasoning_effort(
+                    model["id"], normalized_effort
+                )
+        return {
+            "ok": True,
+            "message": "推理策略已保存" if apply and changed else "推理策略预览",
+            "provider_id": provider_id,
+            "surface": provider_surface_for_app_type(app_type),
+            "effort": normalized_effort,
+            "previous_effort": previous,
+            "apply": apply,
+            "changed": changed,
+            "effective_by_model": effective_by_model,
+            "backups": [db_bak] if db_bak else [],
+        }
+
+    def apply_gpt56_routing_preset(
+        self,
+        provider_id: str,
+        *,
+        surface: str,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        if not provider_id.strip():
+            raise ValueError("provider_id 不能为空")
+        app_type = provider_surface_app_type(surface)
+        targets = {
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-luna",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6-terra",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-5.6-sol",
+        }
+        with self._lock:
+            with self._managed_connect() as conn:
+                columns = self._provider_columns(conn)
+                row = conn.execute(
+                    "SELECT id, settings_config, meta FROM providers WHERE app_type = ? AND id = ? LIMIT 1",
+                    (app_type, provider_id),
+                ).fetchone()
+                if not row:
+                    raise ValueError(f"provider 不存在: {provider_id}")
+                settings = self._extract_json(row["settings_config"])
+                meta = self._extract_json(row["meta"])
+                env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+                if not str(env.get("ANTHROPIC_BASE_URL") or "").startswith(LOCAL_BRIDGE_BASE_URL):
+                    raise ValueError("仅支持 Local Codex Bridge provider")
+                before_settings = copy.deepcopy(settings)
+                before_meta = copy.deepcopy(meta)
+                clear_forced_bridge_model_from_env(env)
+                env.update(targets)
+                env[MAX_CONTEXT_TOKENS_ENV] = "372000"
+                env[GATEWAY_MODEL_DISCOVERY_ENV] = "1"
+                apply_bridge_safe_model_display_names(env)
+                settings["env"] = env
+                if app_type == "claude-desktop":
+                    meta, _issues, _route_changed = normalize_claude_desktop_routes(meta, env)
+                changed = settings != before_settings or meta != before_meta
+                db_bak = None
+                if apply and changed:
+                    db_bak = self._backup_file(self.paths.db, "provider-routing")
+                    conn.execute(
+                        "UPDATE providers SET settings_config = ?, meta = ? WHERE id = ? AND app_type = ?",
+                        (json.dumps(settings, ensure_ascii=False), json.dumps(meta, ensure_ascii=False), provider_id, app_type),
+                    )
+                    conn.commit()
+        return {
+            "ok": True,
+            "message": "GPT-5.6 自动路由已保存" if apply and changed else "GPT-5.6 自动路由预览",
+            "provider_id": provider_id,
+            "surface": provider_surface_for_app_type(app_type),
+            "mode": "gpt56_auto",
+            "apply": apply,
+            "changed": changed,
+            "routes": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol", "fable": "gpt-5.6-sol"},
+            "backups": [db_bak] if db_bak else [],
+        }
 
     def sync_common_env_to_bridge_providers(self, provider_id: str) -> dict[str, Any]:
         if not provider_id.strip():
@@ -9603,6 +9840,7 @@ INDEX_HTML = """<!doctype html>
                 <label>显示名称<input id="providerName" placeholder="Local Codex Bridge - xxx" /></label>
                 <label>路由模式<select id="modelRoutingMode"><option value="auto">Claude 自动路由</option><option value="forced">强制主模型</option></select></label>
                 <label>模型 / 上下文<select id="bridgeModel"></select></label>
+                <label>推理等级<select id="reasoningEffort"></select></label>
                 <label>上下文 tokens<input id="modelContextTokens" type="number" min="10000" max="2000000" step="1000" value="272000" readonly /></label>
               </div>
               <div class="muted" id="selectedProviderMeta">当前账号 provider：未检测。</div>
@@ -9623,6 +9861,8 @@ INDEX_HTML = """<!doctype html>
                   <button class="miniBtn" data-action="save-compact-selected">保存上下文/压缩到选中 provider</button>
                   <button class="miniBtn" data-action="save-forced-model-selected">保存强制主模型</button>
                   <button class="miniBtn warn" data-action="clear-forced-model-selected">改为 Claude 自动路由</button>
+                  <button class="miniBtn" data-action="save-reasoning-selected">保存推理等级</button>
+                  <button class="miniBtn" data-action="apply-gpt56-routing-selected">应用 GPT-5.6 自动路由</button>
                   <button class="miniBtn" data-action="sync-common-env-selected">同步通用 env 到全部</button>
                 </div>
                 <div class="muted" id="bridgeModelMeta">gpt-5.5 = 272000 context tokens / 128000 max output。</div>
@@ -9877,6 +10117,9 @@ INDEX_HTML = """<!doctype html>
               <div class="row mt10">
                 <button class="miniBtn" data-action="preview-ccswitch-315-desktop-routes">预览 Claude Desktop 3.15 路由修复</button>
                 <button class="miniBtn warn" data-action="apply-ccswitch-315-desktop-routes">应用 Claude Desktop 3.15 路由修复</button>
+                <label>Desktop 推理<select id="desktopReasoningEffort"><option>inherit</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option><option>ultra</option></select></label>
+                <button class="miniBtn" data-action="save-reasoning-selected">保存选中 Desktop 推理</button>
+                <button class="miniBtn" data-action="apply-gpt56-routing-selected">应用选中 Desktop GPT-5.6 路由</button>
               </div>
               <div class="tableWrap mt10">
                 <table id="claudeDesktopProvidersTable">
@@ -10023,7 +10266,7 @@ INDEX_HTML = """<!doctype html>
     let oauthExpiryTimer = null;
     let activeOAuthExpiresAt = '';
     const BRIDGE_MODELS = __BRIDGE_MODELS_JSON__;
-    const DEFAULT_BRIDGE_MODEL = 'gpt-5.5';
+    const DEFAULT_BRIDGE_MODEL = 'gpt-5.6-sol';
     const DEFAULT_COMPACT_WINDOW = '272000';
     const CONSERVATIVE_COMPACT_WINDOW = '220000';
     const DEFAULT_COMPACT_PCT = '80';
@@ -10032,8 +10275,9 @@ INDEX_HTML = """<!doctype html>
     const LOCAL_ANTHROPIC_AUTH_TOKEN = 'local-bridge';
     const CLAUDE_DESKTOP_ROUTES = [
       ['claude-haiku-4-5', 'Haiku 4.5'],
-      ['claude-sonnet-4-6', 'Sonnet 4.6'],
-      ['claude-opus-4-7', 'Opus 4.7']
+      ['claude-sonnet-5', 'Sonnet 5'],
+      ['claude-opus-4-8', 'Opus 4.8'],
+      ['claude-fable-5', 'Fable 5']
     ];
     const GUIDES = {
       oauth: {
@@ -11733,7 +11977,9 @@ INDEX_HTML = """<!doctype html>
       return chosen ? chosen.value : '';
     }
     function providerById(providerId) {
-      return providerId && lastData ? (lastData.providers || []).find((p) => p.id === providerId) || null : null;
+      if (!providerId || !lastData) return null;
+      return [...(lastData.providers || []), ...(lastData.claude_desktop_providers || [])]
+        .find((p) => p.id === providerId) || null;
     }
     function providerForClaudeAccount(accountId) {
       if (!lastData) return null;
@@ -11881,7 +12127,7 @@ INDEX_HTML = """<!doctype html>
     }
     function anthropicAccessEnv(item) {
       const baseUrl = anthropicAccessBaseUrl(item);
-      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.3-codex-spark\nANTHROPIC_DEFAULT_HAIKU_MODEL_NAME=Haiku 4.5\nANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.3-codex\nANTHROPIC_DEFAULT_SONNET_MODEL_NAME=Sonnet 4.6\nANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5\nANTHROPIC_DEFAULT_OPUS_MODEL_NAME=Opus 4.7\nCLAUDE_CODE_ATTRIBUTION_HEADER=0\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=272000` : '';
+      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.6-luna\nANTHROPIC_DEFAULT_HAIKU_MODEL_NAME=Haiku 4.5\nANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra\nANTHROPIC_DEFAULT_SONNET_MODEL_NAME=Sonnet 5\nANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.6-sol\nANTHROPIC_DEFAULT_OPUS_MODEL_NAME=Opus 4.8 / Fable 5\nCLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1\nCLAUDE_CODE_ATTRIBUTION_HEADER=0\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=372000` : '';
     }
     function anthropicForcedModelEnv(item) {
       const base = anthropicAccessEnv(item);
@@ -11889,7 +12135,7 @@ INDEX_HTML = """<!doctype html>
     }
     function apiOpenAiEnv(item) {
       const baseUrl = apiAccessBaseUrl(item);
-      return baseUrl ? `OPENAI_API_KEY=${LOCAL_API_KEY_PLACEHOLDER}\nOPENAI_BASE_URL=${baseUrl}\nMODEL=gpt-5.5` : '';
+      return baseUrl ? `OPENAI_API_KEY=${LOCAL_API_KEY_PLACEHOLDER}\nOPENAI_BASE_URL=${baseUrl}\nMODEL=gpt-5.6-sol` : '';
     }
     function apiClaudeEnv(item) {
       const gatewayBase = claudeDesktopGatewayBaseUrl(item);
@@ -12000,6 +12246,37 @@ INDEX_HTML = """<!doctype html>
         ? `${model} = ${context} context tokens${outputText}。`
         : `${model} 未探测到真实 context；自动压缩使用保守 ${CONSERVATIVE_COMPACT_WINDOW}，不会写 CLAUDE_CODE_MAX_CONTEXT_TOKENS。`;
       document.getElementById('bridgeModelMeta').textContent = `${routingText} ${contextText}`;
+      renderReasoningEfforts();
+    }
+    function renderReasoningEfforts(selectedValue = null) {
+      const sel = document.getElementById('reasoningEffort');
+      if (!sel) return;
+      const current = selectedValue || sel.value || 'inherit';
+      const option = bridgeModelOption(selectedBridgeModel());
+      const levels = option && Array.isArray(option.thinking_levels) ? option.thinking_levels : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+      sel.innerHTML = '';
+      ['inherit', ...levels].forEach((effort) => {
+        const node = document.createElement('option');
+        node.value = effort;
+        node.textContent = effort === 'inherit' ? 'inherit（上游默认 medium）' : effort;
+        sel.appendChild(node);
+      });
+      if (!Array.from(sel.options).some((node) => node.value === current) && current !== 'inherit') {
+        const preserved = document.createElement('option');
+        preserved.value = current;
+        preserved.textContent = `${current}（当前策略；此模型会自动收敛）`;
+        sel.appendChild(preserved);
+      }
+      sel.value = Array.from(sel.options).some((node) => node.value === current) ? current : 'inherit';
+    }
+    function selectedReasoningEffort() {
+      const target = selectedProviderActionTarget();
+      if (target.provider && target.provider.surface === 'claude_desktop') {
+        const desktopSel = document.getElementById('desktopReasoningEffort');
+        return desktopSel && desktopSel.value ? desktopSel.value : 'inherit';
+      }
+      const sel = document.getElementById('reasoningEffort');
+      return sel && sel.value ? sel.value : 'inherit';
     }
     function renderBridgeModels() {
       const sel = document.getElementById('bridgeModel');
@@ -12017,6 +12294,7 @@ INDEX_HTML = """<!doctype html>
       const routingSel = document.getElementById('modelRoutingMode');
       if (routingSel) routingSel.onchange = () => updateBridgeModelMeta();
       updateBridgeModelMeta();
+      renderReasoningEfforts();
     }
     function setBridgeModel(modelId, applyContext = false) {
       const sel = document.getElementById('bridgeModel');
@@ -12093,6 +12371,12 @@ INDEX_HTML = """<!doctype html>
     }
     function applyCompactFromProvider(provider) {
       if (!provider) return;
+      if (provider.surface === 'claude_desktop') {
+        const desktopEffort = document.getElementById('desktopReasoningEffort');
+        if (desktopEffort) desktopEffort.value = provider.reasoning_policy || 'inherit';
+        setSelectedProviderMeta(provider);
+        return;
+      }
       const nameInput = document.getElementById('providerName');
       if (nameInput && provider.name) nameInput.value = provider.name;
       setBridgeModel(provider.model || DEFAULT_BRIDGE_MODEL, false);
@@ -12103,6 +12387,7 @@ INDEX_HTML = """<!doctype html>
         setCompactFields(false, '', DEFAULT_COMPACT_PCT);
       }
       setSelectedProviderMeta(provider);
+      renderReasoningEfforts(provider.reasoning_policy || 'inherit');
     }
     function syncClaudeProviderFormForSelectedAccount(markRadio = true) {
       const provider = providerForSelectedClaudeAccount();
@@ -12349,14 +12634,14 @@ INDEX_HTML = """<!doctype html>
       const providers = data.claude_desktop_providers || [];
       providers.forEach((p) => {
         const routes = p.desktop_routes || {};
-        const routeText = ['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-7'].map((key) => {
+        const routeText = ['claude-haiku-4-5', 'claude-sonnet-5', 'claude-opus-4-8', 'claude-fable-5'].map((key) => {
           const item = routes[key] || {};
           const oneM = item.supports1m === true ? '1m' : 'std';
           return `${key} -> ${item.model || '-'} (${oneM})`;
         }).join('\\n');
         const tr = document.createElement('tr');
         tr.innerHTML = `
-          <td>${esc(p.name || '')}<br><span class="muted">${esc(p.api_format || '-')} / ${esc(p.desktop_mode || '-')}</span></td>
+          <td><label class="providerNameCell"><input type="radio" name="providerPick" value="${esc(p.id)}"><span class="providerNameText">${esc(p.name || '')}</span></label><br><span class="muted">${esc(p.api_format || '-')} / ${esc(p.desktop_mode || '-')}</span></td>
           <td>${p.is_current ? '<span class="ok">当前</span>' : '<span class="muted">备用</span>'}</td>
           <td class="mono">${esc(maskId(p.account_id || ''))}</td>
           <td class="mono">${esc(routeText).split('\\n').join('<br>')}</td>
@@ -12598,6 +12883,7 @@ INDEX_HTML = """<!doctype html>
         set_current: setCurrent,
         context_config: bridgeModelConfigPayload(),
         model_config: forcedModelConfigPayload(),
+        reasoning_effort: selectedReasoningEffort(),
         compact_config: compactConfigPayload()
       });
       log(`${res.message}: ${res.provider_name} (${res.provider_id})`);
@@ -12715,6 +13001,31 @@ INDEX_HTML = """<!doctype html>
       log(`${res.message}: 已移除 ${res.removed_model || '-'}`);
       await refreshData().catch((e) => { log(`刷新失败: ${e.message}`); setSimpleResult('刷新失败: ' + e.message, 'bad'); });
     }
+    async function saveReasoningSelected() {
+      const target = selectedProviderActionTarget();
+      const id = selectedProviderActionId();
+      if (!id || !target.provider) return log('请先选账号或选中一个 provider');
+      const surface = target.provider.surface || 'claude_code';
+      const effort = selectedReasoningEffort();
+      const preview = await api('/api/provider-reasoning', 'POST', { provider_id: id, surface, effort, apply: false });
+      const clamps = Object.values(preview.effective_by_model || {}).filter((item) => item.clamped).length;
+      if (!window.confirm(`推理策略 ${preview.previous_effort} → ${effort}${clamps ? `；${clamps} 个模型会自动收敛` : ''}。继续？`)) return;
+      const res = await api('/api/provider-reasoning', 'POST', { provider_id: id, surface, effort, apply: true });
+      log(`${res.message}: ${effort}${res.backups.length ? `；备份 ${res.backups[0]}` : ''}`);
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+    }
+    async function applyGpt56RoutingSelected() {
+      const target = selectedProviderActionTarget();
+      const id = selectedProviderActionId();
+      if (!id || !target.provider) return log('请先选账号或选中一个 provider');
+      const surface = target.provider.surface || 'claude_code';
+      const preview = await api('/api/provider-routing', 'POST', { provider_id: id, surface, mode: 'gpt56_auto', apply: false });
+      if (!window.confirm(`应用 GPT-5.6 自动路由：Haiku→Luna、Sonnet→Terra、Opus/Fable→Sol。继续？`)) return;
+      const res = await api('/api/provider-routing', 'POST', { provider_id: id, surface, mode: 'gpt56_auto', apply: true });
+      setRoutingMode('auto');
+      log(`${res.message}${res.backups.length ? `；备份 ${res.backups[0]}` : ''}`);
+      await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
+    }
     async function syncCommonEnvSelected() {
       const id = selectedProviderActionId();
       if (!id) return log('请先选账号或选中一个 provider');
@@ -12813,6 +13124,8 @@ INDEX_HTML = """<!doctype html>
           if (action === 'save-compact-selected') return saveCompactSelected();
           if (action === 'save-forced-model-selected') return saveForcedModelSelected();
           if (action === 'clear-forced-model-selected') return clearForcedModelSelected();
+          if (action === 'save-reasoning-selected') return saveReasoningSelected();
+          if (action === 'apply-gpt56-routing-selected') return applyGpt56RoutingSelected();
           if (action === 'sync-common-env-selected') return syncCommonEnvSelected();
           if (action === 'copy-claude-env') return copyClaudeEnv();
           if (action === 'extract-safe-common-config') return extractSafeCommonConfig();
@@ -12966,7 +13279,7 @@ def build_handler(
                     INDEX_HTML.replace("__CSRF_TOKEN__", csrf_token)
                     .replace("__CSP_NONCE__", csp_nonce)
                     .replace("__LOCAL_BRIDGE_BASE_URL__", LOCAL_BRIDGE_BASE_URL)
-                    .replace("__BRIDGE_MODELS_JSON__", json.dumps(BRIDGE_MODEL_OPTIONS, ensure_ascii=False))
+                    .replace("__BRIDGE_MODELS_JSON__", json.dumps(catalog_model_options(), ensure_ascii=False))
                     .encode("utf-8")
                 )
                 self.send_response(200)
@@ -13335,6 +13648,7 @@ def build_handler(
                     compact_config = payload.get("compact_config") if isinstance(payload.get("compact_config"), dict) else None
                     context_config = payload.get("context_config") if isinstance(payload.get("context_config"), dict) else None
                     model_config = payload.get("model_config") if isinstance(payload.get("model_config"), dict) else None
+                    reasoning_effort = str(payload.get("reasoning_effort") or "inherit")
                     result = manager.create_or_update_provider(
                         account_id,
                         provider_name,
@@ -13342,6 +13656,7 @@ def build_handler(
                         compact_config=compact_config,
                         context_config=context_config,
                         model_config=model_config,
+                        reasoning_effort=reasoning_effort,
                     )
                     json_response(self, 200, result)
                     return
@@ -13391,9 +13706,33 @@ def build_handler(
                         return
                     provider_id = str(payload.get("provider_id") or "")
                     mode = str(payload.get("mode") or "auto")
-                    if mode != "auto":
-                        raise ValueError("仅支持切换到 Claude 自动路由")
-                    result = manager.clear_provider_forced_model(provider_id, apply=bool(payload.get("apply", False)))
+                    surface = str(payload.get("surface") or "claude_code")
+                    if mode == "auto":
+                        if provider_surface_app_type(surface) != "claude":
+                            raise ValueError("Claude Desktop 请使用 gpt56_auto 或显式模型路由")
+                        result = manager.clear_provider_forced_model(provider_id, apply=bool(payload.get("apply", False)))
+                    elif mode == "gpt56_auto":
+                        result = manager.apply_gpt56_routing_preset(
+                            provider_id,
+                            surface=surface,
+                            apply=bool(payload.get("apply", False)),
+                        )
+                    else:
+                        raise ValueError("仅支持 auto 或 gpt56_auto")
+                    json_response(self, 200, result)
+                    return
+                if self.path == "/api/provider-reasoning":
+                    for fld in ("provider_id", "surface", "effort"):
+                        err = _require_str(payload, fld)
+                        if err:
+                            json_response(self, 400, {"ok": False, "error": err})
+                            return
+                    result = manager.update_provider_reasoning_policy(
+                        str(payload.get("provider_id") or ""),
+                        surface=str(payload.get("surface") or ""),
+                        effort=str(payload.get("effort") or "inherit"),
+                        apply=bool(payload.get("apply", False)),
+                    )
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/sync-common-env":
