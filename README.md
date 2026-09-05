@@ -170,10 +170,10 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8876/accounts/<account_id>/v1
 ANTHROPIC_AUTH_TOKEN=local-bridge
 ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.6-luna
 ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra
-ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.6-sol
+ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-6-astra
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 CLAUDE_CODE_ATTRIBUTION_HEADER=0
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
 ```
 
 Do not set `ANTHROPIC_MODEL` unless you intentionally want to force every main Claude Code request to one model. Leaving it unset keeps Claude's `haiku` / `sonnet` / `opus` slot routing meaningful.
@@ -181,6 +181,14 @@ Do not set `ANTHROPIC_MODEL` unless you intentionally want to force every main C
 BridgeDeck also exposes desktop-safe Claude-style model aliases so clients with model-name restrictions can route to the intended GPT model while the UI still shows both the requested model and actual routed model.
 
 GPT-5.6 reasoning is model-aware: Sol and Terra support `low` through `ultra`; Luna supports `low` through `max`. Requests above a model's supported ceiling are clamped transparently (`Luna ultra -> max`, older GPT models `max/ultra -> xhigh`). Provider policies use `X-BridgeDeck-Reasoning-Effort` locally; the header is consumed by BridgeDeck and is not forwarded upstream.
+
+GPT-6 Astra is the default in the model picker and new forced-model configurations. The optional **GPT-6 Astra auto-routing** action maps Haiku to Luna, Sonnet to Terra, and Opus/Fable to Astra; previewing it does not write settings. Existing providers are updated only when you apply the preset. The previous GPT-5.6 preset remains available.
+
+Claude alias defaults and providers created without this preset keep their legacy slot routes. Apply the Astra preset to the selected provider to migrate those routes.
+
+BridgeDeck uses Codex channel metadata: Astra's offline fallback is a 272,000-token default window, an 872,000-token maximum window, and 128,000 output tokens. Current `~/.codex/models_cache.json` values take precedence. These are distinct from the [public API model limits](https://developers.openai.com/api/docs/models/gpt-6-astra). The Codex catalog advertises `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; `none`/`minimal` requests are adjusted to `low`.
+
+Following the [Astra migration guide](https://developers.openai.com/api/docs/guides/latest-model), the Responses bridge removes unsupported logprob parameters and converts legacy `prompt_cache_retention` to `prompt_cache_options.ttl: "30m"`, preserving explicit new cache options. Responses retains async tool fields and configuration updates; Chat Completions supports streaming function calls through the Responses adapter. This does not add WebSocket mid-turn steering support.
 
 ### Claude Code Attribution Header
 

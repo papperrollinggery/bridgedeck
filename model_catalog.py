@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
+import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 MODELS_CACHE_PATH = Path.home() / ".codex" / "models_cache.json"
+DEFAULT_MODEL_ID = "gpt-6-astra"
 CATALOG_STALE_SECS = 48 * 60 * 60
 REASONING_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 REASONING_LEVEL_DESCRIPTIONS = {
@@ -23,6 +26,16 @@ REASONING_LEVEL_DESCRIPTIONS = {
 
 
 _FALLBACK_MODELS: tuple[dict[str, Any], ...] = (
+    {
+        "id": DEFAULT_MODEL_ID,
+        "name": "GPT-6 Astra",
+        # Codex's default window, not the public API's 1,050,000-token window.
+        "context_tokens": 272_000,
+        "max_context_tokens": 872_000,
+        "max_output_tokens": 128_000,
+        "thinking_levels": ("low", "medium", "high", "xhigh", "max", "ultra"),
+        "default_reasoning_level": "medium",
+    },
     {
         "id": "gpt-5.6-sol",
         "name": "GPT-5.6 Sol",
@@ -80,29 +93,31 @@ def normalize_model_id(value: Any) -> str:
 
 
 def _positive_int(value: Any) -> int | None:
-    return value if isinstance(value, int) and 0 < value <= 2_000_000 else None
+    return value if type(value) is int and 0 < value <= 2_000_000 else None
 
 
 def _cache_model(item: Any) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
     model_id = normalize_model_id(item.get("slug") or item.get("id"))
-    if not model_id.startswith("gpt-") or not model_id[4:5].isdigit():
+    if not re.fullmatch(r"gpt-\d[0-9a-z]*(?:[.-][0-9a-z]+)*", model_id):
         return None
     levels: list[str] = []
-    for raw in item.get("supported_reasoning_levels") or []:
+    raw_levels = item.get("supported_reasoning_levels")
+    for raw in raw_levels if isinstance(raw_levels, list) else []:
         effort = raw.get("effort") if isinstance(raw, dict) else raw
         effort = str(effort or "").strip().lower()
         if effort in REASONING_EFFORT_ORDER and effort not in levels:
             levels.append(effort)
-    context = _positive_int(item.get("context_window") or item.get("max_context_window"))
+    context = _positive_int(item.get("context_window")) or _positive_int(item.get("max_context_window"))
     return {
         "id": model_id,
         "name": str(item.get("display_name") or model_id),
         "context_tokens": context,
-        "max_output_tokens": _positive_int(item.get("max_output_tokens") or item.get("max_completion_tokens")),
+        "max_context_tokens": _positive_int(item.get("max_context_window")),
+        "max_output_tokens": _positive_int(item.get("max_output_tokens")) or _positive_int(item.get("max_completion_tokens")),
         "thinking_levels": tuple(levels),
-        "default_reasoning_level": str(item.get("default_reasoning_level") or "medium").lower(),
+        "default_reasoning_level": str(item.get("default_reasoning_level") or "").strip().lower(),
     }
 
 
@@ -130,14 +145,12 @@ def load_model_catalog(path: Path | None = None) -> dict[str, Any]:
         model = dict(fallback)
         cached = cache_models.get(model["id"])
         if cached:
-            # Preserve BridgeDeck's proven OAuth-path limits for existing models.
-            # The cache still supplies names/reasoning capabilities and is the source
-            # of truth for newly discovered models.
+            # Current Codex metadata wins; fallbacks fill missing cache fields.
             model.update(
                 {
                     key: value
                     for key, value in cached.items()
-                    if key not in {"context_tokens", "max_output_tokens"} and value not in (None, (), "")
+                    if value not in (None, (), "")
                 }
             )
         models.append(model)
@@ -145,16 +158,30 @@ def load_model_catalog(path: Path | None = None) -> dict[str, Any]:
     for model_id, model in sorted(cache_models.items()):
         if model_id not in seen:
             models.append(dict(model))
+    for model in models:
+        levels = model.get("thinking_levels") or ()
+        if model.get("default_reasoning_level") not in levels:
+            model["default_reasoning_level"] = "medium" if "medium" in levels or not levels else levels[0]
+        context = model.get("context_tokens")
+        if context and (model.get("max_context_tokens") or 0) < context:
+            model["max_context_tokens"] = context
 
     try:
         age_secs = max(0.0, time.time() - target.stat().st_mtime)
     except OSError:
         age_secs = None
+    if fetched_at:
+        try:
+            fetched = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+            fetched = fetched if fetched.tzinfo else fetched.replace(tzinfo=timezone.utc)
+            age_secs = max(0.0, time.time() - fetched.timestamp())
+        except (ValueError, OverflowError, OSError):
+            age_secs = None
     return {
         "source": source,
         "path": str(target),
         "fetched_at": fetched_at,
-        "stale": age_secs is None or age_secs > CATALOG_STALE_SECS,
+        "stale": source == "fallback" or age_secs is None or age_secs > CATALOG_STALE_SECS,
         "age_seconds": round(age_secs, 3) if age_secs is not None else None,
         "models": models,
     }
@@ -202,6 +229,7 @@ def public_catalog(path: Path | None = None) -> dict[str, Any]:
                 "id": model["id"],
                 "name": model["name"],
                 "context_tokens": model.get("context_tokens"),
+                "max_context_tokens": model.get("max_context_tokens"),
                 "max_output_tokens": model.get("max_output_tokens"),
                 "thinking_levels": list(model.get("thinking_levels") or ()),
                 "default_reasoning_level": model.get("default_reasoning_level") or "medium",

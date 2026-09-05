@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.28
+
+- Added GPT-6 Astra to the offline Codex catalog and made the model picker and new forced-model configuration share the same default.
+- Added optional GPT-6 routing: Haiku to GPT-5.6 Luna, Sonnet to Terra, and Opus/Fable to Astra. Existing GPT-5.6 presets and saved provider choices remain supported.
+- Prefer current Codex cache capabilities, preserve separate default/maximum context windows and default reasoning effort, and tolerate malformed entries without hiding subsequent models. Cache freshness uses its fetch timestamp.
+- Normalize Astra's unsupported logprob parameters, map `none`/`minimal` reasoning to `low`, and migrate legacy prompt-cache retention to `prompt_cache_options.ttl`. Explicit cache and parallel-tool settings are preserved.
+- Fixed Chat Completions streaming tool calls, including interleaved calls, final-only arguments, and duplicate completion events.
+- Preserve custom model selections, export the selected model, display the catalog's actual default effort, and escape cached model labels when embedding the catalog in HTML.
+
 ## 0.2.27
 
 - Fixed GPT-5.6 Luna requests from Claude Code and CC Switch by forwarding the current Codex CLI `originator`, `User-Agent`, and `Version` identity headers to the ChatGPT Codex backend.

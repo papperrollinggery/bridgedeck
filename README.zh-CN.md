@@ -172,10 +172,10 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8876/accounts/<account_id>/v1
 ANTHROPIC_AUTH_TOKEN=local-bridge
 ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.6-luna
 ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra
-ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.6-sol
+ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-6-astra
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 CLAUDE_CODE_ATTRIBUTION_HEADER=0
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
 ```
 
 不要默认设置 `ANTHROPIC_MODEL`。只有你明确要把所有 Claude Code 主请求强制到某个模型时才设置它；留空时，Claude 的 `haiku` / `sonnet` / `opus` slot 路由才会有意义。
@@ -183,6 +183,14 @@ CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000
 BridgeDeck 也会暴露桌面端安全的 Claude 风格模型别名。遇到客户端限制模型名时，可以用页面显示的别名；页面会同时显示“请求模型”和“实际路由模型”。
 
 GPT-5.6 推理等级按模型识别：Sol、Terra 支持 `low` 到 `ultra`，Luna 支持 `low` 到 `max`。超出模型上限时会透明收敛（Luna `ultra -> max`，旧 GPT 模型 `max/ultra -> xhigh`）。Provider 策略通过本地 `X-BridgeDeck-Reasoning-Effort` Header 注入，该 Header 会由 BridgeDeck 消费，不会转发给上游。
+
+模型选择器与新建强制模型配置默认使用 GPT-6 Astra。可选的 **GPT-6 Astra 自动路由**将 Haiku 分配到 Luna、Sonnet 分配到 Terra、Opus/Fable 分配到 Astra。预览不写入设置，点击应用后才更新选中的 Provider；原有 GPT-5.6 路由预设仍可使用。
+
+Claude 别名的默认路由，以及未应用该预设的新建 Provider，继续沿用旧的分层路由。需要迁移时，对选中的 Provider 应用 Astra 预设。
+
+BridgeDeck 按 Codex 通道读取模型能力。Astra 的离线保底值为默认上下文 272,000、最大上下文 872,000、最大输出 128,000 tokens；当前 `~/.codex/models_cache.json` 的有效字段优先。这些数值与[公共 API 模型规格](https://developers.openai.com/api/docs/models/gpt-6-astra)的口径不同。Codex 目录提供 `low`、`medium`、`high`、`xhigh`、`max`、`ultra`；请求中的 `none`/`minimal` 会调整为 `low`。
+
+按 [Astra 迁移指南](https://developers.openai.com/api/docs/guides/latest-model)，Responses 桥接会移除不支持的 logprob 参数，把旧 `prompt_cache_retention` 转为 `prompt_cache_options.ttl: "30m"`，并保留显式的新缓存设置。Responses 可保留 async 工具字段与 configuration_update；Chat Completions 经 Responses 转换后支持流式函数调用。本次没有新增 WebSocket 中途追加指令的能力。
 
 ### Claude Code Attribution Header
 
