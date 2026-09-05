@@ -3199,6 +3199,7 @@ def iter_chat_completions_sse(chunks: Any, *, completion_id: str, model: str) ->
                     },
                 )
                 yield b"data: [DONE]\n\n"
+                return
             elif event_name in {"response.failed", "error"}:
                 error = payload.get("error")
                 response_obj = payload.get("response")
@@ -3210,6 +3211,7 @@ def iter_chat_completions_sse(chunks: Any, *, completion_id: str, model: str) ->
                         "error": error if isinstance(error, dict) else {"type": "api_error", "message": _coerce_text(error)},
                     },
                 )
+                return
 
 
 def extract_session_key(headers: Any, body: dict[str, Any]) -> str | None:

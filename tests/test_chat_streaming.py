@@ -170,6 +170,25 @@ class ChatStreamingToolCallCase(unittest.TestCase):
         self.assertIn(b"conflicting function call arguments", body)
         self.assertNotIn(b"{\\\"left\\\":1}{\\\"right\\\":2}", body)
 
+    def test_terminal_events_finish_the_stream_once(self) -> None:
+        for terminal in ("response.completed", "response.failed"):
+            for combined in (False, True):
+                with self.subTest(terminal=terminal, combined=combined):
+                    first = _event(terminal, {"response": {"status": "completed" if terminal == "response.completed" else "failed", "error": {"message": "busy"}}})
+                    chunks = [
+                        first,
+                        _event("response.completed", {"response": {"status": "completed"}}),
+                        _event("response.output_text.delta", {"delta": "late output"}),
+                        _event("error", {"error": {"message": "late error"}}),
+                    ]
+                    body = _chat_body([b"".join(chunks)] if combined else chunks)
+                    completed = terminal == "response.completed"
+                    self.assertEqual(body.count(b"data: [DONE]"), 1 if completed else 0)
+                    self.assertEqual(body.count(b'"finish_reason":"stop"'), 1 if completed else 0)
+                    self.assertEqual(body.count(b"event: error"), 0 if completed else 1)
+                    self.assertNotIn(b"late output", body)
+                    self.assertNotIn(b"late error", body)
+
     def test_text_completion_and_error_events_keep_existing_shapes(self) -> None:
         completed = _chat_body(
             [
