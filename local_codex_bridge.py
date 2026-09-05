@@ -245,6 +245,8 @@ class BridgeModel:
     context_length: int | None = None
     max_completion_tokens: int | None = None
     thinking_levels: tuple[str, ...] = ()
+    default_reasoning_level: str = "medium"
+    max_context_length: int | None = None
 
 
 class TerminalStreamError(Exception):
@@ -287,6 +289,8 @@ def bridge_models() -> tuple[BridgeModel, ...]:
             context_length=item.get("context_tokens"),
             max_completion_tokens=item.get("max_output_tokens"),
             thinking_levels=tuple(item.get("thinking_levels") or ()),
+            default_reasoning_level=str(item.get("default_reasoning_level") or "medium"),
+            max_context_length=item.get("max_context_tokens"),
         )
         for item in catalog_model_options()
     )
@@ -929,14 +933,14 @@ def model_payload_item(
     if model.context_length is not None:
         item["context_length"] = model.context_length
         item["context_window"] = model.context_length
-        item["max_context_window"] = model.context_length
+        item["max_context_window"] = model.max_context_length or model.context_length
         item["auto_compact_token_limit"] = None
     if model.max_completion_tokens is not None:
         item["max_completion_tokens"] = model.max_completion_tokens
     if model.thinking_levels:
         levels = list(model.thinking_levels)
         item["thinking"] = {"levels": levels}
-        item["default_reasoning_level"] = "medium" if "medium" in levels else levels[0]
+        item["default_reasoning_level"] = model.default_reasoning_level if model.default_reasoning_level in levels else levels[0]
         item["supported_reasoning_levels"] = [
             {"effort": level, "description": REASONING_LEVEL_DESCRIPTIONS.get(level, level)}
             for level in levels
@@ -2247,13 +2251,24 @@ def normalize_request_body(body: dict[str, Any]) -> dict[str, Any]:
 
     include = normalized.get("include")
     includes = [item for item in include if isinstance(item, str)] if isinstance(include, list) else []
-    includes = [item for item in includes if item != "reasoning.summary"]
+    is_astra = str(normalized.get("model") or "").startswith("gpt-6-astra")
+    if is_astra and "parallel_tool_calls" not in body:
+        # Let Astra's upstream default apply, including for async tools.
+        normalized.pop("parallel_tool_calls", None)
+    includes = [item for item in includes if item != "reasoning.summary"
+                and not (is_astra and item == "message.output_text.logprobs")]
     if "reasoning.encrypted_content" not in includes:
         includes.append("reasoning.encrypted_content")
     normalized["include"] = includes
 
     for key in ("max_output_tokens", "temperature", "top_p"):
         normalized.pop(key, None)
+    if is_astra:
+        normalized.pop("top_logprobs", None)
+        normalized.pop("logprobs", None)
+        if "prompt_cache_retention" in normalized:
+            normalized.pop("prompt_cache_retention")
+            normalized.setdefault("prompt_cache_options", {"ttl": "30m"})
 
     input_items = normalized.get("input")
     if isinstance(input_items, list):
@@ -2981,6 +2996,134 @@ def _usage_to_chat_completion(usage: Any) -> dict[str, int]:
 
 
 def iter_chat_completions_sse(chunks: Any, *, completion_id: str, model: str) -> Any:
+    tool_calls: dict[str, dict[str, Any]] = {}
+    output_index_to_tool_key: dict[int, str] = {}
+    next_tool_index = 0
+
+    def tool_key(payload: dict[str, Any], item: dict[str, Any] | None = None) -> str | None:
+        item_id = payload.get("item_id")
+        if isinstance(item_id, str) and item_id:
+            return item_id
+        if isinstance(item, dict):
+            item_id = item.get("id")
+            if isinstance(item_id, str) and item_id:
+                return item_id
+        output_index = payload.get("output_index")
+        if isinstance(output_index, int):
+            return output_index_to_tool_key.get(output_index)
+        return None
+
+    def remember_tool_call(payload: dict[str, Any], item: dict[str, Any] | None = None) -> dict[str, Any]:
+        nonlocal next_tool_index
+        item = item if isinstance(item, dict) else payload.get("item")
+        item = item if isinstance(item, dict) else {}
+        key = tool_key(payload, item)
+        if not key:
+            key = f"fc_{uuid.uuid4().hex[:12]}"
+        call = tool_calls.get(key)
+        if call is None:
+            call = {
+                "index": next_tool_index,
+                "call_id": None,
+                "name": "",
+                "arguments": "",
+                "emitted_arguments": 0,
+                "started": False,
+            }
+            tool_calls[key] = call
+            next_tool_index += 1
+        call_id = item.get("call_id") or payload.get("call_id")
+        if isinstance(call_id, str) and call_id and not call["call_id"]:
+            call["call_id"] = call_id
+        name = item.get("name") or payload.get("name")
+        if isinstance(name, str) and name:
+            call["name"] = name
+        output_index = payload.get("output_index")
+        if isinstance(output_index, int):
+            output_index_to_tool_key[output_index] = key
+        return call
+
+    def append_arguments(call: dict[str, Any], value: Any, *, complete: bool = False) -> bool:
+        if not isinstance(value, str) or not value:
+            return True
+        current = call["arguments"]
+        if complete:
+            if value.startswith(current):
+                call["arguments"] = value
+            elif current.startswith(value):
+                return True
+            else:
+                return False
+        else:
+            call["arguments"] = current + value
+        return True
+
+    def emit_tool_delta(call: dict[str, Any]) -> list[bytes]:
+        name = call["name"]
+        call_id = call["call_id"]
+        if not isinstance(name, str) or not name or not isinstance(call_id, str) or not call_id:
+            return []
+        emitted: list[bytes] = []
+        if not call["started"]:
+            call["started"] = True
+            emitted.append(
+                _sse_event(
+                    "chat.completion.chunk",
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": call["index"],
+                                            "id": call_id,
+                                            "type": "function",
+                                            "function": {"name": name, "arguments": ""},
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    },
+                )
+            )
+        arguments = call["arguments"]
+        emitted_arguments = call["emitted_arguments"]
+        if len(arguments) > emitted_arguments:
+            call["emitted_arguments"] = len(arguments)
+            emitted.append(
+                _sse_event(
+                    "chat.completion.chunk",
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": call["index"],
+                                            "function": {"arguments": arguments[emitted_arguments:]},
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    },
+                )
+            )
+        return emitted
+
     for chunk in chunks:
         if not chunk:
             continue
@@ -3004,7 +3147,47 @@ def iter_chat_completions_sse(chunks: Any, *, completion_id: str, model: str) ->
                             "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
                         },
                     )
+            elif event_name == "response.output_item.added":
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get("type") == "function_call":
+                    call = remember_tool_call(payload, item)
+                    if not append_arguments(call, item.get("arguments"), complete=True):
+                        yield _sse_event("error", {"error": {"type": "api_error", "message": "conflicting function call arguments"}})
+                        return
+                    for emitted in emit_tool_delta(call):
+                        yield emitted
+            elif event_name == "response.function_call_arguments.delta":
+                call = remember_tool_call(payload)
+                append_arguments(call, payload.get("delta"))
+                for emitted in emit_tool_delta(call):
+                    yield emitted
+            elif event_name in {"response.function_call_arguments.done", "response.output_item.done"}:
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get("type") not in {None, "function_call"}:
+                    continue
+                call = remember_tool_call(payload, item if isinstance(item, dict) else None)
+                arguments = payload.get("arguments")
+                if not isinstance(arguments, str) and isinstance(item, dict):
+                    arguments = item.get("arguments")
+                if not append_arguments(call, arguments, complete=True):
+                    yield _sse_event("error", {"error": {"type": "api_error", "message": "conflicting function call arguments"}})
+                    return
+                for emitted in emit_tool_delta(call):
+                    yield emitted
             elif event_name == "response.completed":
+                response_obj = payload.get("response")
+                if isinstance(response_obj, dict):
+                    output = response_obj.get("output")
+                    if isinstance(output, list):
+                        for item in output:
+                            if not isinstance(item, dict) or item.get("type") != "function_call":
+                                continue
+                            call = remember_tool_call(payload, item)
+                            if not append_arguments(call, item.get("arguments"), complete=True):
+                                yield _sse_event("error", {"error": {"type": "api_error", "message": "conflicting function call arguments"}})
+                                return
+                            for emitted in emit_tool_delta(call):
+                                yield emitted
                 yield _sse_event(
                     "chat.completion.chunk",
                     {
@@ -3012,7 +3195,7 @@ def iter_chat_completions_sse(chunks: Any, *, completion_id: str, model: str) ->
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if any(call["started"] for call in tool_calls.values()) else "stop"}],
                     },
                 )
                 yield b"data: [DONE]\n\n"

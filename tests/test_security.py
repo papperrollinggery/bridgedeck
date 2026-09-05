@@ -71,6 +71,7 @@ except ModuleNotFoundError:
     sys.modules["httpx"] = httpx_stub
 
 import local_codex_bridge
+import model_catalog
 
 
 def fake_jwt(payload: dict[str, Any]) -> str:
@@ -821,6 +822,9 @@ class LocalCodexBridgeCase(unittest.TestCase):
         patcher = mock.patch.object(local_codex_bridge, "BRIDGE_STATE_PATH", state_path)
         patcher.start()
         self.addCleanup(patcher.stop)
+        catalog_patcher = mock.patch.object(model_catalog, "MODELS_CACHE_PATH", state_path.parent / "models.json")
+        catalog_patcher.start()
+        self.addCleanup(catalog_patcher.stop)
 
     def make_handler(self) -> local_codex_bridge.CodexBridgeHandler:
         return object.__new__(local_codex_bridge.CodexBridgeHandler)
@@ -4275,7 +4279,11 @@ class CodexDesktopDoctorCase(ServerCase):
         request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/")
         request.add_header("Host", "127.0.0.1")
 
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(model_catalog, "MODELS_CACHE_PATH", Path(tmp) / "missing-models.json"),
+            urllib.request.urlopen(request, timeout=5) as response,
+        ):
             html = response.read().decode("utf-8")
 
         self.assertIn('id="simpleClaudeAccount"', html)
@@ -4312,7 +4320,8 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertIn("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME=Haiku 4.5", html)
         self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra", html)
         self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME=Sonnet 5", html)
-        self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.6-sol", html)
+        self.assertIn('const DEFAULT_BRIDGE_MODEL = "gpt-6-astra";', html)
+        self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL=${DEFAULT_BRIDGE_MODEL}", html)
         self.assertIn("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME=Opus 4.8 / Fable 5", html)
         self.assertIn("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1", html)
         self.assertIn("CLAUDE_CODE_ATTRIBUTION_HEADER=0", html)
@@ -4325,8 +4334,8 @@ class CodexDesktopDoctorCase(ServerCase):
         self.assertIn("claude-opus-4-8", html)
         self.assertIn("claude-fable-5", html)
         self.assertIn("Desktop Gateway", html)
-        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000", html)
-        self.assertIn("272k context / 128k max output", html)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=${context}", html)
+        self.assertIn("Codex 通道的上下文和推理能力", html)
         self.assertIn('"id": "gpt-5.4"', html)
         self.assertIn('"context_tokens": 220000', html)
         self.assertIn("copy-api-base-url", html)

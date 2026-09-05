@@ -42,6 +42,7 @@ from model_catalog import model_options as catalog_model_options
 from model_catalog import normalize_model_id as catalog_normalize_model_id
 from model_catalog import normalize_reasoning_effort as catalog_normalize_reasoning_effort
 from model_catalog import public_catalog
+from model_catalog import DEFAULT_MODEL_ID
 
 
 DEFAULT_DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
@@ -97,7 +98,7 @@ DEFAULT_AIMAMI_FOLLOW_PATH = Path.home() / ".cc-switch" / "bridgedeck-aimami-fol
 DEFAULT_API_KEYS_PATH = Path.home() / ".cc-switch" / "bridgedeck-keys.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8899
-APP_VERSION = "0.2.27"
+APP_VERSION = "0.2.28"
 MAX_REQUEST_BYTES = 1024 * 1024
 LOCAL_BRIDGE_BASE_URL = "http://127.0.0.1:8876"
 CC_SWITCH_BASE_URL = "http://127.0.0.1:15721"
@@ -124,7 +125,7 @@ CLAUDE_CODE_ATTRIBUTION_HEADER_ENV = "CLAUDE_CODE_ATTRIBUTION_HEADER"
 CLAUDE_CODE_ATTRIBUTION_DISABLED_VALUE = "0"
 DEFAULT_COMPACT_WINDOW_TOKENS = 220_000
 DEFAULT_COMPACT_THRESHOLD_PERCENT = 80
-DEFAULT_BRIDGE_PROVIDER_MODEL = "gpt-5.5"
+DEFAULT_BRIDGE_PROVIDER_MODEL = DEFAULT_MODEL_ID
 BRIDGE_REASONING_HEADER = "X-BridgeDeck-Reasoning-Effort"
 ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 GATEWAY_MODEL_DISCOVERY_ENV = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"
@@ -5064,7 +5065,7 @@ class BridgeManager:
             "model": forced_model,
             "routing_mode": "forced" if forced_model else "claude_auto",
             "reasoning_policy": reasoning_policy_from_provider(settings, meta, app_type),
-            "model_is_legacy_default": forced_model == DEFAULT_BRIDGE_PROVIDER_MODEL,
+            "model_is_legacy_default": forced_model == "gpt-5.5",
             "haiku_model": env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), str) else "",
             "sonnet_model": env.get("ANTHROPIC_DEFAULT_SONNET_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"), str) else "",
             "opus_model": env.get("ANTHROPIC_DEFAULT_OPUS_MODEL") if isinstance(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL"), str) else "",
@@ -7600,13 +7601,27 @@ class BridgeManager:
         surface: str,
         apply: bool = False,
     ) -> dict[str, Any]:
+        return self.apply_model_routing_preset(provider_id, surface=surface, mode="gpt56_auto", apply=apply)
+
+    def apply_model_routing_preset(
+        self,
+        provider_id: str,
+        *,
+        surface: str,
+        mode: str = "gpt6_auto",
+        apply: bool = False,
+    ) -> dict[str, Any]:
         if not provider_id.strip():
             raise ValueError("provider_id 不能为空")
+        if mode not in {"gpt6_auto", "gpt56_auto"}:
+            raise ValueError("仅支持 gpt6_auto 或 gpt56_auto")
         app_type = provider_surface_app_type(surface)
+        flagship = DEFAULT_MODEL_ID if mode == "gpt6_auto" else "gpt-5.6-sol"
+        label = "GPT-6 Astra" if mode == "gpt6_auto" else "GPT-5.6"
         targets = {
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-luna",
             "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6-terra",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-5.6-sol",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": flagship,
         }
         with self._lock:
             with self._managed_connect() as conn:
@@ -7626,7 +7641,8 @@ class BridgeManager:
                 before_meta = copy.deepcopy(meta)
                 clear_forced_bridge_model_from_env(env)
                 env.update(targets)
-                env[MAX_CONTEXT_TOKENS_ENV] = "372000"
+                contexts = [bridge_model_context_tokens(model) for model in targets.values()]
+                env[MAX_CONTEXT_TOKENS_ENV] = str(min(context for context in contexts if context > 0))
                 env[GATEWAY_MODEL_DISCOVERY_ENV] = "1"
                 apply_bridge_safe_model_display_names(env)
                 settings["env"] = env
@@ -7643,13 +7659,13 @@ class BridgeManager:
                     conn.commit()
         return {
             "ok": True,
-            "message": "GPT-5.6 自动路由已保存" if apply and changed else "GPT-5.6 自动路由预览",
+            "message": f"{label} 自动路由已保存" if apply and changed else f"{label} 自动路由预览",
             "provider_id": provider_id,
             "surface": provider_surface_for_app_type(app_type),
-            "mode": "gpt56_auto",
+            "mode": mode,
             "apply": apply,
             "changed": changed,
-            "routes": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol", "fable": "gpt-5.6-sol"},
+            "routes": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": flagship, "fable": flagship},
             "backups": [db_bak] if db_bak else [],
         }
 
@@ -9862,10 +9878,11 @@ INDEX_HTML = """<!doctype html>
                   <button class="miniBtn" data-action="save-forced-model-selected">保存强制主模型</button>
                   <button class="miniBtn warn" data-action="clear-forced-model-selected">改为 Claude 自动路由</button>
                   <button class="miniBtn" data-action="save-reasoning-selected">保存推理等级</button>
+                  <button class="miniBtn" data-action="apply-gpt6-routing-selected">应用 GPT-6 Astra 自动路由</button>
                   <button class="miniBtn" data-action="apply-gpt56-routing-selected">应用 GPT-5.6 自动路由</button>
                   <button class="miniBtn" data-action="sync-common-env-selected">同步通用 env 到全部</button>
                 </div>
-                <div class="muted" id="bridgeModelMeta">gpt-5.5 = 272000 context tokens / 128000 max output。</div>
+                <div class="muted" id="bridgeModelMeta">正在读取模型目录。</div>
               </div>
             </div>
             <div class="card guideSection" id="providerManageCard" data-guide="providerManage">
@@ -10010,7 +10027,7 @@ INDEX_HTML = """<!doctype html>
                 </div>
                 <div class="apiCard ok">
                   <div class="apiCardTitle">Scoped Models</div>
-                  <div class="apiCardMeta"><span class="mono">GET /v1/models</span><br />同时返回 gpt-* 和 claude-* Desktop 路由；gpt-5.5 为 272k context / 128k max output。</div>
+                  <div class="apiCardMeta"><span class="mono">GET /v1/models</span><br />返回 gpt-* 和 claude-* Desktop 路由，以及 Codex 通道的上下文和推理能力。</div>
                 </div>
               </div>
               <div class="apiExampleGrid">
@@ -10023,7 +10040,7 @@ INDEX_HTML = """<!doctype html>
                   <div class="paths" id="apiClaudeExample"></div>
                 </div>
               </div>
-              <div class="muted mt10">gpt-5.5 thinking levels: low / medium / high / xhigh。minimal 不作为可选级别展示。</div>
+              <div class="muted mt10">推理等级随模型目录更新。GPT-6 Astra 的 none / minimal 请求会调整为 low。</div>
             </div>
             <div class="card guideSection mt10" data-guide="apiKeys">
               <h2>API Keys 管理</h2>
@@ -10119,6 +10136,7 @@ INDEX_HTML = """<!doctype html>
                 <button class="miniBtn warn" data-action="apply-ccswitch-315-desktop-routes">应用 Claude Desktop 3.15 路由修复</button>
                 <label>Desktop 推理<select id="desktopReasoningEffort"><option>inherit</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option><option>ultra</option></select></label>
                 <button class="miniBtn" data-action="save-reasoning-selected">保存选中 Desktop 推理</button>
+                <button class="miniBtn" data-action="apply-gpt6-routing-selected">应用选中 Desktop GPT-6 Astra 路由</button>
                 <button class="miniBtn" data-action="apply-gpt56-routing-selected">应用选中 Desktop GPT-5.6 路由</button>
               </div>
               <div class="tableWrap mt10">
@@ -10266,7 +10284,7 @@ INDEX_HTML = """<!doctype html>
     let oauthExpiryTimer = null;
     let activeOAuthExpiresAt = '';
     const BRIDGE_MODELS = __BRIDGE_MODELS_JSON__;
-    const DEFAULT_BRIDGE_MODEL = 'gpt-5.6-sol';
+    const DEFAULT_BRIDGE_MODEL = __DEFAULT_BRIDGE_MODEL_JSON__;
     const DEFAULT_COMPACT_WINDOW = '272000';
     const CONSERVATIVE_COMPACT_WINDOW = '220000';
     const DEFAULT_COMPACT_PCT = '80';
@@ -12127,7 +12145,9 @@ INDEX_HTML = """<!doctype html>
     }
     function anthropicAccessEnv(item) {
       const baseUrl = anthropicAccessBaseUrl(item);
-      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.6-luna\nANTHROPIC_DEFAULT_HAIKU_MODEL_NAME=Haiku 4.5\nANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra\nANTHROPIC_DEFAULT_SONNET_MODEL_NAME=Sonnet 5\nANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.6-sol\nANTHROPIC_DEFAULT_OPUS_MODEL_NAME=Opus 4.8 / Fable 5\nCLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1\nCLAUDE_CODE_ATTRIBUTION_HEADER=0\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=372000` : '';
+      const contexts = ['gpt-5.6-luna', 'gpt-5.6-terra', DEFAULT_BRIDGE_MODEL].map((id) => Number(bridgeModelContext(id))).filter((value) => value > 0);
+      const context = contexts.length ? Math.min(...contexts) : CONSERVATIVE_COMPACT_WINDOW;
+      return baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl}\nANTHROPIC_AUTH_TOKEN=${LOCAL_ANTHROPIC_AUTH_TOKEN}\nANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.6-luna\nANTHROPIC_DEFAULT_HAIKU_MODEL_NAME=Haiku 4.5\nANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra\nANTHROPIC_DEFAULT_SONNET_MODEL_NAME=Sonnet 5\nANTHROPIC_DEFAULT_OPUS_MODEL=${DEFAULT_BRIDGE_MODEL}\nANTHROPIC_DEFAULT_OPUS_MODEL_NAME=Opus 4.8 / Fable 5\nCLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1\nCLAUDE_CODE_ATTRIBUTION_HEADER=0\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=${context}` : '';
     }
     function anthropicForcedModelEnv(item) {
       const base = anthropicAccessEnv(item);
@@ -12135,7 +12155,7 @@ INDEX_HTML = """<!doctype html>
     }
     function apiOpenAiEnv(item) {
       const baseUrl = apiAccessBaseUrl(item);
-      return baseUrl ? `OPENAI_API_KEY=${LOCAL_API_KEY_PLACEHOLDER}\nOPENAI_BASE_URL=${baseUrl}\nMODEL=gpt-5.6-sol` : '';
+      return baseUrl ? `OPENAI_API_KEY=${LOCAL_API_KEY_PLACEHOLDER}\nOPENAI_BASE_URL=${baseUrl}\nMODEL=${selectedBridgeModel()}` : '';
     }
     function apiClaudeEnv(item) {
       const gatewayBase = claudeDesktopGatewayBaseUrl(item);
@@ -12206,8 +12226,9 @@ INDEX_HTML = """<!doctype html>
       return copyText(item ? anthropicForcedModelEnv(item) : '', 'Anthropic forced model env');
     }
     function bridgeModelOption(modelId) {
-      const normalized = String(modelId || '').trim().toLowerCase();
-      return BRIDGE_MODELS.find((item) => item.id === normalized) || BRIDGE_MODELS[0] || null;
+      const requested = String(modelId || '').trim().toLowerCase();
+      const normalized = requested === 'gpt-5.6' ? 'gpt-5.6-sol' : requested;
+      return BRIDGE_MODELS.find((item) => item.id === normalized) || null;
     }
     function bridgeModelContext(modelId) {
       const option = bridgeModelOption(modelId);
@@ -12258,7 +12279,7 @@ INDEX_HTML = """<!doctype html>
       ['inherit', ...levels].forEach((effort) => {
         const node = document.createElement('option');
         node.value = effort;
-        node.textContent = effort === 'inherit' ? 'inherit（上游默认 medium）' : effort;
+        node.textContent = effort === 'inherit' ? `inherit（上游默认 ${option && option.default_reasoning_level || '未知'}）` : effort;
         sel.appendChild(node);
       });
       if (!Array.from(sel.options).some((node) => node.value === current) && current !== 'inherit') {
@@ -12298,8 +12319,18 @@ INDEX_HTML = """<!doctype html>
     }
     function setBridgeModel(modelId, applyContext = false) {
       const sel = document.getElementById('bridgeModel');
-      const option = bridgeModelOption(modelId || DEFAULT_BRIDGE_MODEL);
-      if (sel && option) sel.value = option.id;
+      const requested = String(modelId || DEFAULT_BRIDGE_MODEL).trim();
+      const option = bridgeModelOption(requested);
+      if (sel) {
+        const id = option ? option.id : requested;
+        if (!Array.from(sel.options).some((node) => node.value === id)) {
+          const custom = document.createElement('option');
+          custom.value = id;
+          custom.textContent = `${id} · context unknown`;
+          sel.appendChild(custom);
+        }
+        sel.value = id;
+      }
       updateBridgeModelMeta();
       if (applyContext) applyModelContextPreset();
     }
@@ -13014,14 +13045,15 @@ INDEX_HTML = """<!doctype html>
       log(`${res.message}: ${effort}${res.backups.length ? `；备份 ${res.backups[0]}` : ''}`);
       await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
     }
-    async function applyGpt56RoutingSelected() {
+    async function applyGpt56RoutingSelected(mode = 'gpt56_auto') {
       const target = selectedProviderActionTarget();
       const id = selectedProviderActionId();
       if (!id || !target.provider) return log('请先选账号或选中一个 provider');
       const surface = target.provider.surface || 'claude_code';
-      const preview = await api('/api/provider-routing', 'POST', { provider_id: id, surface, mode: 'gpt56_auto', apply: false });
-      if (!window.confirm(`应用 GPT-5.6 自动路由：Haiku→Luna、Sonnet→Terra、Opus/Fable→Sol。继续？`)) return;
-      const res = await api('/api/provider-routing', 'POST', { provider_id: id, surface, mode: 'gpt56_auto', apply: true });
+      const preview = await api('/api/provider-routing', 'POST', { provider_id: id, surface, mode, apply: false });
+      const routes = Object.entries(preview.routes || {}).map(([slot, model]) => `${slot}→${model}`).join('、');
+      if (!window.confirm(`应用自动路由：${routes}。继续？`)) return;
+      const res = await api('/api/provider-routing', 'POST', { provider_id: id, surface, mode, apply: true });
       setRoutingMode('auto');
       log(`${res.message}${res.backups.length ? `；备份 ${res.backups[0]}` : ''}`);
       await refreshData().catch((e) => log(`刷新失败: ${e.message}`));
@@ -13126,6 +13158,7 @@ INDEX_HTML = """<!doctype html>
           if (action === 'clear-forced-model-selected') return clearForcedModelSelected();
           if (action === 'save-reasoning-selected') return saveReasoningSelected();
           if (action === 'apply-gpt56-routing-selected') return applyGpt56RoutingSelected();
+          if (action === 'apply-gpt6-routing-selected') return applyGpt56RoutingSelected('gpt6_auto');
           if (action === 'sync-common-env-selected') return syncCommonEnvSelected();
           if (action === 'copy-claude-env') return copyClaudeEnv();
           if (action === 'extract-safe-common-config') return extractSafeCommonConfig();
@@ -13279,7 +13312,8 @@ def build_handler(
                     INDEX_HTML.replace("__CSRF_TOKEN__", csrf_token)
                     .replace("__CSP_NONCE__", csp_nonce)
                     .replace("__LOCAL_BRIDGE_BASE_URL__", LOCAL_BRIDGE_BASE_URL)
-                    .replace("__BRIDGE_MODELS_JSON__", json.dumps(catalog_model_options(), ensure_ascii=False))
+                    .replace("__BRIDGE_MODELS_JSON__", json.dumps(catalog_model_options(), ensure_ascii=False).replace("<", "\\u003c"))
+                    .replace("__DEFAULT_BRIDGE_MODEL_JSON__", json.dumps(DEFAULT_BRIDGE_PROVIDER_MODEL))
                     .encode("utf-8")
                 )
                 self.send_response(200)
@@ -13709,7 +13743,7 @@ def build_handler(
                     surface = str(payload.get("surface") or "claude_code")
                     if mode == "auto":
                         if provider_surface_app_type(surface) != "claude":
-                            raise ValueError("Claude Desktop 请使用 gpt56_auto 或显式模型路由")
+                            raise ValueError("Claude Desktop 请使用 gpt6_auto、gpt56_auto 或显式模型路由")
                         result = manager.clear_provider_forced_model(provider_id, apply=bool(payload.get("apply", False)))
                     elif mode == "gpt56_auto":
                         result = manager.apply_gpt56_routing_preset(
@@ -13717,8 +13751,15 @@ def build_handler(
                             surface=surface,
                             apply=bool(payload.get("apply", False)),
                         )
+                    elif mode == "gpt6_auto":
+                        result = manager.apply_model_routing_preset(
+                            provider_id,
+                            surface=surface,
+                            mode=mode,
+                            apply=bool(payload.get("apply", False)),
+                        )
                     else:
-                        raise ValueError("仅支持 auto 或 gpt56_auto")
+                        raise ValueError("仅支持 auto、gpt6_auto 或 gpt56_auto")
                     json_response(self, 200, result)
                     return
                 if self.path == "/api/provider-reasoning":
